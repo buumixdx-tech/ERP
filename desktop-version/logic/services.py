@@ -1,0 +1,641 @@
+"""
+业务服务层
+负责处理跨模块的复杂业务计算逻辑，确保 UI 层仅负责数据展示与交互。
+"""
+from models import (
+    get_session, VirtualContract, EquipmentInventory, MaterialInventory, 
+    SKU, Point, SupplyChain, Business
+)
+from logic.constants import (
+    VCType, VCStatus, SubjectStatus, ReturnDirection, OperationalStatus, SKUType, 
+    AccountOwnerType, SystemConstants, CashFlowType, CounterpartType, AccountLevel1
+)
+import pandas as pd
+
+def normalize_item_data(item: dict) -> dict:
+    """将混乱的字典 Key 统一为系统标准格式"""
+    return {
+        "sku_id": item.get("sku_id") or item.get("skuId") or item.get("id"),
+        "sku_name": item.get("sku_name") or item.get("skuName") or item.get("name") or SystemConstants.UNKNOWN,
+        "qty": float(item.get("qty") or item.get("quantity") or 0),
+        "price": float(item.get("price") or item.get("unit_price") or item.get("unitPrice") or 0.0),
+        "point_id": item.get("point_id") or item.get("pointId"),
+        "point_name": item.get("point_name") or item.get("pointName") or item.get("warehouse") or SystemConstants.UNKNOWN,
+        "sn": item.get("sn") or "-",
+        "deposit": float(item.get("deposit") or 0.0),
+        "source_warehouse": item.get("source_warehouse") or item.get("sourceWarehouse") or SystemConstants.DEFAULT_WAREHOUSE,
+        "target_warehouse": item.get("target_warehouse") or item.get("targetWarehouse") or item.get("退货目的地")
+    }
+
+def format_item_list_preview(items: list) -> str:
+    """将复杂的 Item 列表转换为用户易读的预览文本"""
+    if not items:
+        return "无货品明细"
+    
+    decoded = []
+    for i in items:
+        norm = normalize_item_data(i)
+        desc = f"{norm['sku_name']} x{int(norm['qty']) if norm['qty'].is_integer() else norm['qty']}"
+        if norm['sn'] != "-":
+            desc += f" (SN:{norm['sn']})"
+        decoded.append(desc)
+    
+    return " | ".join(decoded)
+
+def get_returnable_items(session, target_vc_id, return_direction):
+    """
+    计算一个虚拟合同的可退货明细
+    逻辑：原始总量 - 已发起的退货单(非取消) - 实物状态校验
+    """
+    target_vc = session.query(VirtualContract).get(target_vc_id)
+    if not target_vc:
+        return []
+
+    elements = target_vc.elements or {}
+    
+    # 1. 搜集所有已发起的退货单，计算锁定量
+    existing_returns = session.query(VirtualContract).filter(
+        VirtualContract.related_vc_id == target_vc.id, 
+        VirtualContract.type == VCType.RETURN,
+        VirtualContract.status != VCStatus.CANCELLED
+    ).all()
+    
+    locked_sns = set()
+    returned_qtys = {} # sku_id -> {point_name: total_qty}
+    for r_vc in existing_returns:
+        r_items = (r_vc.elements or {}).get("return_items", [])
+        for ri in r_items:
+            rsn = ri.get("sn")
+            if rsn and rsn != "-":
+                locked_sns.add(rsn)
+            else:
+                rsid = ri.get("sku_id")
+                rpon = ri.get("point_name")
+                rqty = float(ri.get("qty", 0))
+                if rsid:
+                    if rsid not in returned_qtys: returned_qtys[rsid] = {}
+                    returned_qtys[rsid][rpon] = returned_qtys[rsid].get(rpon, 0) + rqty
+
+    return_items = []
+
+    # 2. 设备采购类型的退货逻辑
+    if target_vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
+        filter_status = OperationalStatus.OPERATING if ReturnDirection.CUSTOMER_TO_US in return_direction else OperationalStatus.STOCK
+        equip_list = session.query(EquipmentInventory).filter(
+            EquipmentInventory.virtual_contract_id == target_vc.id,
+            EquipmentInventory.operational_status == filter_status
+        ).all()
+        
+        for e in equip_list:
+            if e.sn in locked_sns: continue
+            return_items.append({
+                "sku_id": e.sku_id,
+                "sn": e.sn,
+                "sku_name": e.sku.name if e.sku else "未知设备",
+                "price": 0.0 if ReturnDirection.CUSTOMER_TO_US in return_direction else (e.sku.params.get("unit_price", 0) if e.sku and e.sku.params else 0), 
+                "qty": 1,
+                "point_id": e.point_id,
+                "point_name": e.point.name if e.point else "未定义",
+                "deposit": float(e.deposit_amount or target_vc.elements.get("skus_map", {}).get(str(e.sku_id), {}).get("deposit", 0.0) or 0.0)
+            })
+
+    # 3. 物料采购类型的退货逻辑 (向供应商退款)
+    elif target_vc.type == VCType.MATERIAL_PROCUREMENT:
+        unique_skus = {}
+        for i in elements.get("skus", []):
+            sid = i.get("sku_id")
+            if sid not in unique_skus:
+                unique_skus[sid] = {
+                    "name": i.get("sku_name") or i.get("name"),
+                    "price": float(i.get("price") or 0),
+                    "target_total": float(i.get("qty") or 0)
+                }
+            else:
+                unique_skus[sid]["target_total"] += float(i.get("qty") or 0)
+        
+        for sid, meta in unique_skus.items():
+            mat = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
+            if mat and mat.stock_distribution:
+                for wh, wh_qty in mat.stock_distribution.items():
+                    if wh_qty > 0:
+                        already_ret = returned_qtys.get(sid, {}).get(wh, 0)
+                        final_returnable = min(float(wh_qty), meta["target_total"] - already_ret)
+                        if final_returnable > 0:
+                            return_items.append({
+                                "sku_id": sid,
+                                "sku_name": meta["name"],
+                                "price": meta["price"],
+                                "qty": int(final_returnable),
+                                "point_name": wh
+                            })
+                            
+    # 4. 物料供应类型的退货逻辑 (客户退回)
+    elif target_vc.type == VCType.MATERIAL_SUPPLY:
+        for p in elements.get("points", []):
+            p_name = p.get("pointName") or "未知点位"
+            for i in p.get("items", []):
+                norm = normalize_item_data(i)
+                remain_qty = int(norm["qty"]) - returned_qtys.get(norm["sku_id"], {}).get(p_name, 0)
+                if remain_qty > 0:
+                    return_items.append({
+                        "sku_id": norm["sku_id"],
+                        "sku_name": norm["sku_name"],
+                        "price": norm["price"],
+                        "qty": int(remain_qty),
+                        "point_name": p_name
+                    })
+
+    return return_items
+
+def get_sku_agreement_price(session, sc_id, business_id, sku_name):
+    """
+    获取 SKU 在特定业务 and 供应链环境下的协议单价与押金
+    返回: (unit_price, deposit, sku_type)
+    """
+    sc = session.query(SupplyChain).get(sc_id) if sc_id else None
+    biz = session.query(Business).get(business_id) if isinstance(business_id, int) else business_id
+    
+    # 获取供应链提供的单价 (如果有)
+    unit_price = 0.0
+    if sc:
+        sc_pricing = sc.get_pricing_dict()
+        unit_price = sc_pricing.get(sku_name, 0.0)
+    
+    if not isinstance(unit_price, (int, float)): 
+        unit_price = 0.0
+        
+    # 获取客户业务约定的押金与单价 (优先级覆盖)
+    if biz and isinstance(biz, dict):
+        biz_agreement = biz.get("details", {}).get("pricing", {})
+    else:
+        biz_agreement = biz.details.get("pricing", {}) if (biz and hasattr(biz, 'details')) else {}
+    sku_config = biz_agreement.get(sku_name, {})
+    
+    deposit = 0.0
+    sku_type = SKUType.EQUIPMENT
+    
+    if isinstance(sku_config, dict):
+        deposit = float(sku_config.get("deposit", 0.0))
+        sku_type = sku_config.get("type", SKUType.EQUIPMENT)
+        # 如果客户合同里也定了单价，通常以给客户的单价为准 (在供应场景下)
+        if "price" in sku_config:
+            unit_price = float(sku_config["price"])
+    elif isinstance(sku_config, (int, float)):
+        # 兼容旧版简单格式 {"SKU": 100.0}
+        unit_price = float(sku_config)
+    
+    return float(unit_price), float(deposit), sku_type
+
+def validate_inventory_availability(session, request_items):
+    """
+    统一校验库存充足性
+    request_items: list of (sku_name, warehouse_name, requested_qty)
+    返回: (is_valid, error_messages)
+    """
+    totals = {}
+    for sku_n, wh_n, req_qty in request_items:
+        if not sku_n or not wh_n or req_qty <= 0: continue
+        key = (sku_n, wh_n)
+        totals[key] = totals.get(key, 0) + req_qty
+    
+    over_stock = []
+    for (sku_n, wh_n), total_req in totals.items():
+        mat_inv = session.query(MaterialInventory).join(SKU).filter(SKU.name == sku_n).first()
+        dist = mat_inv.stock_distribution if (mat_inv and mat_inv.stock_distribution) else {}
+        available = float(dist.get(wh_n, 0.0))
+        
+        if total_req > available:
+            over_stock.append(f"【{wh_n}】的 {sku_n}: 申请 {total_req}, 当前存量 {available}")
+            
+    return len(over_stock) == 0, over_stock
+
+def get_counterpart_info(session, vc):
+    """
+    公共方法：识别虚拟合同对应的交易对手类型与 ID
+    """
+    from models import Business, SupplyChain
+    cp_type, cp_id = None, None
+    
+    # 获取关键属性 (适配 dict 或 SQLAlchemy 对象)
+    vc_type = vc.get('type') if isinstance(vc, dict) else vc.type
+    vc_related_id = vc.get('related_vc_id') if isinstance(vc, dict) else vc.related_vc_id
+
+    # 穿透识别原始业务属性
+    active_vc = vc
+    if vc_type == VCType.RETURN and vc_related_id:
+        active_vc = session.query(VirtualContract).get(vc_related_id) or vc
+
+    # 获取 active_vc 的属性 (处理 active_vc 可能是 dict 的情况)
+    active_vc_type = active_vc.get('type') if isinstance(active_vc, dict) else active_vc.type
+    active_vc_sc_id = active_vc.get('supply_chain_id') if isinstance(active_vc, dict) else active_vc.supply_chain_id
+    active_vc_biz_id = active_vc.get('business_id') if isinstance(active_vc, dict) else active_vc.business_id
+
+    if active_vc_type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT, VCType.MATERIAL_PROCUREMENT]:
+        cp_type = CounterpartType.SUPPLIER
+        if active_vc_sc_id:
+            sc = session.query(SupplyChain).get(active_vc_sc_id)
+            if sc: cp_id = sc.supplier_id
+    else:
+        cp_type = CounterpartType.CUSTOMER
+        if active_vc_biz_id:
+            biz = session.query(Business).get(active_vc_biz_id)
+            if biz: cp_id = biz.customer_id
+            
+    return cp_type, cp_id
+
+def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:
+    """
+    根据合同类型、款项性质和流向建议付款方和收款方
+    返回: (payer_type, payer_id, payee_type, payee_id)
+    """
+    from logic.constants import CashFlowType, AccountOwnerType
+    # 获取关键属性 (适配 dict 或 SQLAlchemy 对象)
+    elements = (vc.get('elements') or {}) if isinstance(vc, dict) else (vc.elements or {})
+    vc_type = vc.get('type') if isinstance(vc, dict) else vc.type
+    vc_bid = vc.get('business_id') if isinstance(vc, dict) else vc.business_id
+    vc_scid = vc.get('supply_chain_id') if isinstance(vc, dict) else vc.supply_chain_id
+
+    # 默认空值
+    p_err, p_err_id = None, None
+    p_ee, p_ee_id = None, None
+
+    # 情况A：设备采购中的押金收入（客户 -> 我们）
+    if vc_type == VCType.EQUIPMENT_PROCUREMENT and cf_type == CashFlowType.DEPOSIT:
+        p_err = AccountOwnerType.CUSTOMER
+        biz = session.query(Business).get(vc_bid) if vc_bid else None
+        if biz: p_err_id = biz.customer_id
+        p_ee, p_ee_id = AccountOwnerType.OURSELVES, 0
+        return p_err, p_err_id, p_ee, p_ee_id
+
+    # 情况B：设备采购中的押金退还（我们 -> 客户）
+    if vc_type == VCType.EQUIPMENT_PROCUREMENT and cf_type == CashFlowType.RETURN_DEPOSIT:
+        p_err, p_err_id = AccountOwnerType.OURSELVES, 0
+        p_ee = AccountOwnerType.CUSTOMER
+        biz = session.query(Business).get(vc_bid) if vc_bid else None
+        if biz: p_ee_id = biz.customer_id
+        return p_err, p_err_id, p_ee, p_ee_id
+
+    if vc_type == VCType.MATERIAL_SUPPLY:
+        # 物料供应：客户(Payer) -> 自己公司(Payee)
+        p_err, p_err_id = AccountOwnerType.CUSTOMER, None
+        biz = session.query(Business).get(vc_bid) if vc_bid else None
+        if biz: p_err_id = biz.customer_id
+        p_ee, p_ee_id = AccountOwnerType.OURSELVES, 0
+        
+    elif vc_type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT, VCType.MATERIAL_PROCUREMENT]:
+        # 设备/物料采购（常规货款）：自己公司(Payer) -> 供应商(Payee)
+        p_err, p_err_id = AccountOwnerType.OURSELVES, 0
+        sc = session.query(SupplyChain).get(vc_scid) if vc_scid else None
+        if sc: 
+            p_ee, p_ee_id = AccountOwnerType.SUPPLIER, sc.supplier_id
+            
+    elif vc_type == VCType.RETURN:
+        direction = elements.get('return_direction', '')
+        if ReturnDirection.US_TO_SUPPLIER in direction:
+            # 向供应商退货：供应商(Payer) -> 自己公司(Payee) [退款流程]
+            p_err, p_err_id = AccountOwnerType.SUPPLIER, None
+            sc = session.query(SupplyChain).get(vc_scid) if vc_scid else None
+            if sc: p_err_id = sc.supplier_id
+            p_ee, p_ee_id = AccountOwnerType.OURSELVES, 0
+        elif ReturnDirection.CUSTOMER_TO_US in direction:
+            # 客户退回：自己公司(Payer) -> 客户(Payee) [退款流程]
+            p_err, p_err_id = AccountOwnerType.OURSELVES, 0
+            biz = session.query(Business).get(vc_bid) if vc_bid else None
+            if biz: 
+                p_ee, p_ee_id = AccountOwnerType.CUSTOMER, biz.customer_id
+    
+    return p_err, p_err_id, p_ee, p_ee_id
+
+def format_vc_items_for_display(vc):
+    """
+    将虚拟合同的 elements 转换为 UI 友好的展示格式
+    返回: (display_type, items_list)
+    display_type: 'skus' | 'points' | 'return_items' | 'empty'
+    """
+    elements = (vc['elements'] if isinstance(vc, dict) else vc.elements) or {}
+    
+    # A. 列表模式 (设备采购/物料采购)
+    if "skus" in elements and isinstance(elements["skus"], list):
+        items = elements["skus"]
+        if items:
+            show_items = []
+            for i in items:
+                norm = normalize_item_data(i)
+                row = {
+                    "品类名称": norm["sku_name"],
+                    "数量": norm["qty"],
+                    "单价": norm["price"],
+                    "合计金额": norm["qty"] * norm["price"]
+                }
+                if norm["deposit"] > 0:
+                    row["单台押金"] = norm["deposit"]
+                row["目的点位/仓库"] = norm["point_name"]
+                show_items.append(row)
+            return 'skus', show_items
+    
+    # B. 点位分组模式 (物料供应)
+    elif "points" in elements and isinstance(elements["points"], list):
+        all_items = []
+        for p in elements["points"]:
+            p_name = p.get("point_name") or p.get("pointName") or f"{SystemConstants.UNKNOWN}点位"
+            for i in p.get("items", []):
+                norm = normalize_item_data(i)
+                all_items.append({
+                    "物料名称": norm["sku_name"],
+                    "数量": norm["qty"],
+                    "单价": norm["price"],
+                    "小计": norm["qty"] * norm["price"],
+                    "发货仓库": norm.get("source_warehouse") or SystemConstants.DEFAULT_WAREHOUSE,
+                    "配送/目的点位": p_name
+                })
+        if all_items:
+            return 'points', all_items
+    
+    # C. 退货模式
+    elif "return_items" in elements and isinstance(elements["return_items"], list):
+        ret_items = []
+        for i in elements["return_items"]:
+            norm = normalize_item_data(i)
+            ret_items.append({
+                "退回商品": norm["sku_name"],
+                "退回单价": norm["price"],
+                "退回数量": norm["qty"],
+                "货值金额": norm["qty"] * norm["price"],
+                "原归属点位": norm["point_name"],
+                "退货目的地": i.get("target_warehouse") or SystemConstants.DEFAULT_WAREHOUSE
+            })
+        if ret_items:
+            return 'return_items', ret_items
+    
+    return 'empty', []
+
+def calculate_cashflow_progress(session, vc, existing_cfs):
+    """
+    计算虚拟合同的资金流进度，并计算实时应付金额（扣除冲抵池余额）
+    返回: {
+        'is_return': bool,
+        'goods': {'total': float, 'paid': float, 'balance': float, 'pool': float, 'due': float, 'label': str, 'paid_label': str, 'balance_label': str},
+        'deposit': {'should': float, 'received': float, 'remaining': float},
+        'payment_terms': dict
+    }
+    """
+    from logic.constants import CashFlowType, AccountLevel1, CounterpartType
+    from models import FinanceAccount, FinancialJournal
+    from sqlalchemy import func
+    
+    # --- 计算冲抵池可用余额 ---
+    pool_balance = 0.0
+    party_type, party_id, account_level1 = None, None, None
+    
+    vc_type = vc.get('type') if isinstance(vc, dict) else vc.type
+    vc_sc_id = vc.get('supply_chain_id') if isinstance(vc, dict) else vc.supply_chain_id
+    vc_biz_id = vc.get('business_id') if isinstance(vc, dict) else vc.business_id
+    vc_id = vc.get('id') if isinstance(vc, dict) else vc.id
+
+    if vc_type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT, VCType.MATERIAL_PROCUREMENT]:
+        party_type, account_level1 = CounterpartType.SUPPLIER, AccountLevel1.PREPAYMENT
+        if vc_sc_id:
+            from models import SupplyChain
+            sc = session.query(SupplyChain).get(vc_sc_id)
+            if sc: party_id = sc.supplier_id
+    elif vc_type == VCType.MATERIAL_SUPPLY:
+        party_type, account_level1 = CounterpartType.CUSTOMER, AccountLevel1.PRE_COLLECTION
+        if vc_biz_id:
+            from models import Business
+            biz = session.query(Business).get(vc_biz_id)
+            if biz: party_id = biz.customer_id
+            
+    if party_id:
+        account = session.query(FinanceAccount).filter(
+            FinanceAccount.level1_name == account_level1,
+            FinanceAccount.counterpart_type == party_type,
+            FinanceAccount.counterpart_id == party_id
+        ).first()
+        if account:
+            debit_sum = session.query(func.sum(FinancialJournal.debit)).filter(FinancialJournal.account_id == account.id).scalar() or 0.0
+            credit_sum = session.query(func.sum(FinancialJournal.credit)).filter(FinancialJournal.account_id == account.id).scalar() or 0.0
+            pool_balance = (credit_sum - debit_sum) if account_level1 == AccountLevel1.PRE_COLLECTION else (debit_sum - credit_sum)
+
+    elements = (vc.get('elements') or {}) if isinstance(vc, dict) else (vc.elements or {})
+    deposit_info = (vc.get('deposit_info') or {}) if isinstance(vc, dict) else (vc.deposit_info or {})
+    is_return = (vc_type == VCType.RETURN)
+    
+    result = {
+        'is_return': is_return,
+        'goods': {},
+        'deposit': {},
+        'payment_terms': elements.get('payment_terms', {})
+    }
+
+    if is_return:
+        # 退货合同：区分 货款退款 和 押金退还
+        total_amt = elements.get('goods_amount', 0.0)
+        paid_total = sum((c.get('amount', 0.0) if isinstance(c, dict) else c.amount) for c in existing_cfs if (c.get('type') if isinstance(c, dict) else c.type) == CashFlowType.REFUND)
+        
+        dep_should = elements.get('deposit_amount', 0.0)
+        dep_received = sum((c.get('amount', 0.0) if isinstance(c, dict) else c.amount) for c in existing_cfs if (c.get('type') if isinstance(c, dict) else c.type) == CashFlowType.RETURN_DEPOSIT)
+        
+        result['goods'] = {
+            'total': total_amt,
+            'paid': paid_total,
+            'balance': max(0, total_amt - paid_total),
+            'pool': pool_balance,
+            'due': max(0, total_amt - paid_total - pool_balance),
+            'label': '应退货款总计',
+            'paid_label': '已退货款',
+            'balance_label': '待退货款余额'
+        }
+    else:
+        # 常规合同：货款进度（预付、履约、退款、冲抵）
+        total_amt = elements.get('total_amount', 0.0)
+        # 将冲抵单独提出来的目的是为了在 UI 上展示“应付金额 = 总额 - 冲抵”
+        applied_offsets = sum((c.get('amount', 0.0) if isinstance(c, dict) else c.amount) for c in existing_cfs if (c.get('type') if isinstance(c, dict) else c.type) == CashFlowType.OFFSET_PAY)
+        cash_paid = sum((c.get('amount', 0.0) if isinstance(c, dict) else c.amount) for c in existing_cfs if (c.get('type') if isinstance(c, dict) else c.type) in [CashFlowType.PREPAYMENT, CashFlowType.FULFILLMENT, CashFlowType.REFUND])
+        paid_total = applied_offsets + cash_paid
+        
+        dep_should = deposit_info.get('should_receive', 0.0)
+
+        dep_received = deposit_info.get('total_deposit', 0.0)
+        
+        result['goods'] = {
+            'total': total_amt,
+            'applied_offsets': applied_offsets,
+            'net_payable': total_amt - applied_offsets, # 扣除已确认冲抵后的“纯现金”应付
+            'paid': paid_total,
+            'balance': max(0, total_amt - paid_total),
+            'pool': pool_balance,
+            'due': max(0, total_amt - paid_total - pool_balance),
+            'label': '合同总额',
+            'paid_label': '累计已付/冲抵',
+            'balance_label': '剩余待付'
+        }
+
+    
+    result['deposit'] = {
+        'should': dep_should,
+        'received': dep_received,
+        'remaining': max(0.0, dep_should - dep_received)
+    }
+    
+    return result
+
+def get_account_balance(session, level1_name, cp_type=None, cp_id=None):
+    """
+    获取特定会计科目的实时余额
+    返回: Debit - Credit (正数代表借方余额，负数代表贷方余额)
+    """
+    from models import FinanceAccount, FinancialJournal
+    from sqlalchemy import func
+    
+    # 1. 查找或创建科目
+    from logic.finance import get_or_create_account
+    acc = get_or_create_account(session, level1_name, cp_type, cp_id)
+    
+    # 2. 汇总借贷
+    sums = session.query(
+        func.sum(FinancialJournal.debit).label("debit_sum"),
+        func.sum(FinancialJournal.credit).label("credit_sum")
+    ).filter(FinancialJournal.account_id == acc.id).first()
+    
+    d_sum = float(sums.debit_sum or 0.0)
+    c_sum = float(sums.credit_sum or 0.0)
+    
+    return d_sum - c_sum
+
+# --- 财务上下文服务 ---
+
+def get_logistics_finance_context(session, logistics_id):
+    """
+    构造物流记账所需的领域事实 Context
+    """
+    from models import Logistics, VirtualContract, MaterialInventory, SKU, FinancialJournal
+    from sqlalchemy import func
+    
+    logistics = session.query(Logistics).get(logistics_id)
+    if not logistics: return None
+    
+    vc = session.query(VirtualContract).get(logistics.virtual_contract_id)
+    if not vc: return None
+    
+    cp_type, cp_id = get_counterpart_info(session, vc)
+    
+    ctx = {
+        "logistics": logistics,
+        "vc": vc,
+        "cp_type": cp_type,
+        "cp_id": cp_id,
+        "total_amount": float(vc.elements.get('total_amount', 0)),
+        "is_return": (vc.type == VCType.RETURN),
+        "items_cost": 0.0,
+        "target_acc_l1": AccountLevel1.AR if cp_type == CounterpartType.CUSTOMER else AccountLevel1.AP,
+        "deposit_acc_l1": AccountLevel1.DEPOSIT_PAYABLE if cp_type == CounterpartType.CUSTOMER else AccountLevel1.DEPOSIT_RECEIVABLE,
+        "can_process": not logistics.finance_triggered and vc.subject_status == SubjectStatus.FINISH
+    }
+    
+    if not ctx["can_process"]:
+        return ctx
+
+    # 1. 自动防重逻辑
+    existing_entry = session.query(FinancialJournal).filter(
+        FinancialJournal.ref_vc_id == vc.id,
+        FinancialJournal.ref_type == "Logistics"
+    ).first()
+    ctx["is_duplicate"] = (existing_entry is not None and not ctx["is_return"])
+
+    # 2. 成本核算逻辑
+    if vc.type == VCType.MATERIAL_SUPPLY:
+        total_cost = 0.0
+        for p in vc.elements.get("points", []):
+            for item in p.get("items", []):
+                sid = item.get("sku_id") or item.get("skuId")
+                qty = float(item.get("qty") or 0)
+                mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
+                unit_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
+                if unit_cost == 0:
+                    sku_obj = session.query(SKU).get(sid)
+                    unit_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
+                total_cost += qty * unit_cost
+        ctx["items_cost"] = total_cost
+    
+    elif vc.type == VCType.RETURN:
+        total_asset_cost = 0.0
+        for item in vc.elements.get("return_items", []):
+            sid = item.get("id") or item.get("sku_id")
+            qty = float(item.get("qty") or 0)
+            mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
+            u_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
+            if u_cost == 0:
+                sku_obj = session.query(SKU).get(sid)
+                u_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
+            total_asset_cost += qty * u_cost
+        ctx["items_cost"] = total_asset_cost
+        
+    return ctx
+
+def get_cashflow_finance_context(session, cash_flow_id):
+    """
+    构造现金流记账所需的领域事实 Context
+    """
+    from models import CashFlow, VirtualContract, BankAccount
+    from sqlalchemy import func
+    
+    cf = session.query(CashFlow).get(cash_flow_id)
+    if not cf: return None
+    
+    vc = session.query(VirtualContract).get(cf.virtual_contract_id) if cf.virtual_contract_id else None
+    cp_type, cp_id = None, None
+    is_income = False
+    
+    # 逻辑穿透
+    if vc:
+        cp_type, cp_id = get_counterpart_info(session, vc)
+        active_vc = vc
+        if vc.type == VCType.RETURN and vc.related_vc_id:
+            active_vc = session.query(VirtualContract).get(vc.related_vc_id) or vc
+        
+        if active_vc.type == VCType.MATERIAL_SUPPLY:
+            is_income = True
+        elif vc.type == VCType.RETURN:
+            direction = vc.elements.get("return_direction")
+            is_income = direction and ReturnDirection.US_TO_SUPPLIER in direction
+            
+    elif cf.type == CashFlowType.DEPOSIT_OFFSET_IN:
+        payer_acc = session.query(BankAccount).get(cf.payer_account_id) if cf.payer_account_id else None
+        payee_acc = session.query(BankAccount).get(cf.payee_account_id) if cf.payee_account_id else None
+        target_acc = payer_acc if (payer_acc and payer_acc.owner_type != AccountOwnerType.OURSELVES) else payee_acc
+        if target_acc:
+            cp_type = target_acc.owner_type.capitalize()
+            cp_id = target_acc.owner_id
+            is_income = (cp_type == CounterpartType.CUSTOMER)
+
+    # 计算核销进度
+    ar_ap_amt, pre_amt = 0.0, 0.0
+    if cf.type in [CashFlowType.PREPAYMENT, CashFlowType.FULFILLMENT] and vc:
+        total_amt = float(vc.elements.get('total_amount', 0))
+        paid_before = session.query(func.sum(CashFlow.amount)).filter(
+            CashFlow.virtual_contract_id == vc.id,
+            CashFlow.type.in_([CashFlowType.PREPAYMENT, CashFlowType.FULFILLMENT, CashFlowType.OFFSET_PAY]),
+            CashFlow.id != cf.id
+        ).scalar() or 0.0
+        remaining = max(0, total_amt - paid_before)
+        ar_ap_amt = min(cf.amount, remaining)
+        pre_amt = max(0, cf.amount - remaining)
+        
+    # 获取我方银行 ID
+    our_bank_id = None
+    payer_acc = session.query(BankAccount).get(cf.payer_account_id) if cf.payer_account_id else None
+    payee_acc = session.query(BankAccount).get(cf.payee_account_id) if cf.payee_account_id else None
+    if payee_acc and payee_acc.owner_type == AccountOwnerType.OURSELVES: our_bank_id = payee_acc.id
+    elif payer_acc and payer_acc.owner_type == AccountOwnerType.OURSELVES: our_bank_id = payer_acc.id
+
+    return {
+        "cf": cf,
+        "vc": vc,
+        "cp_type": cp_type,
+        "cp_id": cp_id,
+        "is_income": is_income,
+        "ar_ap_amt": ar_ap_amt,
+        "pre_amt": pre_amt,
+        "our_bank_id": our_bank_id,
+        "can_process": not cf.finance_triggered
+    }

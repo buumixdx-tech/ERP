@@ -1,0 +1,21 @@
+{
+  "voucher_no": "CSH-4-017183",
+  "ref_vc_id": 4,
+  "ref_type": "CashFlow",
+  "ref_id": 4,
+  "timestamp": "2026-03-21T21:17:57.635587",
+  "entries": [
+    {
+      "account": "应付账款 (供应商)",
+      "debit": 100.0,
+      "credit": 0.0,
+      "summary": "核销应付"
+    },
+    {
+      "account": "货币资金",
+      "debit": 0,
+      "credit": 100.0,
+      "summary": "支付资金 (预付)"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "voucher_no": "CSH-15-356F6F",
+  "ref_vc_id": 7,
+  "ref_type": "CashFlow",
+  "ref_id": 15,
+  "timestamp": "2026-03-17T20:47:30.519964",
+  "entries": [
+    {
+      "account": "营业外成本-罚金",
+      "debit": 100.0,
+      "credit": 0.0,
+      "summary": "罚金支出入账"
+    },
+    {
+      "account": "货币资金",
+      "debit": 0,
+      "credit": 100.0,
+      "summary": "交纳罚金"
+    }
+  ]
+}

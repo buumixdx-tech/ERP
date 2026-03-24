@@ -1,0 +1,21 @@
+{
+  "voucher_no": "LOG-4-449CF5",
+  "ref_vc_id": 9,
+  "ref_type": "Logistics",
+  "ref_id": 4,
+  "timestamp": "2026-03-21T21:17:58.042975",
+  "entries": [
+    {
+      "account": "存货/固定资产",
+      "debit": 10000.0,
+      "credit": 0.0,
+      "summary": "采购设备入库"
+    },
+    {
+      "account": "应付账款 (供应商)",
+      "debit": 0.0,
+      "credit": 10000.0,
+      "summary": "入库挂账"
+    }
+  ]
+}

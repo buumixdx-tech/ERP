@@ -1,0 +1,21 @@
+{
+  "voucher_no": "CSH-13-A5601E",
+  "ref_vc_id": 7,
+  "ref_type": "CashFlow",
+  "ref_id": 13,
+  "timestamp": "2026-03-21T21:17:58.012561",
+  "entries": [
+    {
+      "account": "应付账款 (供应商)",
+      "debit": 10000.0,
+      "credit": 0.0,
+      "summary": "核销应付"
+    },
+    {
+      "account": "货币资金",
+      "debit": 0,
+      "credit": 10000.0,
+      "summary": "支付资金 (预付)"
+    }
+  ]
+}

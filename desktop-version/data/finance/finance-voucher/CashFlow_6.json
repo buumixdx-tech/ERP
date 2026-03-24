@@ -1,0 +1,21 @@
+{
+  "voucher_no": "CSH-6-F52CEB",
+  "ref_vc_id": 4,
+  "ref_type": "CashFlow",
+  "ref_id": 6,
+  "timestamp": "2026-03-21T21:17:57.685518",
+  "entries": [
+    {
+      "account": "其他预付款-押金",
+      "debit": 100.0,
+      "credit": 0.0,
+      "summary": "支付押金"
+    },
+    {
+      "account": "货币资金",
+      "debit": 0,
+      "credit": 100.0,
+      "summary": "支付押金"
+    }
+  ]
+}
