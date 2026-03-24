@@ -35,4 +35,8 @@ object DatabaseModule {
     @Provides
     @Singleton
     fun provideSKUDao(db: AppDatabase) = db.skuDao()
+
+    @Provides
+    @Singleton
+    fun provideDashboardDao(db: AppDatabase) = db.dashboardDao()
 }

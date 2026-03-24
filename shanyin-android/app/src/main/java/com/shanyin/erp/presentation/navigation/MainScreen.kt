@@ -12,6 +12,7 @@ import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.*
 import com.shanyin.erp.presentation.customer.CustomerListScreen
+import com.shanyin.erp.presentation.dashboard.DashboardScreen
 import com.shanyin.erp.presentation.sku.SKUListScreen
 import com.shanyin.erp.presentation.supplier.SupplierListScreen
 
@@ -56,7 +57,7 @@ fun MainScreen() {
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Dashboard.route) {
-                PlaceholderScreen("工作台看板 (本地数据渲染: 在建)")
+                DashboardScreen()
             }
             composable(Screen.Customers.route) {
                 CustomerListScreen()

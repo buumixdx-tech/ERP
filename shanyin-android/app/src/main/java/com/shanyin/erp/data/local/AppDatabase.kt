@@ -18,4 +18,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun channelCustomerDao(): ChannelCustomerDao
     abstract fun supplierDao(): SupplierDao
     abstract fun skuDao(): SKUDao
+    abstract fun dashboardDao(): DashboardDao
 }

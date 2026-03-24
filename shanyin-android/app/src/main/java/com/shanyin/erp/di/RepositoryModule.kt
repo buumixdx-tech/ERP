@@ -4,6 +4,7 @@ import com.shanyin.erp.data.repository.CustomerRepositoryImpl
 import com.shanyin.erp.data.repository.SKURepositoryImpl
 import com.shanyin.erp.data.repository.SupplierRepositoryImpl
 import com.shanyin.erp.domain.repository.CustomerRepository
+import com.shanyin.erp.domain.repository.DashboardRepository
 import com.shanyin.erp.domain.repository.SKURepository
 import com.shanyin.erp.domain.repository.SupplierRepository
 import dagger.Binds
@@ -33,4 +34,10 @@ abstract class RepositoryModule {
     abstract fun bindSKURepository(
         skuRepositoryImpl: SKURepositoryImpl
     ): SKURepository
+
+    @Binds
+    @Singleton
+    abstract fun bindDashboardRepository(
+        dashboardRepositoryImpl: DashboardRepositoryImpl
+    ): DashboardRepository
 }
