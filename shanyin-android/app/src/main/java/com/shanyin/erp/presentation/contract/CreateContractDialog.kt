@@ -107,7 +107,7 @@ fun CreateContractDialog(
                                 Icon(Icons.Default.Delete, contentDescription = "删除该行", tint = MaterialTheme.colorScheme.error)
                             }
                         }
-                        Divider()
+                        HorizontalDivider()
                     }
                 }
                 
