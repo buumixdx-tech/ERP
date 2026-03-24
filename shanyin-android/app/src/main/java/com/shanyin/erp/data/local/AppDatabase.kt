@@ -9,7 +9,9 @@ import com.shanyin.erp.data.local.dao.*
     entities = [
         ChannelCustomerEntity::class,
         SupplierEntity::class,
-        SKUEntity::class
+        SKUEntity::class,
+        VirtualContractEntity::class,
+        VirtualContractItemEntity::class
     ],
     version = 1,
     exportSchema = false
@@ -19,4 +21,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun supplierDao(): SupplierDao
     abstract fun skuDao(): SKUDao
     abstract fun dashboardDao(): DashboardDao
+    abstract fun virtualContractDao(): VirtualContractDao
 }

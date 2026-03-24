@@ -21,7 +21,9 @@ object DatabaseModule {
             context,
             AppDatabase::class.java,
             "shanyin_erp_local.db"
-        ).build()
+        )
+        .fallbackToDestructiveMigration()
+        .build()
     }
 
     @Provides
@@ -39,4 +41,8 @@ object DatabaseModule {
     @Provides
     @Singleton
     fun provideDashboardDao(db: AppDatabase) = db.dashboardDao()
+
+    @Provides
+    @Singleton
+    fun provideVirtualContractDao(db: AppDatabase) = db.virtualContractDao()
 }

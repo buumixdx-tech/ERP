@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.*
+import com.shanyin.erp.presentation.contract.VirtualContractScreen
 import com.shanyin.erp.presentation.customer.CustomerListScreen
 import com.shanyin.erp.presentation.dashboard.DashboardScreen
 import com.shanyin.erp.presentation.sku.SKUListScreen
@@ -22,6 +23,7 @@ fun MainScreen() {
 
     val items = listOf(
         Screen.Dashboard,
+        Screen.Contracts,
         Screen.Customers,
         Screen.Suppliers,
         Screen.SKUs
@@ -53,11 +55,14 @@ fun MainScreen() {
     ) { innerPadding ->
         NavHost(
             navController = navController,
-            startDestination = Screen.Customers.route,
+            startDestination = Screen.Contracts.route,
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Dashboard.route) {
                 DashboardScreen()
+            }
+            composable(Screen.Contracts.route) {
+                VirtualContractScreen()
             }
             composable(Screen.Customers.route) {
                 CustomerListScreen()
