@@ -45,4 +45,8 @@ object DatabaseModule {
     @Provides
     @Singleton
     fun provideVirtualContractDao(db: AppDatabase) = db.virtualContractDao()
+
+    @Provides
+    @Singleton
+    fun provideAdvancedDomainDao(db: AppDatabase) = db.advancedDomainDao()
 }

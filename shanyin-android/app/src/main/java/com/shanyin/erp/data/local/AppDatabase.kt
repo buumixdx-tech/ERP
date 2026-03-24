@@ -11,9 +11,17 @@ import com.shanyin.erp.data.local.dao.*
         SupplierEntity::class,
         SKUEntity::class,
         VirtualContractEntity::class,
-        VirtualContractItemEntity::class
+        VirtualContractItemEntity::class,
+        LogisticsEntity::class,
+        ExpressOrderEntity::class,
+        CashFlowEntity::class,
+        FinanceAccountEntity::class,
+        FinancialJournalEntity::class,
+        SystemEventEntity::class,
+        EquipmentInventoryEntity::class,
+        MaterialInventoryEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -22,4 +30,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun skuDao(): SKUDao
     abstract fun dashboardDao(): DashboardDao
     abstract fun virtualContractDao(): VirtualContractDao
+    abstract fun advancedDomainDao(): AdvancedDomainDao
 }
