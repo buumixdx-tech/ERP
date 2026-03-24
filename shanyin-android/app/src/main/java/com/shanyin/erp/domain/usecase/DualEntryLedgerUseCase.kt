@@ -60,7 +60,7 @@ class DualEntryLedgerUseCase @Inject constructor(
             )
 
             // 3. Trigger State Machine cascading updates locally!
-            stateMachineUseCase.invoke(vcId, refType = "cash_flow", refId = cfId)
+            stateMachineUseCase.invoke(vcId)
         }
     }
 }

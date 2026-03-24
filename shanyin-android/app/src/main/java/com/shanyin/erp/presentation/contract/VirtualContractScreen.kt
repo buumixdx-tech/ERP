@@ -49,7 +49,9 @@ fun VirtualContractScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     items(contracts) { contractWithItems ->
-                        ContractItem(contractWithItems)
+                        ContractItem(contractWithItems, onPayClick = { amt ->
+                            viewModel.simulatePayment(contractWithItems.contract.localId, amt)
+                        })
                     }
                 }
             }
@@ -65,7 +67,7 @@ fun VirtualContractScreen(
 }
 
 @Composable
-fun ContractItem(withItems: VirtualContractWithItems) {
+fun ContractItem(withItems: VirtualContractWithItems, onPayClick: (Double) -> Unit = {}) {
     val contract = withItems.contract
     val items = withItems.items
     val sdf = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
@@ -76,9 +78,9 @@ fun ContractItem(withItems: VirtualContractWithItems) {
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "单号: ${contract.contractNo}", style = MaterialTheme.typography.titleMedium)
-                Badge(containerColor = MaterialTheme.colorScheme.tertiary) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(text = " 单号: ${contract.contractNo}", style = MaterialTheme.typography.titleMedium)
+                Badge(containerColor = if (contract.status == "FINISH") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error) {
                     Text(contract.status, modifier = Modifier.padding(4.dp))
                 }
             }
@@ -87,9 +89,20 @@ fun ContractItem(withItems: VirtualContractWithItems) {
             Text(text = "总计额度: ¥ ${contract.totalAmount}", style = MaterialTheme.typography.bodyMedium)
             Text(text = "创建时间: ${sdf.format(Date(contract.createdAt))}", style = MaterialTheme.typography.bodySmall)
             
+            if (contract.status != "FINISH") {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = { onPayClick(contract.totalAmount) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                ) {
+                    Text("💰 模拟结算 (触发复式记账与本地核销)")
+                }
+            }
+            
             if (items.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Divider()
+                HorizontalDivider()
                 Spacer(modifier = Modifier.height(4.dp))
                 items.forEach { item ->
                     Text(

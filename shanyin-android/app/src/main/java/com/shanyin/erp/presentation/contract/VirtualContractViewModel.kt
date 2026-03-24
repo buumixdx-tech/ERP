@@ -8,6 +8,7 @@ import com.shanyin.erp.data.local.entity.VirtualContractItemEntity
 import com.shanyin.erp.domain.repository.CustomerRepository
 import com.shanyin.erp.domain.repository.SKURepository
 import com.shanyin.erp.domain.repository.VirtualContractRepository
+import com.shanyin.erp.domain.usecase.DualEntryLedgerUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -26,7 +27,8 @@ data class DraftItemState(
 class VirtualContractViewModel @Inject constructor(
     private val contractRepository: VirtualContractRepository,
     private val customerRepository: CustomerRepository,
-    private val skuRepository: SKURepository
+    private val skuRepository: SKURepository,
+    private val dualEntryLedgerUseCase: DualEntryLedgerUseCase
 ) : ViewModel() {
 
     val contracts = contractRepository.getAllContractsFlow()
@@ -76,6 +78,19 @@ class VirtualContractViewModel @Inject constructor(
         viewModelScope.launch {
             contractRepository.createDraftContract(customerLocalId, contractNo, itemEntities)
             clearDraft()
+        }
+    }
+
+    fun simulatePayment(vcId: Long, amount: Double) {
+        viewModelScope.launch {
+            // Using placeholder Account IDs (1L for Bank, 2L for Client AR)
+            dualEntryLedgerUseCase.recordCashFlowAndGenerateLedgers(
+                vcId = vcId,
+                amount = amount,
+                cfType = "FULFILLMENT",
+                debitAccountId = 1L,
+                creditAccountId = 2L
+            )
         }
     }
 }

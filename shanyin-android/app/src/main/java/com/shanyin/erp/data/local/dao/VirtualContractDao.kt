@@ -12,6 +12,10 @@ interface VirtualContractDao {
     @Transaction
     @Query("SELECT * FROM virtual_contracts ORDER BY createdAt DESC")
     fun getAllContractsWithItemsFlow(): Flow<List<VirtualContractWithItems>>
+    
+    @Transaction
+    @Query("SELECT * FROM virtual_contracts WHERE localId = :vcId")
+    suspend fun getContractWithItems(vcId: Long): VirtualContractWithItems?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertContract(contract: VirtualContractEntity): Long
