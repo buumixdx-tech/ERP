@@ -24,7 +24,6 @@ venv.bak/
 .flaskenv
 temp/
 *.log
-json/*.json
 
 # [测试相关]
 .pytest_cache/
