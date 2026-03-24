@@ -27,4 +27,12 @@ object DatabaseModule {
     @Provides
     @Singleton
     fun provideChannelCustomerDao(db: AppDatabase) = db.channelCustomerDao()
+
+    @Provides
+    @Singleton
+    fun provideSupplierDao(db: AppDatabase) = db.supplierDao()
+
+    @Provides
+    @Singleton
+    fun provideSKUDao(db: AppDatabase) = db.skuDao()
 }
