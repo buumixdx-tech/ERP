@@ -54,7 +54,7 @@ fun DashboardScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "欢迎使用善饮ERP系统",
+                text = "欢迎使用闪饮ERP系统",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
