@@ -3,7 +3,8 @@ from models import Supplier, SupplyChain, SupplyChainItem
 from .schemas import CreateSupplyChainSchema, DeleteSupplyChainSchema
 from logic.base import ActionResult
 from logic.events.dispatcher import emit_event
-from logic.constants import SystemEventType, SystemAggregateType
+from logic.constants import SystemEventType, SystemAggregateType, TimeRuleRelatedType
+from logic.time_rules.rule_manager import RuleManager
 from datetime import datetime
 
 def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchema) -> ActionResult:
@@ -36,6 +37,15 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
             session.flush()
             sc_id = new_sc.id
             msg = f"已为供应商 {payload.supplier_name} 创建新的 {payload.type} 协议"
+
+        # 生成付款条款时间规则
+        if payload.payment_terms:
+            RuleManager(session).generate_rules_from_payment_terms(
+                related_id=sc_id,
+                related_type=TimeRuleRelatedType.SUPPLY_CHAIN,
+                payment_terms=payload.payment_terms,
+                entity_type=TimeRuleRelatedType.SUPPLY_CHAIN
+            )
 
         emit_event(session, SystemEventType.SUPPLY_CHAIN_CREATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
             "supplier_id": payload.supplier_id, "type": payload.type

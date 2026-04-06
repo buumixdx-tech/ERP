@@ -361,3 +361,151 @@ def get_vc_count_by_business(business_id: int) -> int:
         return session.query(VirtualContract).filter(VirtualContract.business_id == business_id).count()
     finally:
         session.close()
+
+
+# =============================================================================
+# VC 各场景有效点位查询（供 UI 层下拉框使用）
+# =============================================================================
+
+from models import Business, SupplyChain, VirtualContract, Point, MaterialInventory, EquipmentInventory
+from logic.constants import ReturnDirection
+
+
+def get_valid_receiving_points_for_procurement(session, business_id: int) -> list[dict]:
+    """
+    设备采购：收货点 = 客户所有点位（不限 type）
+    """
+    biz = session.query(Business).get(business_id)
+    if not biz or not biz.customer_id:
+        return []
+    pts = session.query(Point).filter(Point.customer_id == biz.customer_id).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_receiving_points_for_mat_procurement(session, sc_id: int) -> list[dict]:
+    """
+    物料采购/库存采购：收货点 = 我们仓库 + 供应商仓库
+    """
+    sc = session.query(SupplyChain).get(sc_id)
+    our = session.query(Point).filter(Point.type == "自有仓").all()
+    supplier_pts = []
+    if sc:
+        supplier_pts = session.query(Point).filter(
+            Point.supplier_id == sc.supplier_id,
+            Point.type == "供应商仓"
+        ).all()
+    pts = our + supplier_pts
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_shipping_points_for_mat_procurement(session, sc_id: int) -> list[dict]:
+    """
+    物料采购/库存采购：发货点 = 供应商仓库（由供应链的 supplier_id 确定）
+    """
+    sc = session.query(SupplyChain).get(sc_id)
+    if not sc:
+        return []
+    pts = session.query(Point).filter(
+        Point.supplier_id == sc.supplier_id,
+        Point.type == "供应商仓"
+    ).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_receiving_points_for_material_supply(session, business_id: int) -> list[dict]:
+    """
+    物料供应：收货点 = 客户所有点位（不限 type）
+    """
+    return get_valid_receiving_points_for_procurement(session, business_id)
+
+
+def get_valid_shipping_points_for_material_supply(session, sku_id: int) -> list[dict]:
+    """
+    物料供应：发货点 = 有该 SKU 物料库存的仓库
+    从 MaterialInventory.stock_distribution 的 key（仓库名称）匹配 Point.name
+    """
+    mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).first()
+    if not mat_inv or not mat_inv.stock_distribution:
+        return []
+    wh_names = list(mat_inv.stock_distribution.keys())
+    pts = session.query(Point).filter(Point.name.in_(wh_names)).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_receiving_points_for_allocation(session, business_id: int) -> list[dict]:
+    """
+    库存拨付：收货点 = 客户所有点位（不限 type）
+    """
+    return get_valid_receiving_points_for_procurement(session, business_id)
+
+
+def get_valid_shipping_points_for_allocation(session, sku_id: int) -> list[dict]:
+    """
+    库存拨付：发货点 = 有该 SKU 设备库存的点位（来自 EquipmentInventory）
+    """
+    eqs = session.query(EquipmentInventory).filter(
+        EquipmentInventory.sku_id == sku_id,
+        EquipmentInventory.operational_status == "库存"
+    ).all()
+    point_ids = list({eq.point_id for eq in eqs})
+    if not point_ids:
+        return []
+    pts = session.query(Point).filter(Point.id.in_(point_ids)).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_shipping_points_for_return_equipment(session, target_vc_id: int) -> list[dict]:
+    """
+    退货-设备采购：发货点 = 目标VC关联客户下，有该SKU设备的点位（不限 type）
+    """
+    target_vc = session.query(VirtualContract).get(target_vc_id)
+    if not target_vc or not target_vc.business_id:
+        return []
+    biz = session.query(Business).get(target_vc.business_id)
+    if not biz or not biz.customer_id:
+        return []
+    cust_pts = session.query(Point).filter(Point.customer_id == biz.customer_id).all()
+    cust_point_ids = [p.id for p in cust_pts]
+    if not cust_point_ids:
+        return []
+    sku_ids = [e["sku_id"] for e in target_vc.elements.get("elements", [])]
+    if not sku_ids:
+        return []
+    eqs = session.query(EquipmentInventory).filter(
+        EquipmentInventory.sku_id.in_(sku_ids),
+        EquipmentInventory.point_id.in_(cust_point_ids)
+    ).all()
+    valid_pt_ids = list({eq.point_id for eq in eqs})
+    pts = session.query(Point).filter(Point.id.in_(valid_pt_ids)).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+
+
+def get_valid_shipping_points_for_return_mat(session, sku_id: int) -> list[dict]:
+    """
+    退货-物料采购/库存采购：发货点 = 我们有该 SKU 物料库存的点位
+    """
+    return get_valid_shipping_points_for_material_supply(session, sku_id)
+
+
+def get_valid_receiving_points_for_return(session, target_vc_id: int, return_direction: str) -> list[dict]:
+    """
+    退货收货点：
+    - CUSTOMER_TO_US → 我们仓库（自有仓）
+    - US_TO_SUPPLIER → 挂钩VC供应链的供应商仓库
+    """
+    if return_direction == ReturnDirection.CUSTOMER_TO_US:
+        pts = session.query(Point).filter(Point.type == "自有仓").all()
+    else:
+        target_vc = session.query(VirtualContract).get(target_vc_id)
+        if target_vc and target_vc.supply_chain_id:
+            sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
+            if sc:
+                pts = session.query(Point).filter(
+                    Point.supplier_id == sc.supplier_id,
+                    Point.type == "供应商仓"
+                ).all()
+            else:
+                pts = []
+        else:
+            pts = []
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]

@@ -23,7 +23,7 @@ class TestLogisticsActions:
                 {
                     "tracking_number": "SF1234567890",
                     "items": [{"name": "设备A", "qty": 1}],
-                    "address_info": {"name": "张三", "phone": "13800138000", "address": "测试地址"}
+                    "address_info": {"收货方联系电话": "13800138000", "发货方联系电话": "13900139000", "收货点位名称": "测试仓库", "发货点位名称": "供应商仓库", "address": "测试地址"}
                 }
             ]
         )

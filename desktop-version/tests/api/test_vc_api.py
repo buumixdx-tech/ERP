@@ -152,6 +152,18 @@ class TestVCAPI:
 def client():
     """创建测试客户端"""
     from api.app import create_app
-    
+    from sqlalchemy import create_engine, text
+
     app = create_app()
+
+    # 对 API 数据库执行 ADD COLUMN（如果列不存在）
+    engine = create_engine("sqlite:///data/business_system.db")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE virtual_contracts ADD COLUMN return_direction VARCHAR(50)"))
+            conn.commit()
+    except Exception:
+        pass
+    engine.dispose()
+
     return TestClient(app)

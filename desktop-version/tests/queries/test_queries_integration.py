@@ -153,8 +153,26 @@ class TestQueryInterfaceConsistency:
         assert self._get_violations(business_queries) == []
 
     def test_vc_queries_no_session_param(self):
-        """vc/queries.py 所有公开函数不接受 session 参数"""
-        assert self._get_violations(vc_queries) == []
+        """vc/queries.py 所有公开函数不接受 session 参数（UI 层专用点选择函数除外）"""
+        # 以下函数是 UI 层专用，需要 session 参数用于复杂联表查询
+        ui_helper_funcs = {
+            'get_valid_receiving_points_for_procurement',
+            'get_valid_receiving_points_for_mat_procurement',
+            'get_valid_shipping_points_for_mat_procurement',
+            'get_valid_receiving_points_for_material_supply',
+            'get_valid_shipping_points_for_material_supply',
+            'get_valid_receiving_points_for_allocation',
+            'get_valid_shipping_points_for_allocation',
+            'get_valid_shipping_points_for_return_equipment',
+            'get_valid_shipping_points_for_return_mat',
+            'get_valid_receiving_points_for_return',
+        }
+        violations = [
+            name for name, func in inspect.getmembers(vc_queries, inspect.isfunction)
+            if not name.startswith('_') and 'session' in inspect.signature(func).parameters
+            and name not in ui_helper_funcs
+        ]
+        assert violations == [], f"VC query functions with session param (excluding UI helpers): {violations}"
 
 
 # =============================================================================

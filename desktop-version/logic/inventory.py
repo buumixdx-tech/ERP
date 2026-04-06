@@ -39,13 +39,15 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                     qty = int(norm["qty"])
                     p_id = None
                     if o.address_info:
-                        p_id = o.address_info.get("pointId")
-                        if not p_id and "pointName" in o.address_info:
-                            p_obj = session.query(models.Point).filter(models.Point.name == o.address_info["pointName"]).first()
+                        p_id = o.address_info.get("收货点位Id")
+                        if not p_id and "收货点位名称" in o.address_info:
+                            p_obj = session.query(models.Point).filter(models.Point.name == o.address_info["收货点位名称"]).first()
                             if p_obj: p_id = p_obj.id
                     
                     if not p_id:
-                        p_id = vc.elements.get("point_id")
+                        vc_elems = (vc.elements or {}).get("elements", [])
+                        if vc_elems:
+                            p_id = vc_elems[0].get("receiving_point_id")
 
                     for _ in range(qty):
                         if sn_index < len(sns):
@@ -62,9 +64,9 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                             inv = models.EquipmentInventory(
                                 sku_id=sid,
                                 sn=current_sn,
-                                operational_status=OperationalStatus.OPERATING,
+                                operational_status=OperationalStatus.STOCK if vc.type == VCType.STOCK_PROCUREMENT else OperationalStatus.OPERATING,
                                 device_status=DeviceStatus.NORMAL,
-                                virtual_contract_id=vc.id,
+                                virtual_contract_id=vc.id if vc.type == VCType.EQUIPMENT_PROCUREMENT else None,  # 库存采购不关联业务VC
                                 point_id=p_id,
                                 deposit_amount=item.get("deposit", 0.0),
                                 deposit_timestamp=datetime.now()
@@ -72,40 +74,41 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                             session.add(inv)
                             sn_index += 1
             session.flush() # Added session.flush() here
-            from logic.deposit import deposit_module
-            deposit_module(vc_id=vc.id, session=session)
+            # 仅设备采购触发押金核算，库存采购不涉及押金
+            if vc.type == VCType.EQUIPMENT_PROCUREMENT:
+                from logic.deposit import deposit_module
+                deposit_module(vc_id=vc.id, session=session)
 
         elif vc.type in [VCType.MATERIAL_PROCUREMENT, VCType.MATERIAL_SUPPLY]:
             orders = session.query(models.ExpressOrder).filter(models.ExpressOrder.logistics_id == logistics_id).all()
             for o in orders:
                 if not o.items: continue
+                # 从 address_info 获取仓库信息（items 只含 sku_id, sku_name, qty）
+                addr_info = o.address_info or {}
+                recv_point_id = addr_info.get("收货点位Id")
+                recv_point_name = addr_info.get("收货点位名称", SystemConstants.DEFAULT_POINT)
+                send_point_id = addr_info.get("发货点位Id")
+                send_point_name = addr_info.get("发货点位名称", "")
+
                 for item in o.items:
-                    norm = normalize_item_data(item)
-                    sid, qty = norm["sku_id"], norm["qty"]
+                    sid = item.get("sku_id")
+                    qty = int(item.get("qty", 0))
                     if not sid or qty <= 0: continue
-                    
+
                     mat = session.query(models.MaterialInventory).filter(models.MaterialInventory.sku_id == sid).first()
                     if not mat:
                         mat = models.MaterialInventory(sku_id=sid, total_balance=0.0, average_price=0.0)
                         session.add(mat)
                         session.flush()
-                    
+
                     if vc.type == VCType.MATERIAL_PROCUREMENT:
                         unit_price = 0.0
-                        if "skus" in vc.elements:
-                            for sk in vc.elements["skus"]:
-                                snormal = normalize_item_data(sk)
-                                if str(snormal["sku_id"]) == str(sid):
-                                    unit_price = snormal["price"]
-                                    break
-                        elif "points" in vc.elements:
-                            for p in vc.elements["points"]:
-                                for sk in p.get("items", []):
-                                    if str(sk.get("skuId") or sk.get("sku_id") or sk.get("id")) == str(sid):
-                                        unit_price = float(sk.get("unitPrice") or sk.get("price") or 0)
-                                        break
-                                if unit_price > 0: break
-                        
+                        vc_elems = (vc.elements or {}).get("elements", [])
+                        for sk in vc_elems:
+                            if str(sk.get("sku_id")) == str(sid):
+                                unit_price = float(sk.get("price") or 0)
+                                break
+
                         if unit_price > 0:
                             current_bal = mat.total_balance or 0.0
                             current_avg = mat.average_price or 0.0
@@ -118,49 +121,83 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                             mat.total_balance = (mat.total_balance or 0.0) + float(qty)
 
                         dist = dict(mat.stock_distribution or {})
-                        warehouse = norm["point_name"]
-                        if warehouse == SystemConstants.UNKNOWN and o.address_info:
-                            warehouse = o.address_info.get("pointName", SystemConstants.DEFAULT_WAREHOUSE)
-                        if warehouse == SystemConstants.UNKNOWN: 
-                            warehouse = SystemConstants.DEFAULT_WAREHOUSE
-                            
-                        dist[warehouse] = dist.get(warehouse, 0) + float(qty)
+                        # 物料采购入库：收货点位ID作为库存分布键
+                        point_key = str(recv_point_id) if recv_point_id else SystemConstants.DEFAULT_POINT
+
+                        dist[point_key] = dist.get(point_key, 0) + float(qty)
                         mat.stock_distribution = dist
                         flag_modified(mat, "stock_distribution")
                     else:
                         mat.total_balance = (mat.total_balance or 0.0) - float(qty)
                         dist = dict(mat.stock_distribution or {})
-                        warehouse = item.get("source_warehouse") or item.get("sourceWarehouse") or norm.get("source_warehouse")
-                        if (not warehouse or warehouse == SystemConstants.UNKNOWN or warehouse == SystemConstants.DEFAULT_WAREHOUSE) and o.address_info:
-                            warehouse = o.address_info.get("sourceWarehouse") or o.address_info.get("pointName")
-                        if not warehouse or warehouse == SystemConstants.UNKNOWN: 
-                            warehouse = SystemConstants.DEFAULT_WAREHOUSE
-                        
-                        dist[warehouse] = dist.get(warehouse, 0) - float(qty)
+                        # 物料供应出库：发货点位ID作为库存分布键
+                        point_key = str(send_point_id) if send_point_id else SystemConstants.DEFAULT_POINT
+
+                        dist[point_key] = dist.get(point_key, 0) - float(qty)
                         mat.stock_distribution = dist
                         flag_modified(mat, "stock_distribution")
 
         elif vc.type == VCType.RETURN:
             orders = session.query(models.ExpressOrder).filter(models.ExpressOrder.logistics_id == logistics_id).all()
-            direction = vc.elements.get("return_direction", SystemConstants.UNKNOWN)
-            for o in orders:
-                if not o.items: continue
-                dest_p_id = None
-                if o.address_info:
-                    dest_p_id = o.address_info.get("pointId")
-                    if not dest_p_id and "pointName" in o.address_info:
-                        p_obj = session.query(models.Point).filter(models.Point.name == o.address_info["pointName"]).first()
-                        if p_obj: dest_p_id = p_obj.id
+            direction = getattr(vc, 'return_direction', None) or (vc.elements.get("return_direction") if vc.elements else SystemConstants.UNKNOWN)
+            # 从 vc.elements 获取物品信息
+            return_items_map = {}
+            ret_elems = (vc.elements or {}).get("elements", [])
+            for ri in ret_elems:
+                # sn 可能在 sn_list 数组中（VCElementSchema），也可能在 sn 字段（旧结构）
+                sn_val = ri.get("sn")
+                if not sn_val or sn_val == "-":
+                    sn_list = ri.get("sn_list") or []
+                    sn_val = sn_list[0] if sn_list else "-"
+                key = (ri.get("sku_id"), sn_val)
+                return_items_map[key] = ri
 
+            # equipment_sn_json 包含退货设备的 SN 列表（由 confirm_inbound 传入）
+            # 用于直接定位设备记录进行位置/状态更新
+            sns = equipment_sn_json if equipment_sn_json else []
+
+            for o in orders:
+                addr_info = o.address_info or {}
+                # 收货点位信息
+                recv_point_id = addr_info.get("收货点位Id")
+                recv_point_name = addr_info.get("收货点位名称", SystemConstants.DEFAULT_POINT)
+                # 发货点位信息
+                send_point_id = addr_info.get("发货点位Id")
+                send_point_name = addr_info.get("发货点位名称", "")
+
+                if not o.items: continue
                 for item in o.items:
-                    norm = normalize_item_data(item)
-                    sid, sn = norm["sku_id"], norm["sn"]
-                    qty, price = norm["qty"], norm["price"]
-                    
-                    if sn and sn != "-":
-                        equip = session.query(models.EquipmentInventory).filter(models.EquipmentInventory.sn == sn).first()
+                    sid = item.get("sku_id")
+                    qty = int(item.get("qty", 0))
+                    sn = item.get("sn", "-")
+                    if not sid or qty <= 0: continue
+
+                    # 优先使用 equipment_sn_json 中的 SN（来自 confirm_inbound）
+                    # 其次使用 order item 中的 sn 字段
+                    lookup_sn = None
+                    if sns:
+                        # 从 ret_elems 中查找匹配 sku_id 的 SN
+                        for ri in ret_elems:
+                            if int(ri.get("sku_id")) == int(sid):
+                                ri_sn = ri.get("sn")
+                                if not ri_sn or ri_sn == "-":
+                                    sn_list = ri.get("sn_list") or []
+                                    ri_sn = sn_list[0] if sn_list else "-"
+                                if ri_sn and ri_sn != "-" and ri_sn in sns:
+                                    lookup_sn = ri_sn
+                                    break
+                    if not lookup_sn:
+                        lookup_sn = sn
+
+                    # 从 vc.elements.return_items 查找完整信息
+                    key = (sid, lookup_sn)
+                    full_item = return_items_map.get(key) or {}
+                    price = full_item.get("price", 0.0)
+
+                    if lookup_sn and lookup_sn != "-":
+                        equip = session.query(models.EquipmentInventory).filter(models.EquipmentInventory.sn == lookup_sn).first()
                         if equip:
-                            if dest_p_id: equip.point_id = dest_p_id
+                            if recv_point_id: equip.point_id = recv_point_id
                             if ReturnDirection.CUSTOMER_TO_US in direction:
                                 equip.operational_status = OperationalStatus.STOCK
                             elif ReturnDirection.US_TO_SUPPLIER in direction:
@@ -175,26 +212,22 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                             session.flush()
                         dist = dict(mat.stock_distribution or {})
                         if ReturnDirection.CUSTOMER_TO_US in direction:
-                            warehouse_name = norm["point_name"]
-                            if (not warehouse_name or warehouse_name == SystemConstants.UNKNOWN) and o.address_info:
-                                warehouse_name = o.address_info.get("pointName", SystemConstants.DEFAULT_WAREHOUSE)
-                            
+                            # 退货到我方：收货点位ID作为库存分布键
+                            point_key = str(recv_point_id) if recv_point_id else SystemConstants.DEFAULT_POINT
+
                             sku_obj = session.query(models.SKU).get(sid)
                             cost_price = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else price
                             new_total_val = (mat.total_balance * mat.average_price) + (qty * cost_price)
                             mat.total_balance += qty
                             if mat.total_balance > 0:
                                 mat.average_price = new_total_val / mat.total_balance
-                            dist[warehouse_name] = dist.get(warehouse_name, 0) + qty
+                            dist[point_key] = dist.get(point_key, 0) + qty
                         elif ReturnDirection.US_TO_SUPPLIER in direction:
-                            source_wh = item.get("point_name") or item.get("warehouse") or norm["point_name"]
-                            if (not source_wh or source_wh == SystemConstants.UNKNOWN) and o.address_info:
-                                source_wh = o.address_info.get("sourceWarehouse") or o.address_info.get("pointName")
-                            if not source_wh or source_wh == SystemConstants.UNKNOWN: 
-                                source_wh = SystemConstants.DEFAULT_WAREHOUSE
-                            
+                            # 退货到供应商：发货点位ID作为库存分布键（减库存）
+                            point_key = str(send_point_id) if send_point_id else SystemConstants.DEFAULT_POINT
+
                             mat.total_balance -= qty
-                            dist[source_wh] = dist.get(source_wh, 0) - qty
+                            dist[point_key] = dist.get(point_key, 0) - qty
                         mat.stock_distribution = dist
                         flag_modified(mat, "stock_distribution")
 

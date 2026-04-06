@@ -13,7 +13,7 @@ from logic.vc import (
     CreateProcurementVCSchema,
     CreateMaterialSupplyVCSchema,
     CreateReturnVCSchema,
-    VCItemSchema,
+    VCElementSchema,
     UpdateVCSchema,
     DeleteVCSchema
 )
@@ -22,19 +22,34 @@ from logic.vc import (
 class TestCreateProcurementVCAction:
     """设备采购执行单创建测试"""
 
-    def test_create_procurement_vc_success(self, db_session, sample_business, sample_sku):
+    def test_create_procurement_vc_success(self, db_session, sample_business, sample_sku, sample_supplier):
         """✅ 正常创建设备采购单"""
-        # Given
+        from models import Point, SupplyChain
+
+        # 创建设备采购所需的数据
+        sup_wh = Point(name="测试供应商仓", type="供应商仓", supplier_id=sample_supplier.id)
+        db_session.add(sup_wh)
+        cust_wh = Point(name="客户仓库A", type="客户仓", customer_id=sample_business.customer_id)
+        db_session.add(cust_wh)
+        db_session.flush()
+
+        sc = SupplyChain(supplier_id=sample_supplier.id, supplier_name=sample_supplier.name, type="设备")
+        db_session.add(sc)
+        db_session.flush()
+
         payload = CreateProcurementVCSchema(
             business_id=sample_business.id,
-            sc_id=None,
-            items=[
-                VCItemSchema(
+            sc_id=sc.id,
+            elements=[
+                VCElementSchema(
+                    shipping_point_id=0,
+                    receiving_point_id=cust_wh.id,
                     sku_id=sample_sku.id,
-                    sku_name="测试设备-001",
                     qty=10,
                     price=1000,
-                    deposit=100
+                    deposit=100,
+                    subtotal=10000,
+                    sn_list=[]
                 )
             ],
             total_amt=10000,
@@ -43,11 +58,9 @@ class TestCreateProcurementVCAction:
             description="测试采购单"
         )
 
-        # When
         result = create_procurement_vc_action(db_session, payload)
 
-        # Then
-        assert result.success is True
+        assert result.success is True, f"创建失败: {result.error}"
         assert result.data is not None
         assert "vc_id" in result.data
         assert result.data["vc_id"] > 0
@@ -58,13 +71,16 @@ class TestCreateProcurementVCAction:
         payload = CreateProcurementVCSchema(
             business_id=99999,
             sc_id=None,
-            items=[
-                VCItemSchema(
+            elements=[
+                VCElementSchema(
+                    shipping_point_id=1,
+                    receiving_point_id=2,
                     sku_id=sample_sku.id,
-                    sku_name="测试设备",
                     qty=1,
                     price=1000,
-                    deposit=0
+                    deposit=0,
+                    subtotal=1000,
+                    sn_list=[]
                 )
             ],
             total_amt=1000,
@@ -88,13 +104,16 @@ class TestCreateProcurementVCAction:
         payload = CreateProcurementVCSchema(
             business_id=sample_business.id,
             sc_id=None,
-            items=[
-                VCItemSchema(
+            elements=[
+                VCElementSchema(
+                    shipping_point_id=1,
+                    receiving_point_id=2,
                     sku_id=sample_sku.id,
-                    sku_name="测试设备",
                     qty=1,
                     price=1000,
-                    deposit=0
+                    deposit=0,
+                    subtotal=1000,
+                    sn_list=[]
                 )
             ],
             total_amt=1000,
@@ -116,7 +135,8 @@ class TestCreateMaterialSupplyVCAction:
         """❌ 业务不存在"""
         payload = CreateMaterialSupplyVCSchema(
             business_id=99999,
-            order={"points": [], "total_amount": 0}
+            elements=[],
+            total_amt=0
         )
 
         result = create_material_supply_vc_action(db_session, payload)
@@ -132,7 +152,7 @@ class TestCreateReturnVCAction:
         payload = CreateReturnVCSchema(
             target_vc_id=99999,
             return_direction="客户退我方",
-            return_items=[],
+            elements=[],
             goods_amount=0,
             deposit_amount=0,
             logistics_cost=0,
@@ -153,7 +173,7 @@ class TestUpdateVCAction:
         """✅ 正常更新 VC"""
         # Given
         new_description = "更新后的描述"
-        new_elements = {"skus": [{"name": "新设备"}]}
+        new_elements = {"elements": [{"id": "sp1_rp2_sku1", "shipping_point_id": 1, "receiving_point_id": 2, "sku_id": 1, "qty": 1, "price": 1000, "deposit": 0, "subtotal": 1000, "sn_list": []}]}
         new_deposit_info = {"should_receive": 2000}
 
         # When

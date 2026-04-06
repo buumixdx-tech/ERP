@@ -218,8 +218,10 @@ class TestLogisticsBoundary:
                 "tracking_number": f"SF{i:08d}",
                 "items": [{"name": f"设备{i}", "qty": 1}],
                 "address_info": {
-                    "name": f"用户{i}",
-                    "phone": f"138{i:08d}",
+                    "收货方联系电话": f"138{i:08d}",
+                    "发货方联系电话": f"139{i:08d}",
+                    "收货点位名称": f"仓库{i}",
+                    "发货点位名称": f"供应商{i}",
                     "address": f"地址{i}"
                 }
             })
@@ -257,8 +259,10 @@ class TestLogisticsBoundary:
                     "tracking_number": "SF1234567890",
                     "items": [{"name": "设备A", "qty": 1}],
                     "address_info": {
-                        "name": "张三",
-                        "phone": "",
+                        "收货方联系电话": "",
+                        "发货方联系电话": "13900139000",
+                        "收货点位名称": "测试仓库",
+                        "发货点位名称": "供应商",
                         "address": "测试地址"
                     }
                 }
@@ -276,10 +280,12 @@ class TestLogisticsBoundary:
             orders=[
                 {
                     "tracking_number": "",
-                    "items": [{"name": "设备A", "qty": 1}],
+                    "items": [{"sku_id": 1, "sku_name": "设备A", "qty": 1}],
                     "address_info": {
-                        "name": "张三",
-                        "phone": "13800138000",
+                        "收货方联系电话": "13800138000",
+                        "发货方联系电话": "13900139000",
+                        "收货点位名称": "测试仓库",
+                        "发货点位名称": "供应商",
                         "address": "测试地址"
                     }
                 }
@@ -297,13 +303,13 @@ class TestLogisticsBoundary:
             orders=[
                 {
                     "tracking_number": "SF1234567890",
-                    "items": [{"name": "设备A", "qty": 1}],
-                    "address_info": {"name": "张三", "phone": "13800138000", "address": "地址1"}
+                    "items": [{"sku_id": 1, "sku_name": "设备A", "qty": 1}],
+                    "address_info": {"收货方联系电话": "13800138000", "发货方联系电话": "13900139000", "收货点位名称": "仓库A", "发货点位名称": "供应商A", "address": "地址1"}
                 },
                 {
                     "tracking_number": "SF1234567890",
-                    "items": [{"name": "设备B", "qty": 1}],
-                    "address_info": {"name": "李四", "phone": "13800138001", "address": "地址2"}
+                    "items": [{"sku_id": 2, "sku_name": "设备B", "qty": 1}],
+                    "address_info": {"收货方联系电话": "13800138001", "发货方联系电话": "13900139001", "收货点位名称": "仓库B", "发货点位名称": "供应商B", "address": "地址2"}
                 }
             ]
         )
@@ -415,10 +421,12 @@ class TestLogisticsBoundary:
             orders=[
                 {
                     "tracking_number": "SF1234567890",
-                    "items": [{"name": "设备A", "qty": 1}],
+                    "items": [{"sku_id": 1, "sku_name": "设备A", "qty": 1}],
                     "address_info": {
-                        "name": "张三",
-                        "phone": "13800138000",
+                        "收货方联系电话": "13800138000",
+                        "发货方联系电话": "13900139000",
+                        "收货点位名称": "测试仓库",
+                        "发货点位名称": "供应商",
                         "address": "测试地址"
                     }
                 }

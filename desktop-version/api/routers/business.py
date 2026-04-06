@@ -21,7 +21,7 @@ def create_business(payload: CreateBusinessSchema, session: Session = Depends(ge
 
 @router.post("/update-status", summary="更新业务状态")
 def update_business_status(payload: UpdateBusinessStatusSchema, session: Session = Depends(get_db)):
-    """直接更新业务状态和详情。会触发时间规则传播。"""
+    """直接更新业务状态和详情（暂缓/终止等），并写入 history 记录。会触发时间规则传播。"""
     return update_business_status_action(session, payload).model_dump()
 
 

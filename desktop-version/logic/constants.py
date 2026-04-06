@@ -4,7 +4,7 @@
 """
 
 class SystemConstants:
-    DEFAULT_WAREHOUSE = "默认仓库"
+    DEFAULT_POINT = "默认点位"
     FLOAT_PRICING = "浮动"
     UNKNOWN = "未知"
 

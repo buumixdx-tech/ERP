@@ -20,9 +20,15 @@ from logic.master import (
     create_partner_action, update_partners_action, delete_partners_action
 )
 from logic.vc.queries import (
-    get_virtual_contracts_for_return, get_vc_detail_with_logs, get_vc_list_for_overview, 
+    get_virtual_contracts_for_return, get_vc_detail_with_logs, get_vc_list_for_overview,
     get_vc_count_by_business, get_vc_status_logs, get_vc_cash_flows, get_returnable_vcs,
-    get_vc_list, get_vc_detail
+    get_vc_list, get_vc_detail,
+    get_valid_receiving_points_for_procurement,
+    get_valid_receiving_points_for_mat_procurement, get_valid_shipping_points_for_mat_procurement,
+    get_valid_receiving_points_for_material_supply, get_valid_shipping_points_for_material_supply,
+    get_valid_receiving_points_for_allocation, get_valid_shipping_points_for_allocation,
+    get_valid_shipping_points_for_return_equipment, get_valid_shipping_points_for_return_mat,
+    get_valid_receiving_points_for_return,
 )
 from logic.logistics.queries import (
     get_logistics_list_by_vc, get_logistics_dashboard_summary
@@ -58,13 +64,13 @@ from logic.business import (
     CreateBusinessSchema, UpdateBusinessStatusSchema, AdvanceBusinessStageSchema
 )
 from logic.vc import (
-    create_procurement_vc_action, create_material_supply_vc_action, 
+    create_procurement_vc_action, create_material_supply_vc_action,
     create_return_vc_action, create_mat_procurement_vc_action,
     update_vc_action, delete_vc_action,
     create_stock_procurement_vc_action, allocate_inventory_action,
-    CreateProcurementVCSchema, VCItemSchema, CreateMaterialSupplyVCSchema, 
+    CreateProcurementVCSchema, VCItemSchema, CreateMaterialSupplyVCSchema,
     CreateReturnVCSchema, CreateMatProcurementVCSchema,
-    CreateStockProcurementVCSchema, AllocateInventorySchema
+    CreateStockProcurementVCSchema, AllocateInventorySchema, VCElementSchema
 )
 
 def _save_procurement_vc(_session, business_id, data):
@@ -73,16 +79,29 @@ def _save_procurement_vc(_session, business_id, data):
     现在通过 standardized Action 执行，UI 只负责数据准备与状态清理
     """
     # 1. 准备 Action Payload
-    # 注意：我们的 Action 要求标准的 VCItemSchema 列表
-    items_payload = []
+    # 新结构使用 VCElementSchema: (shipping_point_id, receiving_point_id, sku_id, qty, price, deposit, subtotal, sn_list)
+    elems_payload = []
     for i in data['items']:
         norm = normalize_item_data(i)
-        items_payload.append(VCItemSchema(**norm))
-    
+        qty = float(norm.get('qty') or 0)
+        price = float(norm.get('price') or 0)
+        deposit = float(norm.get('deposit') or 0)
+        elem = VCElementSchema(
+            shipping_point_id=int(norm.get('shipping_point_id') or 0),
+            receiving_point_id=int(norm.get('receiving_point_id') or norm.get('point_id') or 0),
+            sku_id=int(norm.get('sku_id') or 0),
+            qty=qty,
+            price=price,
+            deposit=deposit,
+            subtotal=qty * price,
+            sn_list=[norm.get('sn')] if norm.get('sn') and norm.get('sn') != '-' else []
+        )
+        elems_payload.append(elem)
+
     payload = CreateProcurementVCSchema(
         business_id=business_id,
         sc_id=data['sc_id'],
-        items=items_payload,
+        elements=elems_payload,
         total_amt=data['total_amt'],
         total_deposit=data['total_deposit'],
         payment=data['payment'],
@@ -156,13 +175,30 @@ def confirm_procurement_dialog(session, business_id):
 def _save_material_supply_vc(_session, business_id, data):
     """辅助物料供应保存，通过 Action 执行"""
     order = data['order']
-    # 这里的 normalize 逻辑保持在提交前执行（或移入 Action，但目前为了兼容 UI 传参格式先保留）
+    # 将 points[].items[] 结构转换为统一的 elements[]
+    elems_payload = []
     for p in order['points']:
-        p['items'] = [normalize_item_data(i) for i in p['items']]
-    
+        p_point_id = p.get('point_id') or 0
+        for i in p.get('items', []):
+            norm = normalize_item_data(i)
+            qty = float(norm.get('qty') or 0)
+            price = float(norm.get('price') or 0)
+            elem = VCElementSchema(
+                shipping_point_id=int(norm.get('shipping_point_id') or 0),
+                receiving_point_id=int(p_point_id),
+                sku_id=int(norm.get('sku_id') or 0),
+                qty=qty,
+                price=price,
+                deposit=0.0,
+                subtotal=qty * price,
+                sn_list=[]
+            )
+            elems_payload.append(elem)
+
     payload = CreateMaterialSupplyVCSchema(
         business_id=business_id,
-        order=order,
+        elements=elems_payload,
+        total_amt=order.get('total_amount', 0),
         description=data.get('description', '')
     )
     
@@ -196,7 +232,7 @@ def confirm_material_supply_dialog(session, business_id):
             st.rerun()
         return
 
-    st.write("请核对以下物料供应清单及规则。确认后将立即在各个发出仓库扣减相应物料库存并生成应收。")
+    st.write("请核对以下物料供应清单及规则。确认后将立即在各个发货点位扣减相应物料库存并生成应收。")
     
     order = data['order']
     c1, c2, c3 = st.columns(3)
@@ -216,7 +252,7 @@ def confirm_material_supply_dialog(session, business_id):
                 "数量": ni["qty"],
                 "单价": ni["price"],
                 "金额": ni["qty"] * ni["price"],
-                "发出仓库": ni.get("source_warehouse") or SystemConstants.DEFAULT_WAREHOUSE
+                "发货点位": ni.get("shipping_point_name") or SystemConstants.DEFAULT_POINT
             })
     st.table(pd.DataFrame(flat_items))
 
@@ -238,11 +274,26 @@ def confirm_material_supply_dialog(session, business_id):
 
 def _save_mat_procurement_vc(_session, sc_id, data):
     """辅助物料采购保存，通过 Action 执行"""
-    items_payload = [VCItemSchema(**normalize_item_data(i)) for i in data['items']]
-    
+    elems_payload = []
+    for i in data['items']:
+        norm = normalize_item_data(i)
+        qty = float(norm.get('qty') or 0)
+        price = float(norm.get('price') or 0)
+        elem = VCElementSchema(
+            shipping_point_id=int(norm.get('shipping_point_id') or 0),
+            receiving_point_id=int(norm.get('receiving_point_id') or norm.get('point_id') or 0),
+            sku_id=int(norm.get('sku_id') or 0),
+            qty=qty,
+            price=price,
+            deposit=0.0,
+            subtotal=qty * price,
+            sn_list=[]
+        )
+        elems_payload.append(elem)
+
     payload = CreateMatProcurementVCSchema(
         sc_id=sc_id,
-        items=items_payload,
+        elements=elems_payload,
         total_amt=data['total_amt'],
         payment=data['payment'],
         description=data.get('description')
@@ -291,7 +342,7 @@ def confirm_mat_procurement_dialog(session, sc_id):
         "sku_name": "品类名称",
         "qty": "数量",
         "price": "单价",
-        "point_name": "存放仓库"
+        "point_name": "存放点位"
     })
     st.table(df_preview[["品类名称", "数量", "单价", "存放仓库"]])
 
@@ -313,12 +364,27 @@ def confirm_mat_procurement_dialog(session, sc_id):
 
 def _save_return_vc(_session, target_vc_id, data):
     """辅助退货保存，通过 Action 执行"""
-    items_payload = [VCItemSchema(**normalize_item_data(i)) for i in data['return_items']]
-    
+    elems_payload = []
+    for i in data['return_items']:
+        norm = normalize_item_data(i)
+        qty = float(norm.get('qty') or 0)
+        price = float(norm.get('price') or 0)
+        elem = VCElementSchema(
+            shipping_point_id=int(norm.get('shipping_point_id') or norm.get('point_id') or 0),
+            receiving_point_id=int(norm.get('receiving_point_id') or 0),
+            sku_id=int(norm.get('sku_id') or 0),
+            qty=qty,
+            price=price,
+            deposit=0.0,
+            subtotal=qty * price,
+            sn_list=[norm.get('sn')] if norm.get('sn') and norm.get('sn') != '-' else []
+        )
+        elems_payload.append(elem)
+
     payload = CreateReturnVCSchema(
         target_vc_id=target_vc_id,
         return_direction=data['return_direction'],
-        return_items=items_payload,
+        elements=elems_payload,
         goods_amount=data['goods_amount'],
         deposit_amount=data['deposit_amount'],
         logistics_cost=data['logistics_cost'],
@@ -385,7 +451,7 @@ def confirm_return_dialog(session, target_vc_id):
         "price": "单价",
         "deposit": "押金",
         "point_name": "当前所在位置",
-        "target_warehouse": "退回目的地"
+        "target_warehouse": "退回目的地"  # 字段 key 不变，兼容已有数据
     })
     
     cols_to_show = ["物品名称", "SN码", "数量", "当前所在位置", "退回目的地"]
@@ -644,7 +710,7 @@ def show_supply_chain_list():
                 if sel_det_tab == '价格协议明细':
                     st.write("**SKU 协议单价约定**")
                     items_data = []
-                    pricing_dict = sc.get('pricing_dict', {})
+                    pricing_dict = sc.get('pricing_config', {})
                     for sku_name, price in pricing_dict.items():
                         items_data.append({
                             "品类名称": sku_name,
@@ -1228,35 +1294,21 @@ def show_business_execution():
             # 2. 定制化解析物品明细
             origin_items = []
             elements = target_vc['elements'] or {}
-            
-            # 获取基础数据：自有仓、供应商仓、转运仓
-            own_warehouses = get_points_for_ui(customer_id=None, supplier_id=None)
-            transit_warehouses = get_points_for_ui(point_type="转运仓")
-            supplier_warehouses = []
-            if target_vc.get('supply_chain_id'):
-                sc = get_supply_chain_detail_for_ui(target_vc['supply_chain_id'])
-                if sc:
-                    supplier_warehouses = get_points_for_ui(supplier_id=sc['supplier_id'])
-            
-            warehouse_options = [p['name'] for p in own_warehouses]
-            
+
+            # 使用新的 query 函数获取退货目的地选项
+            receiving_pts = get_valid_receiving_points_for_return(session, target_vc['id'], return_direction)
+            point_options = [f"{p['name']} ({p['type']})" for p in receiving_pts]
+
+            # 构建点位名称->Point ID 映射（使用带类型的显示名）
+            point_map = {f"{p['name']} ({p['type']})": p['id'] for p in receiving_pts}
+
             # 2. 调用 Service 层获取精算后的可退明细
             origin_items = get_returnable_items(session, target_vc['id'], return_direction)
-            
-            # 目的地仓库选项获取
+
+            # 根据退货类型确定小计标签
             if target_vc['type'] == VCType.EQUIPMENT_PROCUREMENT:
-                if return_direction == ReturnDirection.CUSTOMER_TO_US:
-                    curr_points = list(set([o["point_name"] for o in origin_items if o.get("point_name")]))
-                    warehouse_options = list(set([p['name'] for p in own_warehouses + transit_warehouses] + curr_points))
-                    subtotal_label = "📊 货品押金小计"
-                else:
-                    warehouse_options = list(set([p['name'] for p in supplier_warehouses + transit_warehouses]))
-                    subtotal_label = "📊 货品价值小计"
-            elif target_vc['type'] == VCType.MATERIAL_PROCUREMENT:
-                warehouse_options = [p['name'] for p in supplier_warehouses]
-                subtotal_label = "📊 货品价值小计"
+                subtotal_label = "📊 货品押金小计"
             else:
-                warehouse_options = list(set([p['name'] for p in own_warehouses + transit_warehouses]))
                 subtotal_label = "📊 货品价值小计"
 
             if not origin_items:
@@ -1301,7 +1353,7 @@ def show_business_execution():
                         row.update({
                             "可退数量": item["qty"],
                             "本次退货": 0,
-                            "退货目的地": warehouse_options[0] if warehouse_options else SystemConstants.DEFAULT_WAREHOUSE,
+                            "退货目的地": point_options[0] if point_options else SystemConstants.DEFAULT_POINT,
                             "_raw_idx": i
                         })
                         init_data.append(row)
@@ -1314,7 +1366,7 @@ def show_business_execution():
                     "目前位置": st.column_config.TextColumn(disabled=True),
                     "可退数量": st.column_config.NumberColumn(disabled=True),
                     "本次退货": st.column_config.NumberColumn(min_value=0, max_value=None if target_vc['type'] != VCType.EQUIPMENT_PROCUREMENT else 1, step=1),
-                    "退货目的地": st.column_config.SelectboxColumn("退货目的地", options=warehouse_options),
+                    "退货目的地": st.column_config.SelectboxColumn("退货目的地", options=point_options),
                     "_raw_idx": None # 明确隐藏内部列
                 }
                 if "原单价" in st.session_state[r_key].columns:
@@ -1340,6 +1392,8 @@ def show_business_execution():
                         calc_total += qty * val
                         
                         raw = origin_items[int(row["_raw_idx"])]
+                        tgt_wh = row["退货目的地"]
+                        tgt_point_id = point_map.get(tgt_wh)  # 从映射表获取 Point ID
                         return_list.append({
                             "sku_id": raw.get("sku_id"),
                             "sn": raw.get("sn"),
@@ -1349,7 +1403,8 @@ def show_business_execution():
                             "qty": qty,
                             "point_id": raw.get("point_id"),
                             "point_name": raw.get("point_name"),
-                            "target_warehouse": row["退货目的地"]
+                            "target_point_id": tgt_point_id,
+                            "receiving_point_name": tgt_wh
                         })
                 
                 st.info(f"{subtotal_label}: ¥{calc_total:,.2f}")
@@ -1695,10 +1750,10 @@ def show_procurement_form(session, business):
     payment = sc['payment_terms'] or {}
     sku_list = list(pricing.keys())
 
-    # 3. 客户点位查询
-    c_points = get_points_by_customer(business['customer_id'])
-    point_list = [p['name'] for p in c_points]
-    point_map = {p['name']: p['id'] for p in c_points}
+    # 3. 客户点位查询（收货点 = 客户所有点位，不限类型）
+    c_points = get_valid_receiving_points_for_procurement(session, business['id'])
+    point_list = [f"{p['name']} ({p['type']})" for p in c_points]
+    point_map = {f"{p['name']} ({p['type']})": p['id'] for p in c_points}
 
     if not sku_list:
         st.error("该供应链协议中未配置任何品类价格，请先完善协议。")
@@ -1833,7 +1888,8 @@ def show_procurement_form(session, business):
             valid_items.append({
                 "sku_id": s_id, "sku_name": row["设备品类"],
                 "point_id": p_id, "point_name": row["部署点位"],
-                "qty": qty, "price": price, "deposit": dep
+                "qty": qty, "price": price, "deposit": dep,
+                "shipping_point_name": f"{sc['supplier_name']}仓库" if sc.get('supplier_name') else SystemConstants.DEFAULT_POINT
             })
             total_amt += qty * price
             total_deposit += qty * dep
@@ -1900,10 +1956,10 @@ def show_supply_form(session, business):
     </div>
     """, unsafe_allow_html=True)
 
-    # 2. 准备点位数据
-    c_points = get_points_by_customer(business['customer_id'])
-    point_list = sorted([p['name'] for p in c_points])
-    point_detail_map = {p['name']: {"id": p['id'], "address": p['address']} for p in c_points}
+    # 2. 准备点位数据（收货点 = 客户所有点位，不限类型）
+    c_points = get_valid_receiving_points_for_material_supply(session, business['id'])
+    point_list = sorted([f"{p['name']} ({p['type']})" for p in c_points])
+    point_detail_map = {f"{p['name']} ({p['type']})": {"id": p['id'], "address": p.get('address', '')} for p in c_points}
 
     # 3. 初始化/获取数据状态
     if df_key not in st.session_state:
@@ -1913,21 +1969,23 @@ def show_supply_form(session, business):
     pricing_config = business.get('details', {}).get("pricing", {})
     payment = business.get('details', {}).get("payment_terms", {})
     
-    # 准备仓库选项 (基于全局库存分布)
-    warehouse_options_map = {}
-    all_warehouses_set = set()
-    inventory_items = get_material_inventory_all()
+    # 准备发货点位选项（基于 SKU 库存分布，从 query 函数获取）
+    point_options_map = {}   # sku_name -> [显示名称]
+    point_id_map = {}       # 显示名称 -> point_id （用于按 SKU 索引）
+    all_points_set = set()
     for sku_name in sku_list:
-        mat_inv_list = [i for i in inventory_items if i['sku_name'] == sku_name]
-        mat_inv = mat_inv_list[0] if mat_inv_list else None
-        if mat_inv and mat_inv.get('stock_distribution'):
-            available_warehouses = [wh for wh, qty in mat_inv['stock_distribution'].items() if qty > 0]
-            warehouse_options_map[sku_name] = available_warehouses if available_warehouses else [SystemConstants.DEFAULT_WAREHOUSE]
+        sku_id = sku_id_map.get(sku_name)
+        if sku_id:
+            pts = get_valid_shipping_points_for_material_supply(session, sku_id)
+            names = [f"{p['name']} ({p['type']})" for p in pts] if pts else [SystemConstants.DEFAULT_POINT]
         else:
-            warehouse_options_map[sku_name] = [SystemConstants.DEFAULT_WAREHOUSE]
-        all_warehouses_set.update(warehouse_options_map[sku_name])
-    
-    all_warehouses = sorted(list(all_warehouses_set)) if all_warehouses_set else [SystemConstants.DEFAULT_WAREHOUSE]
+            names = [SystemConstants.DEFAULT_POINT]
+        point_options_map[sku_name] = names
+        for p in (pts or []):
+            key = f"{p['name']} ({p['type']})"
+            point_id_map[key] = p['id']
+        all_points_set.update(names)
+    all_points = sorted(list(all_points_set)) if all_points_set else [SystemConstants.DEFAULT_POINT]
 
     # --- 核心交互逻辑：捕获变动并实时联动 ---
     if editor_key in st.session_state:
@@ -1950,8 +2008,8 @@ def show_supply_form(session, business):
                             # 使用统一服务获取价格
                             u_price, _, _ = get_sku_agreement_price(session, None, business, val)
                             df.at[idx, "单价"] = u_price
-                            wh_list = warehouse_options_map.get(val, [SystemConstants.DEFAULT_WAREHOUSE])
-                            df.at[idx, "发货仓库"] = wh_list[0]
+                            pt_list = point_options_map.get(val, [SystemConstants.DEFAULT_POINT])
+                            df.at[idx, "发货点位"] = pt_list[0]
 
             # 3. 处理新增
             for row_data in state.get("added_rows", []):
@@ -1959,12 +2017,12 @@ def show_supply_form(session, business):
                     sku = row_data["物料"]
                     u_price, _, _ = get_sku_agreement_price(session, None, business, sku)
                     row_data["单价"] = u_price
-                    wh_list = warehouse_options_map.get(sku, [SystemConstants.DEFAULT_WAREHOUSE])
-                    row_data["发货仓库"] = wh_list[0]
-                
+                    pt_list = point_options_map.get(sku, [SystemConstants.DEFAULT_POINT])
+                    row_data["发货点位"] = pt_list[0]
+
                 if "数量" not in row_data: row_data["数量"] = 1
                 if "点位" not in row_data and point_list: row_data["点位"] = point_list[0]
-                if "发货仓库" not in row_data: row_data["发货仓库"] = all_warehouses[0]
+                if "发货点位" not in row_data: row_data["发货点位"] = all_points[0]
                 
                 df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
 
@@ -1987,7 +2045,7 @@ def show_supply_form(session, business):
             "物料": st.column_config.SelectboxColumn("选择库存物料", options=sku_list),
             "数量": st.column_config.NumberColumn("供应数量", min_value=1, step=1),
             "单价": st.column_config.NumberColumn("执行单价 (元)", format="%.2f"),
-            "发货仓库": st.column_config.SelectboxColumn("发货仓库", options=all_warehouses, required=True, help="选择从哪个仓库发货")
+            "发货点位": st.column_config.SelectboxColumn("发货点位", options=all_points, required=True, help="选择从哪个点位发货")
         },
         hide_index=True,
         key=editor_key
@@ -2062,13 +2120,13 @@ def show_supply_form(session, business):
                 sku_id = sku_id_map[p_name]
                 qty = int(row["数量"])
                 price = float(row["单价"])
-                src_wh = row["发货仓库"]
-                
+                src_wh = row["发货点位"]
+
                 # 汇总
                 sku_sums[p_name] = sku_sums.get(p_name, 0) + qty
                 supply_order["summary"]["total_qty"] += qty
                 supply_order["summary"]["total_amount"] += qty * price
-                
+
                 # 分组点位
                 if p_id not in point_groups:
                     point_groups[p_id] = {
@@ -2082,7 +2140,8 @@ def show_supply_form(session, business):
                     "sku_name": p_name,
                     "qty": qty,
                     "price": price,
-                    "source_warehouse": src_wh
+                    "shipping_point_name": src_wh,
+                    "shipping_point_id": point_id_map.get(src_wh, 0)
                 })
 
             supply_order["summary"]["total_skus"] = len(sku_sums)
@@ -2158,21 +2217,27 @@ def show_material_procurement_form(session):
     # SKU ID 映射
     mats = get_skus_by_names(sku_list, supplier_id=sc['supplier_id'])
     sku_id_map = {s['name']: s['id'] for s in mats}
-    
-    # 准备可用仓库列表
-    warehouse_options = []
-    # 1. 供应商仓库
-    supplier_points = get_points_for_ui(supplier_id=sc['supplier_id'])
-    for p in supplier_points:
-        warehouse_options.append(f"{p['name']} (供应商仓)")
-    # 2. 自有仓库
-    all_points = get_points_for_ui(limit=500)
-    for p in all_points:
-        if not p.get('customer_id') and not p.get('supplier_id'):
-             warehouse_options.append(f"{p['name']} (自有仓)")
-    
-    if not warehouse_options:
-        warehouse_options = [SystemConstants.DEFAULT_WAREHOUSE]
+
+    # 准备可用点位列表（统一按 Point 体系管理）
+    # 发货点 = 供应商仓库；收货点 = 我们仓库 + 供应商仓库
+    shipping_pts = get_valid_shipping_points_for_mat_procurement(session, sc['id'])
+    receiving_pts = get_valid_receiving_points_for_mat_procurement(session, sc['id'])
+
+    point_options = []   # 收货点选项（入库点位列）
+    point_map = {}       # 显示名称 -> Point ID 映射
+    # 保存发货点位：供应商点位中 ID 最小的（用于统一发货）
+    _shipping_pt = min(shipping_pts, key=lambda p: p['id']) if shipping_pts else None
+    _shipping_pt_name = _shipping_pt['name'] if _shipping_pt else SystemConstants.DEFAULT_POINT
+
+    # 收货点选项
+    for p in receiving_pts:
+        display_name = f"{p['name']} ({p['type']})"
+        point_options.append(display_name)
+        point_map[display_name] = p['id']
+
+    if not point_options:
+        point_options = [SystemConstants.DEFAULT_POINT]
+        point_map[SystemConstants.DEFAULT_POINT] = None
 
     # 初始化/切换协议时重置表格
     if f"mat_proc_df" not in st.session_state or st.session_state.get("mat_proc_sc_id") != sc['id']:
@@ -2181,9 +2246,9 @@ def show_material_procurement_form(session):
         if initial_sku in pricing_config:
             p_val = pricing_config[initial_sku]
             initial_price = float(p_val) if p_val != "浮动" else 0.0
-            
+
         st.session_state["mat_proc_df"] = pd.DataFrame([
-            {"物料": initial_sku, "数量": 0, "单价": initial_price, "存放位置": warehouse_options[0] if warehouse_options else SystemConstants.DEFAULT_WAREHOUSE}
+            {"物料": initial_sku, "数量": 0, "单价": initial_price, "存放点位": point_options[0] if point_options else SystemConstants.DEFAULT_POINT}
         ])
         st.session_state["mat_proc_sc_id"] = sc['id']
 
@@ -2218,8 +2283,8 @@ def show_material_procurement_form(session):
                     u_price, _, _ = get_sku_agreement_price(session, sc['id'], None, sku)
                     row_data["单价"] = u_price
                 if "数量" not in row_data: row_data["数量"] = 0
-                if "存放位置" not in row_data: 
-                    row_data["存放位置"] = warehouse_options[0] if warehouse_options else SystemConstants.DEFAULT_WAREHOUSE
+                if "存放点位" not in row_data:
+                    row_data["存放点位"] = point_options[0] if point_options else SystemConstants.DEFAULT_POINT
                 df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
 
             # 更新数据并切换版本以重置组件
@@ -2243,7 +2308,7 @@ def show_material_procurement_form(session):
             "物料": st.column_config.SelectboxColumn("协议内物料品类", options=sku_list),
             "数量": st.column_config.NumberColumn("采购数量", min_value=0, step=1),
             "单价": st.column_config.NumberColumn("执行单价 (元)", format="%.2f", help="若协议价非浮动，系统将自动纠正"),
-            "存放位置": st.column_config.SelectboxColumn("入库仓库", options=warehouse_options, help="选择采购后的存放位置")
+            "存放点位": st.column_config.SelectboxColumn("入库点位", options=point_options, help="选择采购后的存放点位")
         },
         hide_index=True,
         key=editor_key
@@ -2274,24 +2339,28 @@ def show_material_procurement_form(session):
         total_amt = 0.0
         for idx, row in edited_df.iterrows():
             p_name = row["物料"]
-            w_name = row.get("存放位置")
+            w_name = row.get("存放点位")
             qty = row["数量"]
-            
+
             # 过滤没有任何输入的纯空行
             if not p_name and not w_name and (not qty or qty <= 0): continue
-            
+
             # 强制检查
             if not p_name or not w_name or not qty or qty <= 0:
-                st.error(f"提交失败：第 {idx+1} 行信息不完整。请确保【物料】、【入库仓库】已选且【采购数量】大于 0。")
+                st.error(f"提交失败：第 {idx+1} 行信息不完整。请确保【物料】、【入库点位】已选且【采购数量】大于 0。")
                 return
 
             item_price = float(row["单价"])
+            w_name = row.get("存放点位", SystemConstants.DEFAULT_POINT)
+            w_point_id = point_map.get(w_name)  # 从映射表获取 Point ID
             valid_items.append({
                 "sku_id": sku_id_map.get(row["物料"]),
                 "sku_name": row["物料"],
                 "qty": row["数量"],
                 "price": item_price,
-                "warehouse": row.get("存放位置", SystemConstants.DEFAULT_WAREHOUSE)
+                "point_id": w_point_id,
+                "point_name": w_name,
+                "shipping_point_name": _shipping_pt_name
             })
             total_amt += row["数量"] * item_price
         
@@ -2354,24 +2423,26 @@ def show_stock_procurement_form(session):
     mats = get_skus_by_names(sku_list, supplier_id=sc['supplier_id'])
     sku_id_map = {s['name']: s['id'] for s in mats}
     
-    # 准备可用仓库列表（供应商仓与自有仓）
-    warehouse_options = []
-    # 1. 供应商仓库
-    supplier_points = get_points_for_ui(supplier_id=sc['supplier_id'])
-    for p in supplier_points:
-        warehouse_options.append(f"{p['name']} (供应商仓)")
-    # 2. 自有仓库
-    own_warehouses = get_points_for_ui(point_type="自有仓") # Use type or filter manually
-    # Wait, my get_points_for_ui doesn't filter by "own".
-    # I'll use point_type="自有仓" if that's what's available.
-    # Actually, the original was: Point.customer_id == None, Point.supplier_id == None
-    all_points = get_points_for_ui(limit=500)
-    for p in all_points:
-        if not p.get('customer_id') and not p.get('supplier_id'):
-             warehouse_options.append(f"{p['name']} (自有仓)")
-    
-    if not warehouse_options:
-        warehouse_options = [SystemConstants.DEFAULT_WAREHOUSE]
+    # 准备可用点位列表（统一按 Point 体系管理）
+    # 发货点 = 供应商仓库；收货点 = 我们仓库 + 供应商仓库
+    shipping_pts = get_valid_shipping_points_for_mat_procurement(session, sc['id'])
+    receiving_pts = get_valid_receiving_points_for_mat_procurement(session, sc['id'])
+
+    point_options = []   # 收货点选项（入库点位列）
+    point_map = {}       # 显示名称 -> Point ID 映射
+    # 保存发货点位：供应商点位中 ID 最小的（用于统一发货）
+    _shipping_pt = min(shipping_pts, key=lambda p: p['id']) if shipping_pts else None
+    _shipping_pt_name = _shipping_pt['name'] if _shipping_pt else SystemConstants.DEFAULT_POINT
+
+    # 收货点选项
+    for p in receiving_pts:
+        display_name = f"{p['name']} ({p['type']})"
+        point_options.append(display_name)
+        point_map[display_name] = p['id']
+
+    if not point_options:
+        point_options = [SystemConstants.DEFAULT_POINT]
+        point_map[SystemConstants.DEFAULT_POINT] = None
 
     if "stock_proc_df" not in st.session_state or st.session_state.get("stock_proc_sc_id") != sc['id']:
         initial_sku = sku_list[0] if sku_list else ""
@@ -2379,9 +2450,9 @@ def show_stock_procurement_form(session):
         if initial_sku in pricing_config:
             p_val = pricing_config[initial_sku]
             initial_price = float(p_val) if p_val != "浮动" else 0.0
-            
+
         st.session_state["stock_proc_df"] = pd.DataFrame([
-            {"设备/配件": initial_sku, "数量": 0, "单价": initial_price, "入库位置": warehouse_options[0]}
+            {"设备/配件": initial_sku, "数量": 0, "单价": initial_price, "入库位置": point_options[0]}
         ])
         st.session_state["stock_proc_sc_id"] = sc['id']
 
@@ -2408,7 +2479,7 @@ def show_stock_procurement_form(session):
                     u_price, _, _ = get_sku_agreement_price(session, sc['id'], None, row_data["设备/配件"])
                     row_data["单价"] = u_price
                 if "数量" not in row_data: row_data["数量"] = 0
-                if "入库位置" not in row_data: row_data["入库位置"] = warehouse_options[0]
+                if "入库位置" not in row_data: row_data["入库位置"] = point_options[0]
                 df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
             st.session_state["stock_proc_df"] = df
             st.session_state[version_key] += 1
@@ -2416,7 +2487,7 @@ def show_stock_procurement_form(session):
 
     st.markdown(f"""
     <div style='background-color: rgba(46, 204, 113, 0.1); padding: 10px; border-radius: 5px; border-left: 4px solid #2ECC71; margin-bottom: 1rem;'>
-        <b>结算协议摘要：</b> 预付 {int(payment.get('prepayment_ratio',0)*100)}% | 
+        <b>结算协议摘要：</b> 预付 {int(payment.get('prepayment_ratio',0)*100)}% |
         尾款账期 {payment.get('balance_period',0)} {payment.get('day_rule', SettlementRule.NATURAL_DAY)}
     </div>
     """, unsafe_allow_html=True)
@@ -2429,7 +2500,7 @@ def show_stock_procurement_form(session):
             "设备/配件": st.column_config.SelectboxColumn("协议内品类", options=sku_list),
             "数量": st.column_config.NumberColumn("采购数量", min_value=0, step=1),
             "单价": st.column_config.NumberColumn("单价 (元)", format="%.2f"),
-            "入库位置": st.column_config.SelectboxColumn("入库仓库", options=warehouse_options)
+            "入库位置": st.column_config.SelectboxColumn("入库点位", options=point_options)
         },
         hide_index=True,
         key=editor_key
@@ -2450,13 +2521,20 @@ def show_stock_procurement_form(session):
                 return
             
             item_price = float(row["单价"])
+            w_name = row.get("入库位置")
+            w_point_id = point_map.get(w_name)  # 从映射表获取 Point ID
+            # 发货点位：取供应商点位中 ID 最小的
+            shipping_pt = min(shipping_pts, key=lambda p: p['id']) if shipping_pts else None
+            shipping_pt_name = shipping_pt['name'] if shipping_pt else SystemConstants.DEFAULT_POINT
             valid_items.append({
                 "sku_id": sku_id_map.get(row["设备/配件"]),
                 "sku_name": row["设备/配件"],
                 "qty": row["数量"],
                 "price": item_price,
-                "deposit": 0.0, # 库存采购无押金
-                "point_name": row.get("入库位置")
+                "deposit": 0.0,  # 库存采购无押金
+                "point_id": w_point_id,
+                "point_name": w_name,
+                "shipping_point_name": shipping_pt_name
             })
             total_amt += row["数量"] * item_price
         
@@ -2495,7 +2573,7 @@ def confirm_stock_procurement_dialog(session, sc_id: int):
     st.write("---")
     st.write("📦 **入库明细:**")
     df_show = pd.DataFrame(data['items'])[['sku_name', 'qty', 'price', 'point_name']]
-    df_show.columns = ['设备型号', '数量', '单价(元)', '入库仓库']
+    df_show.columns = ['设备型号', '数量', '单价(元)', '入库点位']
     st.dataframe(df_show, use_container_width=True, hide_index=True)
 
     desc = st.text_input("采购说明 (附言)", placeholder="选填，如：Q3季度备库存")
@@ -2512,11 +2590,27 @@ def confirm_stock_procurement_dialog(session, sc_id: int):
 def _save_stock_procurement_vc(session, sc_id: int):
     data = st.session_state["temp_stock_proc_data"]
     desc = st.session_state.get("temp_stock_proc_desc", "")
-    items_payload = [VCItemSchema(**i) for i in data["items"]]
-    
+    elems_payload = []
+    for i in data["items"]:
+        norm = normalize_item_data(i)
+        qty = float(norm.get('qty') or 0)
+        price = float(norm.get('price') or 0)
+        deposit = float(norm.get('deposit') or 0)
+        elem = VCElementSchema(
+            shipping_point_id=int(norm.get('shipping_point_id') or 0),
+            receiving_point_id=int(norm.get('receiving_point_id') or norm.get('point_id') or 0),
+            sku_id=int(norm.get('sku_id') or 0),
+            qty=qty,
+            price=price,
+            deposit=deposit,
+            subtotal=qty * price,
+            sn_list=[norm.get('sn')] if norm.get('sn') and norm.get('sn') != '-' else []
+        )
+        elems_payload.append(elem)
+
     payload = CreateStockProcurementVCSchema(
         sc_id=sc_id,
-        items=items_payload,
+        elements=elems_payload,
         total_amt=data["total_amt"],
         payment=data["payment"],
         description=desc
@@ -2555,13 +2649,13 @@ def show_inventory_allocation_form(session, active_businesses):
     biz_id = biz_options[sel_biz_label]
     biz = get_business_detail(biz_id)
 
-    # 获取目标业务下的所有点位
-    points = get_points_by_customer(biz['customer_id'])
+    # 获取目标业务下的所有点位（收货点 = 客户所有点位，不限类型）
+    points = get_valid_receiving_points_for_allocation(session, biz_id)
     if not points:
         st.warning("该客户没有配置点位，无法拨付设备。")
         return
-    point_names = sorted([p['name'] for p in points])
-    point_id_map = {p['name']: p['id'] for p in points}
+    point_names = sorted([f"{p['name']} ({p['type']})" for p in points])
+    point_id_map = {f"{p['name']} ({p['type']})": p['id'] for p in points}
 
     # 获取库存设备
     available_equipments = get_equipment_inventory_list(status=OperationalStatus.STOCK)
@@ -2645,10 +2739,37 @@ def confirm_allocation_dialog(session, biz_id: int):
 def _save_inventory_allocation(session, biz_id: int):
     data = st.session_state[f"temp_alloc_data_{biz_id}"]
     desc = st.session_state.get(f"temp_alloc_desc_{biz_id}", "")
-    
+    allocation_map = data["allocation_map"]
+
+    # 按目标点位分组，构建 elements
+    pt_groups = {}
+    for eq_id, tgt_pt_id in allocation_map.items():
+        if tgt_pt_id not in pt_groups:
+            pt_groups[tgt_pt_id] = []
+        pt_groups[tgt_pt_id].append(str(eq_id))
+
+    elems_payload = []
+    from models import EquipmentInventory
+    for tgt_pt_id, eq_ids in pt_groups.items():
+        # 获取第一条记录的设备信息用于获取 sku_id 和 deposit
+        first_eq = session.query(EquipmentInventory).get(int(eq_ids[0]))
+        sku_id = first_eq.sku_id if first_eq else 0
+        deposit = 0.0
+        elem = VCElementSchema(
+            shipping_point_id=int(first_eq.point_id) if first_eq else 0,
+            receiving_point_id=int(tgt_pt_id),
+            sku_id=int(sku_id),
+            qty=len(eq_ids),
+            price=0.0,
+            deposit=deposit,
+            subtotal=0.0,
+            sn_list=eq_ids
+        )
+        elems_payload.append(elem)
+
     payload = AllocateInventorySchema(
         business_id=biz_id,
-        allocation_map=data["allocation_map"],
+        elements=elems_payload,
         description=desc
     )
     

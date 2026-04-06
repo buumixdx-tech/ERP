@@ -1,4 +1,4 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, attributes
 from models import Business, Contract, VirtualContract
 from .schemas import CreateBusinessSchema, UpdateBusinessStatusSchema, AdvanceBusinessStageSchema
 from logic.base import ActionResult
@@ -30,10 +30,24 @@ def update_business_status_action(session: Session, payload: UpdateBusinessStatu
             return ActionResult(success=False, error="未找到业务记录")
         
         old_status = biz.status
-        biz.status = payload.status
         if payload.details is not None:
+            # JSON 编辑器传入了完整 details，直接使用（包含用户编辑后的 history）
             biz.details = payload.details
-            
+            attributes.flag_modified(biz, 'details')
+        else:
+            # 仅改状态时，追加 history 记录
+            new_details = (biz.details or {}).copy()
+            new_details.setdefault("history", [])
+            new_details["history"].append({
+                "from": old_status,
+                "to": payload.status,
+                "time": datetime.now().isoformat(),
+                "comment": ""
+            })
+            biz.details = new_details
+            attributes.flag_modified(biz, 'details')
+        biz.status = payload.status
+
         emit_event(session, SystemEventType.BUSINESS_STATUS_CHANGED, SystemAggregateType.BUSINESS, biz.id, {"from": old_status, "to": payload.status})
         
         # Trigger rule propagation
@@ -117,6 +131,7 @@ def advance_business_stage_action(session: Session, payload: AdvanceBusinessStag
             new_details["contract_id"] = target_c_id
             
         biz.details = new_details
+        attributes.flag_modified(biz, 'details')
         biz.status = payload.next_status
         emit_event(session, SystemEventType.BUSINESS_STAGE_ADVANCED, SystemAggregateType.BUSINESS, biz.id, {"from": old_status, "to": payload.next_status})
         
@@ -125,7 +140,8 @@ def advance_business_stage_action(session: Session, payload: AdvanceBusinessStag
             rules_count = RuleManager(session).generate_rules_from_payment_terms(
                 related_id=biz.id,
                 related_type=TimeRuleRelatedType.BUSINESS,
-                payment_terms=payload.payment_terms
+                payment_terms=payload.payment_terms,
+                entity_type=TimeRuleRelatedType.BUSINESS
             )
             
         session.commit()

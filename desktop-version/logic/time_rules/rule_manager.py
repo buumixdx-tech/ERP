@@ -153,148 +153,123 @@ class RuleManager:
         }
         return mapping.get(name)
 
-    def generate_rules_from_payment_terms(self, related_id: int, related_type: str, payment_terms: dict, party: str = None) -> int:
+    def generate_rules_from_payment_terms(
+        self,
+        related_id: int,
+        related_type: str,
+        payment_terms: dict,
+        entity_type: str,  # TimeRuleRelatedType.BUSINESS 或 TimeRuleRelatedType.SUPPLY_CHAIN
+        party: str = None
+    ) -> int:
         """
         根据结算条款自动生成时间规则
-        
+
+        规则生成逻辑：
+          3.2  预付比例 > 0 → 生成预付约束规则：
+                 CASH_PREPAID → SUBJECT_SHIPPED (direction=AFTER, offset=0)
+          3.3  生成结算规则：
+                 SUBJECT_FINISH → SUBJECT_CASH_FINISH (direction=BEFORE, offset=账期天数)
+
+        字段赋值规范：
+          - tae_param1：所有自动生成的规则统一赋值为 "付款条款生成"，tae_param2 固定为 None
+          - 规则1（预付约束）：tge_param1 = 纯百分数字符串（如 "40%"），供规则引擎数值计算
+          - 规则2（结算规则）：tge_param1 = None，账期天数承载于 offset 字段
+
         Args:
-            related_id: 关联对象 ID (业务 ID 或供应链 ID)
+            related_id: 关联对象 ID
             related_type: 关联类型 (TimeRuleRelatedType.BUSINESS 或 SUPPLY_CHAIN)
             payment_terms: 结算条款字典，包含:
                 - prepayment_ratio: 预付款比例 (0-1)
                 - balance_period: 尾款账期 (天)
                 - day_rule: 计日规则 (自然日/工作日)
-                - start_trigger: 起算锚点 (入库日/发货日)
-            party: 责任方 (默认根据 related_type 自动判断)
-        
+                - start_trigger: 起算锚点 (入库/发货)
+            entity_type: 实体类型，用 TimeRuleRelatedType.BUSINESS / SUPPLY_CHAIN
+            party: 责任方（默认自动判断：business→客户，supply_chain→我方）
+
         Returns:
             int: 生成的规则数量
         """
         from logic.constants import SettlementRule
-        
+
         if not payment_terms:
             return 0
-        
-        # 自动判断责任方 (对业务而言通常监控客户，对供应链而言通常监控供应商)
+
+        # VC 和 Logistics 不通过付款条款生成规则
+        if entity_type in (TimeRuleRelatedType.VIRTUAL_CONTRACT, TimeRuleRelatedType.LOGISTICS):
+            return 0
+
+        # 责任方：business→客户，supply_chain→我方
         if party is None:
-            # 注意：预付款和尾款的责任方逻辑不同，这里仅作默认参考
-            party = TimeRuleParty.CUSTOMER if related_type == TimeRuleRelatedType.BUSINESS else TimeRuleParty.SUPPLIER
-        
+            party = TimeRuleParty.CUSTOMER if entity_type == TimeRuleRelatedType.BUSINESS else TimeRuleParty.OURSELVES
+
         prepay_ratio = payment_terms.get("prepayment_ratio", 0)
         balance_days = payment_terms.get("balance_period", 30)
         day_rule_str = payment_terms.get("day_rule", SettlementRule.NATURAL_DAY)
-        trigger_str = payment_terms.get("start_trigger", SettlementRule.TRIGGER_INBOUND)
-        
-        # 映射计日规则
+
+        # 计日规则
         unit = TimeRuleOffsetUnit.WORK_DAY if day_rule_str == SettlementRule.WORK_DAY else TimeRuleOffsetUnit.NATURAL_DAY
-        
-        # 映射起算锚点事件
-        trigger_event = self._map_trigger_name(trigger_str) or EventType.VCLevel.SUBJECT_SIGNED
-        
+
+        # 结算规则 trigger：入库 → SUBJECT_FINISH
+        trigger_event = EventType.VCLevel.SUBJECT_FINISH
+
         rules_created = 0
-        
-        # 1. 如果有预付款比例，生成预付款规则
+
+        # 3.2 预付比例 > 0 → 生成预付约束 (CASH_PREPAID → SUBJECT_SHIPPED)
         if prepay_ratio and prepay_ratio > 0:
-            if related_type == TimeRuleRelatedType.SUPPLY_CHAIN:
-                # === 供应链预付：我方负责支付给供应商 ===
-                existing = self.session.query(TimeRule).filter(
-                    TimeRule.related_id == related_id,
-                    TimeRule.related_type == related_type,
-                    TimeRule.target_event == EventType.VCLevel.CASH_PREPAID
-                ).first()
-                if not existing:
-                    self.session.add(TimeRule(
-                        related_id=related_id,
-                        related_type=related_type,
-                        inherit=TimeRuleInherit.NEAR,
-                        party=TimeRuleParty.OURSELVES,  # 我方支付
-                        trigger_event=EventType.VCLevel.VC_CREATED,
-                        tge_param1="合同启动",
-                        target_event=EventType.VCLevel.CASH_PREPAID,
-                        tae_param1=f"预付{int(prepay_ratio * 100)}%",
-                        offset=7,
-                        unit=unit,
-                        direction=TimeRuleDirection.AFTER,
-                        status=TimeRuleStatus.TEMPLATE
-                    ))
-                    rules_created += 1
-            else:
-                # === 业务预付：客户负责支付给我方，且约束发货 ===
-                # 规则1：客户应在虚拟合同创建后支付预付款
-                existing_p1 = self.session.query(TimeRule).filter(
-                    TimeRule.related_id == related_id,
-                    TimeRule.related_type == related_type,
-                    TimeRule.target_event == EventType.VCLevel.CASH_PREPAID
-                ).first()
-                if not existing_p1:
-                    self.session.add(TimeRule(
-                        related_id=related_id,
-                        related_type=related_type,
-                        inherit=TimeRuleInherit.NEAR,
-                        party=TimeRuleParty.CUSTOMER,  # 客户支付
-                        trigger_event=EventType.VCLevel.VC_CREATED,
-                        tge_param1="合同启动",
-                        target_event=EventType.VCLevel.CASH_PREPAID,
-                        tae_param1=f"预付{int(prepay_ratio * 100)}%",
-                        offset=7,
-                        unit=unit,
-                        direction=TimeRuleDirection.AFTER,
-                        status=TimeRuleStatus.TEMPLATE
-                    ))
-                    rules_created += 1
-                
-                # 规则2：约束规则 - 只有收到预付款后才能发货 (Trigger: 预付完成, Target: 物流发货)
-                existing_p2 = self.session.query(TimeRule).filter(
-                    TimeRule.related_id == related_id,
-                    TimeRule.related_type == related_type,
-                    TimeRule.trigger_event == EventType.VCLevel.CASH_PREPAID,
-                    TimeRule.target_event == EventType.VCLevel.SUBJECT_SHIPPED
-                ).first()
-                if not existing_p2:
-                    self.session.add(TimeRule(
-                        related_id=related_id,
-                        related_type=related_type,
-                        inherit=TimeRuleInherit.NEAR,
-                        party=TimeRuleParty.OURSELVES,  # 我方发货
-                        trigger_event=EventType.VCLevel.CASH_PREPAID,
-                        tge_param1=f"预付{int(prepay_ratio * 100)}%",
-                        target_event=EventType.VCLevel.SUBJECT_SHIPPED,
-                        tae_param1="物流发货",
-                        offset=0,  # 必须在预付之后
-                        unit=unit,
-                        direction=TimeRuleDirection.AFTER,
-                        status=TimeRuleStatus.TEMPLATE
-                    ))
-                    rules_created += 1
-        
-        # 2. 生成尾款规则（基于账期）
+            existing_prepay = self.session.query(TimeRule).filter(
+                TimeRule.related_id == related_id,
+                TimeRule.related_type == related_type,
+                TimeRule.trigger_event == EventType.VCLevel.CASH_PREPAID,
+                TimeRule.target_event == EventType.VCLevel.SUBJECT_SHIPPED
+            ).first()
+            if not existing_prepay:
+                self.session.add(TimeRule(
+                    related_id=related_id,
+                    related_type=related_type,
+                    inherit=TimeRuleInherit.NEAR,
+                    party=TimeRuleParty.OURSELVES,  # 我方发货，受预付约束
+                    trigger_event=EventType.VCLevel.CASH_PREPAID,
+                    tge_param1=f"{int(prepay_ratio * 100)}%",  # 纯百分数字符串，供规则引擎计算
+                    tge_param2=None,
+                    target_event=EventType.VCLevel.SUBJECT_SHIPPED,
+                    tae_param1="付款条款生成",
+                    tae_param2=None,
+                    offset=0,
+                    unit=unit,
+                    direction=TimeRuleDirection.AFTER,
+                    status=TimeRuleStatus.TEMPLATE
+                ))
+                rules_created += 1
+
+        # 3.3 结算规则 (SUBJECT_FINISH → SUBJECT_CASH_FINISH, direction=BEFORE)
         existing_balance = self.session.query(TimeRule).filter(
             TimeRule.related_id == related_id,
             TimeRule.related_type == related_type,
             TimeRule.target_event == EventType.VCLevel.SUBJECT_CASH_FINISH,
             TimeRule.inherit == TimeRuleInherit.NEAR
         ).first()
-        
+
         if not existing_balance:
-            balance_rule = TimeRule(
+            self.session.add(TimeRule(
                 related_id=related_id,
                 related_type=related_type,
-                inherit=TimeRuleInherit.NEAR,  # 传递给虚拟合同 (模板)
+                inherit=TimeRuleInherit.NEAR,
                 party=party,
                 trigger_event=trigger_event,
-                tge_param1=f"账期{balance_days}天",
+                tge_param1=None,  # 账期时长在 offset 中体现
+                tge_param2=None,
                 target_event=EventType.VCLevel.SUBJECT_CASH_FINISH,
-                tae_param1="货款结清",
+                tae_param1="付款条款生成",
+                tae_param2=None,
                 offset=balance_days,
                 unit=unit,
-                direction=TimeRuleDirection.AFTER,
-                status=TimeRuleStatus.TEMPLATE  # 模板状态
-            )
-            self.session.add(balance_rule)
+                direction=TimeRuleDirection.BEFORE,
+                status=TimeRuleStatus.TEMPLATE
+            ))
             rules_created += 1
-        
+
         if rules_created > 0:
             self.session.flush()
-        
+
         return rules_created
 

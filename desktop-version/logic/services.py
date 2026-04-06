@@ -13,18 +13,28 @@ from logic.constants import (
 import pandas as pd
 
 def normalize_item_data(item: dict) -> dict:
-    """将混乱的字典 Key 统一为系统标准格式"""
+    """将混乱的字典 Key 统一为系统标准格式（统一使用 snake_case 字段名）"""
     return {
         "sku_id": item.get("sku_id") or item.get("skuId") or item.get("id"),
         "sku_name": item.get("sku_name") or item.get("skuName") or item.get("name") or SystemConstants.UNKNOWN,
         "qty": float(item.get("qty") or item.get("quantity") or 0),
         "price": float(item.get("price") or item.get("unit_price") or item.get("unitPrice") or 0.0),
-        "point_id": item.get("point_id") or item.get("pointId"),
-        "point_name": item.get("point_name") or item.get("pointName") or item.get("warehouse") or SystemConstants.UNKNOWN,
+        # 收货点位（采购场景）
+        "receiving_point_id": item.get("receiving_point_id") or item.get("point_id") or item.get("pointId"),
+        "receiving_point_name": item.get("receiving_point_name") or item.get("point_name") or item.get("pointName") or item.get("warehouse") or SystemConstants.UNKNOWN,
+        # 设备序列号
         "sn": item.get("sn") or "-",
+        # 押金
         "deposit": float(item.get("deposit") or 0.0),
-        "source_warehouse": item.get("source_warehouse") or item.get("sourceWarehouse") or SystemConstants.DEFAULT_WAREHOUSE,
-        "target_warehouse": item.get("target_warehouse") or item.get("targetWarehouse") or item.get("退货目的地")
+        # 发货点位（综合来源：source_warehouse/supplier仓库 或 shipping_point_name/退货原点位）
+        "shipping_point_name": item.get("source_warehouse") or item.get("sourceWarehouse") or item.get("shipping_point_name") or item.get("shippingPointName") or SystemConstants.DEFAULT_POINT,
+        # 收货点位（综合来源：target_warehouse/退货目的地 或 receiving_warehouse）
+        "receiving_point_name": item.get("target_warehouse") or item.get("targetWarehouse") or item.get("receiving_warehouse") or item.get("receivingWarehouse") or item.get("退货目的地"),
+        # 目标点位（调拨场景）
+        "target_point_id": item.get("target_point_id") or item.get("targetPointId"),
+        "target_point_name": item.get("target_point_name") or item.get("targetPointName"),
+        # 发货点位ID（退货场景）
+        "shipping_point_id": item.get("shipping_point_id") or item.get("shippingPointId"),
     }
 
 def format_item_list_preview(items: list) -> str:
@@ -63,8 +73,9 @@ def get_returnable_items(session, target_vc_id, return_direction):
     locked_sns = set()
     returned_qtys = {} # sku_id -> {point_name: total_qty}
     for r_vc in existing_returns:
-        r_items = (r_vc.elements or {}).get("return_items", [])
-        for ri in r_items:
+        # 支持新旧两种结构
+        r_elems = (r_vc.elements or {}).get("elements", [])
+        for ri in r_elems:
             rsn = ri.get("sn")
             if rsn and rsn != "-":
                 locked_sns.add(rsn)
@@ -78,6 +89,9 @@ def get_returnable_items(session, target_vc_id, return_direction):
 
     return_items = []
 
+    # 获取 elements 列表（兼容新旧结构）
+    vc_elems = elements.get("elements", [])
+
     # 2. 设备采购类型的退货逻辑
     if target_vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
         filter_status = OperationalStatus.OPERATING if ReturnDirection.CUSTOMER_TO_US in return_direction else OperationalStatus.STOCK
@@ -85,24 +99,25 @@ def get_returnable_items(session, target_vc_id, return_direction):
             EquipmentInventory.virtual_contract_id == target_vc.id,
             EquipmentInventory.operational_status == filter_status
         ).all()
-        
+
         for e in equip_list:
             if e.sn in locked_sns: continue
             return_items.append({
                 "sku_id": e.sku_id,
                 "sn": e.sn,
                 "sku_name": e.sku.name if e.sku else "未知设备",
-                "price": 0.0 if ReturnDirection.CUSTOMER_TO_US in return_direction else (e.sku.params.get("unit_price", 0) if e.sku and e.sku.params else 0), 
+                "price": 0.0 if ReturnDirection.CUSTOMER_TO_US in return_direction else (e.sku.params.get("unit_price", 0) if e.sku and e.sku.params else 0),
                 "qty": 1,
                 "point_id": e.point_id,
                 "point_name": e.point.name if e.point else "未定义",
-                "deposit": float(e.deposit_amount or target_vc.elements.get("skus_map", {}).get(str(e.sku_id), {}).get("deposit", 0.0) or 0.0)
+                "shipping_point_name": e.point.name if e.point else None,
+                "deposit": float(e.deposit_amount or 0.0)
             })
 
     # 3. 物料采购类型的退货逻辑 (向供应商退款)
     elif target_vc.type == VCType.MATERIAL_PROCUREMENT:
         unique_skus = {}
-        for i in elements.get("skus", []):
+        for i in vc_elems:
             sid = i.get("sku_id")
             if sid not in unique_skus:
                 unique_skus[sid] = {
@@ -112,7 +127,7 @@ def get_returnable_items(session, target_vc_id, return_direction):
                 }
             else:
                 unique_skus[sid]["target_total"] += float(i.get("qty") or 0)
-        
+
         for sid, meta in unique_skus.items():
             mat = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
             if mat and mat.stock_distribution:
@@ -126,12 +141,26 @@ def get_returnable_items(session, target_vc_id, return_direction):
                                 "sku_name": meta["name"],
                                 "price": meta["price"],
                                 "qty": int(final_returnable),
-                                "point_name": wh
+                                "point_name": wh,
+                                "shipping_point_name": wh
                             })
-                            
+
     # 4. 物料供应类型的退货逻辑 (客户退回)
     elif target_vc.type == VCType.MATERIAL_SUPPLY:
-        for p in elements.get("points", []):
+        # 旧结构：points[].items[]
+        points_data = elements.get("points", [])
+        if not points_data and vc_elems:
+            # 新结构：elements[] — 按 receiving_point_id 分组
+            pt_group = {}
+            for e in vc_elems:
+                pt_id = e.get("receiving_point_id")
+                if pt_id not in pt_group:
+                    pt = session.query(Point).get(pt_id)
+                    pt_group[pt_id] = {"name": pt.name if pt else f"点位{pt_id}", "items": []}
+                pt_group[pt_id]["items"].append(e)
+            points_data = [{"pointName": v["name"], "items": v["items"]} for v in pt_group.values()]
+
+        for p in points_data:
             p_name = p.get("pointName") or "未知点位"
             for i in p.get("items", []):
                 norm = normalize_item_data(i)
@@ -142,7 +171,8 @@ def get_returnable_items(session, target_vc_id, return_direction):
                         "sku_name": norm["sku_name"],
                         "price": norm["price"],
                         "qty": int(remain_qty),
-                        "point_name": p_name
+                        "point_name": p_name,
+                        "shipping_point_name": norm.get("shipping_point_name")
                     })
 
     return return_items
@@ -197,16 +227,22 @@ def validate_inventory_availability(session, request_items):
         if not sku_n or not wh_n or req_qty <= 0: continue
         key = (sku_n, wh_n)
         totals[key] = totals.get(key, 0) + req_qty
-    
+
     over_stock = []
     for (sku_n, wh_n), total_req in totals.items():
         mat_inv = session.query(MaterialInventory).join(SKU).filter(SKU.name == sku_n).first()
         dist = mat_inv.stock_distribution if (mat_inv and mat_inv.stock_distribution) else {}
-        available = float(dist.get(wh_n, 0.0))
-        
+
+        # stock_distribution 的 key 是 str(point_id)，将 warehouse name 转为 point_id 再查询
+        pt = session.query(Point).filter(Point.name == wh_n).first()
+        if pt:
+            available = float(dist.get(str(pt.id), 0.0))
+        else:
+            available = float(dist.get(wh_n, 0.0))
+
         if total_req > available:
             over_stock.append(f"【{wh_n}】的 {sku_n}: 申请 {total_req}, 当前存量 {available}")
-            
+
     return len(over_stock) == 0, over_stock
 
 def get_counterpart_info(session, vc):
@@ -290,7 +326,7 @@ def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:
             p_ee, p_ee_id = AccountOwnerType.SUPPLIER, sc.supplier_id
             
     elif vc_type == VCType.RETURN:
-        direction = elements.get('return_direction', '')
+        direction = (vc.get('return_direction') if isinstance(vc, dict) else vc.return_direction) or ''
         if ReturnDirection.US_TO_SUPPLIER in direction:
             # 向供应商退货：供应商(Payer) -> 自己公司(Payee) [退款流程]
             p_err, p_err_id = AccountOwnerType.SUPPLIER, None
@@ -310,63 +346,31 @@ def format_vc_items_for_display(vc):
     """
     将虚拟合同的 elements 转换为 UI 友好的展示格式
     返回: (display_type, items_list)
-    display_type: 'skus' | 'points' | 'return_items' | 'empty'
+    display_type: 'elements' | 'empty'
     """
     elements = (vc['elements'] if isinstance(vc, dict) else vc.elements) or {}
-    
-    # A. 列表模式 (设备采购/物料采购)
-    if "skus" in elements and isinstance(elements["skus"], list):
-        items = elements["skus"]
-        if items:
+
+    # 统一结构：elements["elements"]（新 VC）
+    if "elements" in elements and isinstance(elements["elements"], list):
+        elems = elements["elements"]
+        if elems:
             show_items = []
-            for i in items:
-                norm = normalize_item_data(i)
+            for e in elems:
                 row = {
-                    "品类名称": norm["sku_name"],
-                    "数量": norm["qty"],
-                    "单价": norm["price"],
-                    "合计金额": norm["qty"] * norm["price"]
+                    "SKU_ID": e.get("sku_id"),
+                    "数量": e.get("qty"),
+                    "单价": e.get("price"),
+                    "小计": e.get("subtotal"),
+                    "发货点位ID": e.get("shipping_point_id"),
+                    "收货点位ID": e.get("receiving_point_id"),
                 }
-                if norm["deposit"] > 0:
-                    row["单台押金"] = norm["deposit"]
-                row["目的点位/仓库"] = norm["point_name"]
+                if e.get("deposit", 0) > 0:
+                    row["单台押金"] = e.get("deposit")
+                if e.get("sn_list"):
+                    row["序列号列表"] = e.get("sn_list")
                 show_items.append(row)
-            return 'skus', show_items
-    
-    # B. 点位分组模式 (物料供应)
-    elif "points" in elements and isinstance(elements["points"], list):
-        all_items = []
-        for p in elements["points"]:
-            p_name = p.get("point_name") or p.get("pointName") or f"{SystemConstants.UNKNOWN}点位"
-            for i in p.get("items", []):
-                norm = normalize_item_data(i)
-                all_items.append({
-                    "物料名称": norm["sku_name"],
-                    "数量": norm["qty"],
-                    "单价": norm["price"],
-                    "小计": norm["qty"] * norm["price"],
-                    "发货仓库": norm.get("source_warehouse") or SystemConstants.DEFAULT_WAREHOUSE,
-                    "配送/目的点位": p_name
-                })
-        if all_items:
-            return 'points', all_items
-    
-    # C. 退货模式
-    elif "return_items" in elements and isinstance(elements["return_items"], list):
-        ret_items = []
-        for i in elements["return_items"]:
-            norm = normalize_item_data(i)
-            ret_items.append({
-                "退回商品": norm["sku_name"],
-                "退回单价": norm["price"],
-                "退回数量": norm["qty"],
-                "货值金额": norm["qty"] * norm["price"],
-                "原归属点位": norm["point_name"],
-                "退货目的地": i.get("target_warehouse") or SystemConstants.DEFAULT_WAREHOUSE
-            })
-        if ret_items:
-            return 'return_items', ret_items
-    
+            return 'elements', show_items
+
     return 'empty', []
 
 def calculate_cashflow_progress(session, vc, existing_cfs):
@@ -524,7 +528,7 @@ def get_logistics_finance_context(session, logistics_id):
         "vc": vc,
         "cp_type": cp_type,
         "cp_id": cp_id,
-        "total_amount": float(vc.elements.get('total_amount', 0)),
+        "total_amount": float((vc.elements or {}).get('total_amount', 0)),
         "is_return": (vc.type == VCType.RETURN),
         "items_cost": 0.0,
         "target_acc_l1": AccountLevel1.AR if cp_type == CounterpartType.CUSTOMER else AccountLevel1.AP,
@@ -545,21 +549,22 @@ def get_logistics_finance_context(session, logistics_id):
     # 2. 成本核算逻辑
     if vc.type == VCType.MATERIAL_SUPPLY:
         total_cost = 0.0
-        for p in vc.elements.get("points", []):
-            for item in p.get("items", []):
-                sid = item.get("sku_id") or item.get("skuId")
-                qty = float(item.get("qty") or 0)
-                mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
-                unit_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
-                if unit_cost == 0:
-                    sku_obj = session.query(SKU).get(sid)
-                    unit_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
-                total_cost += qty * unit_cost
+        mat_elems = (vc.elements or {}).get("elements", [])
+        for item in mat_elems:
+            sid = item.get("sku_id") or item.get("skuId")
+            qty = float(item.get("qty") or 0)
+            mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
+            unit_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
+            if unit_cost == 0:
+                sku_obj = session.query(SKU).get(sid)
+                unit_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
+            total_cost += qty * unit_cost
         ctx["items_cost"] = total_cost
-    
+
     elif vc.type == VCType.RETURN:
         total_asset_cost = 0.0
-        for item in vc.elements.get("return_items", []):
+        ret_elems = (vc.elements or {}).get("elements", [])
+        for item in ret_elems:
             sid = item.get("id") or item.get("sku_id")
             qty = float(item.get("qty") or 0)
             mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
@@ -596,7 +601,7 @@ def get_cashflow_finance_context(session, cash_flow_id):
         if active_vc.type == VCType.MATERIAL_SUPPLY:
             is_income = True
         elif vc.type == VCType.RETURN:
-            direction = vc.elements.get("return_direction")
+            direction = vc.return_direction or (vc.elements.get("return_direction") if vc.elements else None)
             is_income = direction and ReturnDirection.US_TO_SUPPLIER in direction
             
     elif cf.type == CashFlowType.DEPOSIT_OFFSET_IN:
@@ -611,7 +616,7 @@ def get_cashflow_finance_context(session, cash_flow_id):
     # 计算核销进度
     ar_ap_amt, pre_amt = 0.0, 0.0
     if cf.type in [CashFlowType.PREPAYMENT, CashFlowType.FULFILLMENT] and vc:
-        total_amt = float(vc.elements.get('total_amount', 0))
+        total_amt = float((vc.elements or {}).get('total_amount', 0))
         paid_before = session.query(func.sum(CashFlow.amount)).filter(
             CashFlow.virtual_contract_id == vc.id,
             CashFlow.type.in_([CashFlowType.PREPAYMENT, CashFlowType.FULFILLMENT, CashFlowType.OFFSET_PAY]),

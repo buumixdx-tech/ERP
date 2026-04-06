@@ -9,7 +9,7 @@ from .queries import (
     get_returnable_vcs, get_vc_count_by_business, get_vc_status_logs, get_vc_cash_flows
 )
 from .schemas import (
-    VCItemSchema, CreateProcurementVCSchema, CreateStockProcurementVCSchema,
+    VCElementSchema, VCItemSchema, CreateProcurementVCSchema, CreateStockProcurementVCSchema,
     AllocateInventorySchema, CreateMaterialSupplyVCSchema, CreateReturnVCSchema,
     CreateMatProcurementVCSchema, TimeRuleSchema, UpdateVCSchema, DeleteVCSchema
 )
@@ -30,6 +30,7 @@ __all__ = [
     'get_vc_count_by_business',
     'get_vc_status_logs',
     'get_vc_cash_flows',
+    'VCElementSchema',
     'VCItemSchema',
     'CreateProcurementVCSchema',
     'CreateStockProcurementVCSchema',

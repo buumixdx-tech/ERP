@@ -68,20 +68,25 @@ def process_vc_deposit(session, vc_id):
     # 根据用户规则：应收金额 = 还在运营状态的设备数量 * 业务约定单台押金
     new_should_receive = 0.0
     
-    if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT] and "skus" in elements:
+    if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
+        # 兼容新旧两种 elements 结构
+        items = elements.get("elements") or elements.get("skus") or []
+        if not items:
+            return
+
         # 建立 SKU 与约定押金的映射（确保 ID 为整数类型）
         sku_to_dep = {}
-        for item in elements["skus"]:
+        for item in items:
             sid = item.get("sku_id")
             if sid:
                 sku_to_dep[int(sid)] = float(item.get("deposit", 0.0))
-        
+
         print(f"DEBUG deposit: VC {vc_id} sku_to_dep = {sku_to_dep}")
-        
+
         # 统计是否已经产生过实物档案（发货后的）
         inv_exists = session.query(EquipmentInventory).filter(EquipmentInventory.virtual_contract_id == vc_id).first() is not None
         print(f"DEBUG deposit: VC {vc_id} inv_exists = {inv_exists}")
-        
+
         if inv_exists:
             # 方案 A: 基于实物库存（处理后期退货变动）
             for sid, target_dep in sku_to_dep.items():
@@ -94,7 +99,7 @@ def process_vc_deposit(session, vc_id):
                 new_should_receive += count * target_dep
         else:
             # 方案 B: 基于初始合同计划（处理刚创建尚未发货阶段）
-            for item in elements["skus"]:
+            for item in items:
                 new_should_receive += float(item.get("qty", 0)) * float(item.get("deposit", 0.0))
         
         print(f"DEBUG deposit: VC {vc_id} new_should_receive = {new_should_receive}")
@@ -171,8 +176,9 @@ def process_vc_deposit(session, vc_id):
     
     # 获取 SKU 与约定押金的映射
     sku_to_agreed_deposit = {}
-    if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT] and "skus" in elements:
-        for item in elements["skus"]:
+    if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
+        items = elements.get("elements") or elements.get("skus") or []
+        for item in items:
             sid = item.get("sku_id")
             if sid:
                 sku_to_agreed_deposit[sid] = float(item.get("deposit", 0.0))

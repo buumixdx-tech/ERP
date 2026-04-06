@@ -3,27 +3,44 @@ from typing import List, Optional, Dict
 from datetime import datetime
 from logic.time_rules.schemas import TimeRuleSchema
 
-class VCItemSchema(BaseModel):
+
+class VCElementSchema(BaseModel):
+    """统一 VC elements 条目结构：按(shipping_point_id, receiving_point_id, sku_id)唯一确定"""
+    shipping_point_id: int = Field(..., description="发货点位ID")
+    receiving_point_id: int = Field(..., description="收货点位ID")
     sku_id: int = Field(..., description="SKU ID")
-    sku_name: str = Field(..., min_length=1, description="SKU名称")
-    point_id: Optional[int] = Field(None, description="目标点位ID")
-    point_name: Optional[str] = Field(None, description="目标点位名称")
     qty: float = Field(..., gt=0, description="数量")
     price: float = Field(..., ge=0, description="单价")
-    deposit: float = Field(default=0.0, ge=0, description="单台押金")
-    sn: str = Field("-", description="设备序列号(物料填'-')")
+    deposit: float = Field(default=0.0, ge=0, description="单台押金（设备VC有值，物料VC为0）")
+    subtotal: float = Field(..., description="小计金额 = qty × price")
+    sn_list: List[str] = Field(default_factory=list, description="设备序列号列表（退货/调拨时填写）")
 
-    @field_validator('sku_name', 'point_name', 'sn')
+    @field_validator('subtotal', mode='before')
     @classmethod
-    def clean_strings(cls, v):
-        if isinstance(v, str):
-            return v.strip()
-        return v
+    def compute_subtotal(cls, v, info):
+        # 自动计算小计
+        if v is not None:
+            return v
+        return 0.0
+
+    @model_validator(mode='after')
+    def validate_subtotal(self) -> 'VCElementSchema':
+        expected = self.qty * self.price
+        if abs(self.subtotal - expected) > 0.01:
+            raise ValueError(f"小计 {self.subtotal} 与 qty×price ({expected}) 不符")
+        return self
+
+    @property
+    def id(self) -> str:
+        """自动生成唯一标识：sp{shipping_point_id}_rp{receiving_point_id}_sku{sku_id}"""
+        return f"sp{self.shipping_point_id}_rp{self.receiving_point_id}_sku{self.sku_id}"
+
 
 class CreateProcurementVCSchema(BaseModel):
+    """设备采购 / 库存采购 / 物料采购 统一 Schema"""
     business_id: int = Field(..., description="关联业务ID")
     sc_id: Optional[int] = Field(None, description="供应链协议ID")
-    items: List[VCItemSchema] = Field(..., description="采购明细列表")
+    elements: List[VCElementSchema] = Field(..., description="采购明细列表")
     total_amt: float = Field(..., ge=0, description="总金额")
     total_deposit: float = Field(..., ge=0, description="总押金")
     payment: Dict = Field(..., description="结算条款")
@@ -31,35 +48,46 @@ class CreateProcurementVCSchema(BaseModel):
 
     @model_validator(mode='after')
     def validate_totals(self) -> 'CreateProcurementVCSchema':
-        calc_amt = sum(item.qty * item.price for item in self.items)
-        calc_dep = sum(item.qty * item.deposit for item in self.items)
+        calc_amt = sum(elem.qty * elem.price for elem in self.elements)
+        calc_dep = sum(elem.qty * elem.deposit for elem in self.elements)
         if abs(calc_amt - self.total_amt) > 0.01:
             raise ValueError(f"总计金额 ¥{self.total_amt} 与明细计算值 ¥{calc_amt:.2f} 不符")
         if abs(calc_dep - self.total_deposit) > 0.01:
             raise ValueError(f"总计押金 ¥{self.total_deposit} 与明细计算值 ¥{calc_dep:.2f} 不符")
         return self
 
+
 class CreateStockProcurementVCSchema(BaseModel):
+    """库存采购 Schema"""
     sc_id: int = Field(..., description="供应链协议ID")
-    items: List[VCItemSchema] = Field(..., description="采购明细")
+    elements: List[VCElementSchema] = Field(..., description="采购明细")
     total_amt: float = Field(..., ge=0, description="总金额")
     payment: Dict = Field(..., description="结算条款")
     description: Optional[str] = Field("", description="备注")
 
-class AllocateInventorySchema(BaseModel):
-    business_id: int = Field(..., description="目标业务ID")
-    allocation_map: Dict[int, int] = Field(..., description="设备ID到目标点位ID的映射")
+
+class CreateMatProcurementVCSchema(BaseModel):
+    """物料采购 Schema"""
+    sc_id: int = Field(..., description="供应链协议ID")
+    elements: List[VCElementSchema] = Field(..., description="物料采购明细")
+    total_amt: float = Field(..., gt=0, description="总金额")
+    payment: Dict = Field(..., description="结算条款")
     description: Optional[str] = Field("", description="备注")
+
 
 class CreateMaterialSupplyVCSchema(BaseModel):
+    """物料供应 Schema"""
     business_id: int = Field(..., description="关联业务ID")
-    order: Dict = Field(..., description="供应订单")
+    elements: List[VCElementSchema] = Field(..., description="供应明细列表")
+    total_amt: float = Field(..., ge=0, description="总金额")
     description: Optional[str] = Field("", description="备注")
 
+
 class CreateReturnVCSchema(BaseModel):
+    """退货 Schema"""
     target_vc_id: int = Field(..., description="退货目标虚拟合同ID")
     return_direction: str = Field(..., description="退货方向")
-    return_items: List[VCItemSchema] = Field(..., description="退货明细")
+    elements: List[VCElementSchema] = Field(..., description="退货明细")
     goods_amount: float = Field(..., ge=0, description="退货货款金额")
     deposit_amount: float = Field(..., ge=0, description="退还押金金额")
     logistics_cost: float = Field(..., ge=0, description="物流费用")
@@ -68,12 +96,13 @@ class CreateReturnVCSchema(BaseModel):
     reason: Optional[str] = Field("", description="退货原因")
     description: Optional[str] = Field("", description="备注")
 
-class CreateMatProcurementVCSchema(BaseModel):
-    sc_id: int = Field(..., description="供应链协议ID")
-    items: List[VCItemSchema] = Field(..., description="物料采购明细")
-    total_amt: float = Field(..., gt=0, description="总金额")
-    payment: Dict = Field(..., description="结算条款")
+
+class AllocateInventorySchema(BaseModel):
+    """库存拨付 Schema"""
+    business_id: int = Field(..., description="目标业务ID")
+    elements: List[VCElementSchema] = Field(..., description="拨付明细")
     description: Optional[str] = Field("", description="备注")
+
 
 class UpdateVCSchema(BaseModel):
     id: int = Field(..., description="VC ID")
@@ -81,6 +110,31 @@ class UpdateVCSchema(BaseModel):
     elements: Optional[Dict] = Field(None, description="核心数据负载")
     deposit_info: Optional[Dict] = Field(None, description="押金信息")
 
+
 class DeleteVCSchema(BaseModel):
     id: int = Field(..., description="VC ID")
 
+
+# 向后兼容：保留 VCItemSchema 供 operations.py 过渡期使用
+class VCItemSchema(BaseModel):
+    """向后兼容：旧版 items 结构，逐步废弃"""
+    sku_id: int = Field(..., description="SKU ID")
+    sku_name: str = Field(..., min_length=1, description="SKU名称")
+    receiving_point_id: Optional[int] = Field(None, description="收货点位ID")
+    receiving_point_name: Optional[str] = Field(None, description="收货点位名称")
+    qty: float = Field(..., gt=0, description="数量")
+    price: float = Field(..., ge=0, description="单价")
+    deposit: float = Field(default=0.0, ge=0, description="单台押金")
+    sn: str = Field("-", description="设备序列号(物料填'-')")
+    shipping_point_name: Optional[str] = Field(None, description="发货点位")
+    receiving_point_name: Optional[str] = Field(None, description="收货点位")
+    target_point_id: Optional[int] = Field(None, description="目标点位ID")
+    target_point_name: Optional[str] = Field(None, description="目标点位名称")
+    shipping_point_id: Optional[int] = Field(None, description="发货点位ID")
+
+    @field_validator('sku_name', 'receiving_point_name', 'shipping_point_name', 'sn')
+    @classmethod
+    def clean_strings(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v

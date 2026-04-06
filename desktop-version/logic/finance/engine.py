@@ -157,7 +157,8 @@ def process_logistics_finance(session, logistics_id):
             entries.append({"level1": AccountLevel1.INVENTORY, "credit": items_cost, "summary": "物料发出"})
     elif vc.type == VCType.RETURN:
         original_vc = session.query(VirtualContract).get(vc.related_vc_id) if vc.related_vc_id else None
-        direction = vc.elements.get("return_direction")
+        # 优先读 VC 表字段，兼容旧数据（仍在 elements 中的 return_direction）
+        direction = vc.return_direction or (vc.elements.get("return_direction") if vc.elements else None)
         goods_amount = float(vc.elements.get("goods_amount") or 0)
         if direction and ReturnDirection.CUSTOMER_TO_US in direction:
             if items_cost > 0:

@@ -1,9 +1,9 @@
 from sqlalchemy.orm import Session
-from models import VirtualContract, TimeRule, Business, SupplyChain, EquipmentInventory, Point
+from models import VirtualContract, TimeRule, Business, SupplyChain, EquipmentInventory, Point, MaterialInventory
 from logic.constants import (
-    VCType, VCStatus, SubjectStatus, CashStatus, TimeRuleRelatedType, 
+    VCType, VCStatus, SubjectStatus, CashStatus, TimeRuleRelatedType,
     TimeRuleStatus, BusinessStatus, SKUType, SystemEventType, SystemAggregateType,
-    OperationalStatus
+    OperationalStatus, ReturnDirection
 )
 from logic.time_rules import RuleManager
 from logic.offset_manager import apply_offset_to_vc
@@ -11,10 +11,166 @@ from logic.events.dispatcher import emit_event
 from .schemas import (
     CreateProcurementVCSchema, CreateStockProcurementVCSchema, CreateMatProcurementVCSchema,
     CreateMaterialSupplyVCSchema, CreateReturnVCSchema, AllocateInventorySchema,
-    UpdateVCSchema, DeleteVCSchema
+    UpdateVCSchema, DeleteVCSchema, VCElementSchema
 )
 from logic.base import ActionResult
 from datetime import datetime
+
+
+# =============================================================================
+# 辅助函数：点位查询（商业逻辑）
+# =============================================================================
+
+# 默认总仓库ID
+DEFAULT_WAREHOUSE_ID = 1
+
+
+def _get_supplier_warehouse(session: Session, supplier_id: int) -> int | None:
+    """
+    根据供应商ID找供应商仓库 Point.id
+    规则：Point.type=供应商仓 且 Point.supplier_id=supplier_id
+    返回 None 表示未找到
+    """
+    pt = session.query(Point).filter(
+        Point.supplier_id == supplier_id,
+        Point.type == "供应商仓"
+    ).first()
+    return pt.id if pt else None
+
+
+def _get_our_warehouses(session: Session) -> list[int]:
+    """
+    获取我们所有的仓库（type=自有仓）的ID列表
+    """
+    pts = session.query(Point).filter(Point.type == "自有仓").all()
+    return [pt.id for pt in pts]
+
+
+def _get_supplier_warehouses(session: Session, supplier_id: int) -> list[int]:
+    """
+    获取指定供应商的仓库（type=供应商仓 且 supplier_id）的ID列表
+    """
+    pts = session.query(Point).filter(
+        Point.supplier_id == supplier_id,
+        Point.type == "供应商仓"
+    ).all()
+    return [pt.id for pt in pts]
+
+
+def _get_customer_warehouses(session: Session, customer_id: int) -> list[int]:
+    """
+    获取指定客户所有的仓库（type=客户仓 且 customer_id）的ID列表
+    """
+    pts = session.query(Point).filter(
+        Point.customer_id == customer_id,
+        Point.type == "客户仓"
+    ).all()
+    return [pt.id for pt in pts]
+
+
+def _get_customer_points(session: Session, customer_id: int) -> list[int]:
+    """
+    获取指定客户所有的点位（任意 type，只要 customer_id 匹配）
+    用途：采购/供应/拨付的收货点范围
+    """
+    pts = session.query(Point).filter(Point.customer_id == customer_id).all()
+    return [pt.id for pt in pts]
+
+
+def _get_warehouses_with_sku_stock(session: Session, sku_id: int) -> list[int]:
+    """
+    物料供应/库存拨付专用：查询所有存有该SKU物料库存的仓库ID
+    从 MaterialInventory.stock_distribution 的 key（str(point_id)）匹配 Point.id
+    返回匹配到的 Point.id 列表
+    """
+    mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).first()
+    if not mat_inv or not mat_inv.stock_distribution:
+        return []
+    # stock_distribution 的 key 是 str(point_id)，如 "3" 表示 point_id=3
+    wh_ids = [int(k) for k in mat_inv.stock_distribution.keys()]
+    pts = session.query(Point).filter(Point.id.in_(wh_ids)).all()
+    return [pt.id for pt in pts]
+
+
+def _get_equipment_stock_points(session: Session, sku_id: int) -> list[int]:
+    """
+    库存拨付专用：查询所有存有该SKU设备库存的点位ID
+    从 EquipmentInventory 查询 point_id（operational_status=STOCK 的记录）
+    返回 Point.id 列表
+    """
+    eqs = session.query(EquipmentInventory).filter(
+        EquipmentInventory.sku_id == sku_id,
+        EquipmentInventory.operational_status == OperationalStatus.STOCK
+    ).all()
+    return list({eq.point_id for eq in eqs})
+
+
+def _get_customer_points_with_sku(session: Session, customer_id: int, sku_id: int) -> list[int]:
+    """
+    退货4.1专用：查询指定客户下，所有存有该SKU设备的点位（不限type）
+    从 EquipmentInventory 查询 point_id，筛选属于该客户任意类型的点位
+    返回 Point.id 列表
+    """
+    # 查找该客户所有点位下有该 SKU 设备的点位ID
+    pts = session.query(Point).filter(
+        Point.customer_id == customer_id
+    ).all()
+    customer_point_ids = [pt.id for pt in pts]
+    if not customer_point_ids:
+        return []
+
+    # 从 EquipmentInventory 找这些点位上有该 SKU 的设备
+    from models import SKU
+    eqs = session.query(EquipmentInventory).filter(
+        EquipmentInventory.point_id.in_(customer_point_ids),
+        EquipmentInventory.sku_id == sku_id
+    ).all()
+    point_ids_with_sku = list({eq.point_id for eq in eqs})
+    return point_ids_with_sku
+
+
+def _get_our_points_with_sku(session: Session, sku_id: int) -> list[int]:
+    """
+    退货4.2/4.3专用：查询我们有该SKU物料库存的点位
+    从 MaterialInventory.stock_distribution 匹配
+    返回 Point.id 列表
+    """
+    return _get_warehouses_with_sku_stock(session, sku_id)
+
+
+def _elem_to_dict(elem: VCElementSchema) -> dict:
+    """将 VCElementSchema 转为字典，用于存入 elements JSON"""
+    return {
+        "id": elem.id,
+        "shipping_point_id": elem.shipping_point_id,
+        "receiving_point_id": elem.receiving_point_id,
+        "sku_id": elem.sku_id,
+        "qty": elem.qty,
+        "price": elem.price,
+        "deposit": elem.deposit,
+        "subtotal": elem.subtotal,
+        "sn_list": elem.sn_list
+    }
+
+
+def _get_point_name(session: Session, point_id: int) -> str:
+    """根据点位ID获取点位名称"""
+    if not point_id:
+        return "默认点位"
+    pt = session.query(Point).get(point_id)
+    return pt.name if pt else f"点位{point_id}"
+
+
+def _get_sku_name(session: Session, sku_id: int) -> str:
+    """根据SKU ID获取SKU名称"""
+    from models import SKU
+    sku = session.query(SKU).get(sku_id)
+    return sku.name if sku else f"SKU{sku_id}"
+
+
+# =============================================================================
+# VC Action 函数
+# =============================================================================
 
 def create_procurement_vc_action(session: Session, payload: CreateProcurementVCSchema, draft_rules: list = None) -> ActionResult:
     """设备采购执行单创建 Action"""
@@ -23,20 +179,50 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
         if biz.status not in [BusinessStatus.ACTIVE, BusinessStatus.LANDING]:
             return ActionResult(success=False, error=f"项目当前状态为 {biz.status}，不允许下达采购单")
-        
+
+        sc = None
         if payload.sc_id:
             sc = session.query(SupplyChain).get(payload.sc_id)
             if not sc: return ActionResult(success=False, error="未找到供应链协议")
             if sc.type != SKUType.EQUIPMENT:
                 return ActionResult(success=False, error="该协议类型不属于设备供应，无法用于设备采购")
 
-        clean_items = [item.dict() for item in payload.items]
+        # 商业逻辑
+        # shipping_point_id = 供应商仓库（由供应链的supplier_id确定）
+        # receiving_point_id = 用户选择，范围：客户所有点位（运营点位+仓库）
+        if not biz.customer_id:
+            return ActionResult(success=False, error="业务未关联客户，无法创建设备采购单")
+        allowed_receiving = _get_customer_points(session, biz.customer_id)
+        if not allowed_receiving:
+            return ActionResult(success=False, error=f"客户 {biz.customer_id} 没有可用点位，请先配置")
+
+        clean_elems = []
+        for e in payload.elements:
+            # 校验收货点是否在允许范围内
+            if e.receiving_point_id not in allowed_receiving:
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在客户仓库范围内")
+
+            # 发货点：由供应链的supplier_id查供应商仓库
+            if sc:
+                sp = _get_supplier_warehouse(session, sc.supplier_id)
+                if not sp:
+                    return ActionResult(success=False, error=f"未找到供应商仓库，请检查供应商 {sc.supplier_id} 的仓库配置")
+            else:
+                sp = None
+
+            corrected = VCElementSchema(
+                shipping_point_id=sp,
+                receiving_point_id=e.receiving_point_id,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
             business_id=payload.business_id,
-            supply_chain_id=payload.sc_id,
+            supply_chain_id=sc.id if sc else None,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "skus": clean_items,
+                "elements": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
@@ -79,22 +265,57 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
         if biz.status not in [BusinessStatus.ACTIVE, BusinessStatus.LANDING]:
             return ActionResult(success=False, error=f"项目尚未正式开展 (当前状态: {biz.status})，无法进行物料供应")
-        
+
         from logic.services import validate_inventory_availability
+
+        if not biz.customer_id:
+            return ActionResult(success=False, error="业务未关联客户，无法创建物料供应单")
+
+        # 商业逻辑
+        # shipping_point_id：用户选择，范围=有该SKU库存的所有仓库
+        # receiving_point_id：用户选择，范围=客户所有点位（运营点位+仓库）
+        allowed_shipping_by_sku = {}
+        allowed_receiving = _get_customer_points(session, biz.customer_id)
+        if not allowed_receiving:
+            return ActionResult(success=False, error=f"客户 {biz.customer_id} 没有可用点位，请先配置")
+
         check_items = []
-        for p in payload.order.get('points', []):
-            for item in p.get('items', []):
-                wh_n = item.get('source_warehouse') or p.get('source_warehouse') or "默认仓"
-                check_items.append((item.get('sku_name'), wh_n, float(item.get('qty', 0))))
-        
+        clean_elems = []
+        for e in payload.elements:
+            # 校验收货点
+            if e.receiving_point_id not in allowed_receiving:
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在客户运营点位范围内")
+
+            # 校验/获取该SKU的可用发货仓库
+            if e.sku_id not in allowed_shipping_by_sku:
+                allowed_shipping_by_sku[e.sku_id] = set(_get_warehouses_with_sku_stock(session, e.sku_id))
+            allowed_sp = allowed_shipping_by_sku[e.sku_id]
+            if not allowed_sp:
+                return ActionResult(success=False, error=f"SKU {e.sku_id} 在任何仓库都没有库存，无法供应")
+            if e.shipping_point_id not in allowed_sp:
+                return ActionResult(success=False, error=f"发货点 {e.shipping_point_id} 没有 SKU {e.sku_id} 的库存")
+
+            corrected = VCElementSchema(
+                shipping_point_id=e.shipping_point_id,
+                receiving_point_id=e.receiving_point_id,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
+            check_items.append((_get_sku_name(session, e.sku_id), _get_point_name(session, e.shipping_point_id), e.qty))
+
         is_ok, over_stock = validate_inventory_availability(session, check_items)
         if not is_ok:
             return ActionResult(success=False, error=f"库存严重不足: {' | '.join(over_stock)}")
-
+        payment_terms = (biz.details or {}).get("payment_terms", {})
         new_vc = VirtualContract(
             business_id=payload.business_id,
             type=VCType.MATERIAL_SUPPLY,
-            elements=payload.order,
+            elements={
+                "elements": clean_elems,
+                "total_amount": payload.total_amt,
+                "payment_terms": payment_terms
+            },
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
             cash_status=CashStatus.EXE,
@@ -115,7 +336,7 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
                 ))
         apply_offset_to_vc(session, new_vc)
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {
-            "type": new_vc.type, "business_id": new_vc.business_id, "total_amount": payload.order.get('total_amount', 0)
+            "type": new_vc.type, "business_id": new_vc.business_id, "total_amount": payload.total_amt
         })
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"物料供应单 VC-{new_vc.id} 创建成功")
@@ -128,7 +349,7 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
     try:
         target_vc = session.query(VirtualContract).get(payload.target_vc_id)
         if not target_vc: return ActionResult(success=False, error="未找到目标虚拟合同")
-        
+
         if target_vc.subject_status not in [SubjectStatus.EXE, SubjectStatus.FINISH]:
             return ActionResult(success=False, error=f"原单标的状态为 {target_vc.subject_status}，此时无法发起退货")
 
@@ -138,24 +359,105 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         for ai in allowed_items:
             key = (ai['sku_id'], ai.get('point_name'), ai.get('sn', '-'))
             allowed_map[key] = allowed_map.get(key, 0) + ai['qty']
-        
-        for ri in payload.return_items:
-            key = (ri.sku_id, ri.point_name, ri.sn)
+
+        for ri in payload.elements:
+            pt_name = _get_point_name(session, ri.shipping_point_id)
+            sn = ri.sn_list[0] if ri.sn_list else '-'
+            key = (ri.sku_id, pt_name, sn)
             avail = allowed_map.get(key, 0)
             if ri.qty > avail:
-                return ActionResult(success=False, error=f"退货越界: {ri.sku_name} (点位:{ri.point_name}) 申请退货 {ri.qty}，而最大可退仅 {avail}")
+                return ActionResult(success=False, error=f"退货越界: SKU {ri.sku_id} 在 {pt_name} 申请退货 {ri.qty}，而最大可退仅 {avail}")
 
-        clean_ret_items = [item.dict() for item in payload.return_items]
+        # -------------------------------------------------------
+        # 商业逻辑：确定退货收货点 + 校验收货点/发货点范围
+        # -------------------------------------------------------
+        target_type = target_vc.type
+        is_equipment_target = target_type in (VCType.EQUIPMENT_PROCUREMENT,)
+        is_mat_or_stock_target = target_type in (VCType.MATERIAL_PROCUREMENT, VCType.STOCK_PROCUREMENT)
+
+        # 4.2/4.3: 获取target_vc的供应链供应商仓库（退货目的地）
+        rp_supplier = None
+        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER and is_mat_or_stock_target:
+            if target_vc.supply_chain_id:
+                sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
+                if sc:
+                    rp_supplier = _get_supplier_warehouse(session, sc.supplier_id)
+            if not rp_supplier:
+                return ActionResult(success=False, error="无法确定退货目的地供应商仓库")
+
+        # 4.1: 获取挂钩vc供应链的供应商仓库（US_TO_SUPPLIER时）
+        rp_equipment_supplier = None
+        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER and is_equipment_target:
+            if target_vc.supply_chain_id:
+                sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
+                if sc:
+                    rp_equipment_supplier = _get_supplier_warehouse(session, sc.supplier_id)
+            if not rp_equipment_supplier:
+                return ActionResult(success=False, error="无法确定设备退货目的地供应商仓库")
+
+        # 4.1: 获取"有该sku的客户运营点位"列表（发货点允许范围）
+        # 4.2/4.3: 获取"我们有该sku库存的点位"列表（发货点允许范围）
+        allowed_shipping_by_sku = {}
+        if is_equipment_target:
+            # 4.1: 按sku查客户运营点位下有该设备的点位
+            for e in payload.elements:
+                if e.sku_id not in allowed_shipping_by_sku:
+                    # 从target_vc关联的客户查
+                    biz = session.query(Business).get(target_vc.business_id) if target_vc.business_id else None
+                    cust_id = biz.customer_id if biz else None
+                    if cust_id:
+                        allowed_shipping_by_sku[e.sku_id] = set(
+                            _get_customer_points_with_sku(session, cust_id, e.sku_id)
+                        )
+                    else:
+                        allowed_shipping_by_sku[e.sku_id] = set()
+        elif is_mat_or_stock_target:
+            # 4.2/4.3: 按sku查我们有库存的点位
+            for e in payload.elements:
+                if e.sku_id not in allowed_shipping_by_sku:
+                    allowed_shipping_by_sku[e.sku_id] = set(_get_our_points_with_sku(session, e.sku_id))
+
+        # 收货点 + 全面校验收货点/发货点
+        clean_elems = []
+        for e in payload.elements:
+            allowed_sp = allowed_shipping_by_sku.get(e.sku_id, set())
+            if not allowed_sp:
+                return ActionResult(success=False, error=f"SKU {e.sku_id} 没有可退货的库存点位")
+
+            # 校验收货点是否在允许范围内
+            if e.shipping_point_id not in allowed_sp:
+                return ActionResult(success=False, error=f"发货点 {e.shipping_point_id} 不在允许范围内")
+
+            # 确定收货点
+            if payload.return_direction == ReturnDirection.US_TO_SUPPLIER:
+                if is_equipment_target:
+                    rp = rp_equipment_supplier  # 供应商仓库
+                else:
+                    rp = rp_supplier  # 供应商仓库
+            else:
+                rp = DEFAULT_WAREHOUSE_ID  # 我们仓库
+
+            corrected = VCElementSchema(
+                shipping_point_id=e.shipping_point_id,
+                receiving_point_id=rp,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
             related_vc_id=payload.target_vc_id, business_id=target_vc.business_id,
             supply_chain_id=target_vc.supply_chain_id, type=VCType.RETURN,
             status=VCStatus.EXE, subject_status=SubjectStatus.EXE,
-            cash_status=CashStatus.EXE if payload.total_refund > 0 else CashStatus.FINISH, 
+            cash_status=CashStatus.EXE if payload.total_refund > 0 else CashStatus.FINISH,
             description=payload.description,
+            return_direction=payload.return_direction,
             elements={
-                "return_direction": payload.return_direction, "return_items": clean_ret_items,
-                "goods_amount": payload.goods_amount, "deposit_amount": payload.deposit_amount,
-                "total_refund": payload.total_refund, "total_amount": payload.total_refund, "reason": payload.reason
+                "elements": clean_elems,
+                "goods_amount": payload.goods_amount,
+                "deposit_amount": payload.deposit_amount,
+                "total_refund": payload.total_refund,
+                "total_amount": payload.total_refund,
+                "reason": payload.reason
             }
         )
         session.add(new_vc)
@@ -227,19 +529,43 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
         if not sc or sc.type != SKUType.MATERIAL:
             return ActionResult(success=False, error="无效的物料供应链协议")
 
-        clean_items = [item.dict() for item in payload.items]
+        # 商业逻辑
+        # shipping_point_id = 供应商仓库（由sc.supplier_id确定）
+        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库
+        sp = _get_supplier_warehouse(session, sc.supplier_id)
+        if not sp:
+            return ActionResult(success=False, error=f"未找到供应商 {sc.supplier_id} 的仓库配置")
+
+        our_wh_ids = _get_our_warehouses(session)
+        supplier_wh_ids = _get_supplier_warehouses(session, sc.supplier_id)
+        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids))
+        if not allowed_receiving:
+            return ActionResult(success=False, error="没有可用的收货仓库")
+
+        clean_elems = []
+        for e in payload.elements:
+            if e.receiving_point_id not in allowed_receiving:
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库）")
+
+            corrected = VCElementSchema(
+                shipping_point_id=sp,
+                receiving_point_id=e.receiving_point_id,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
             supply_chain_id=payload.sc_id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "skus": clean_items,
+                "elements": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
             cash_status=CashStatus.EXE,
-            description=payload.description or f"物料采购: {len(clean_items)}项物料"
+            description=payload.description or f"物料采购: {len(clean_elems)}项物料"
         )
         session.add(new_vc)
         session.flush()
@@ -259,13 +585,37 @@ def create_stock_procurement_vc_action(session: Session, payload: CreateStockPro
         if not sc or sc.type != SKUType.EQUIPMENT:
             return ActionResult(success=False, error="无效的设备供应链协议")
 
-        clean_items = [item.dict() for item in payload.items]
+        # 商业逻辑
+        # shipping_point_id = 供应商仓库（由sc.supplier_id确定）
+        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库
+        sp = _get_supplier_warehouse(session, sc.supplier_id)
+        if not sp:
+            return ActionResult(success=False, error=f"未找到供应商 {sc.supplier_id} 的仓库配置")
+
+        our_wh_ids = _get_our_warehouses(session)
+        supplier_wh_ids = _get_supplier_warehouses(session, sc.supplier_id)
+        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids))
+        if not allowed_receiving:
+            return ActionResult(success=False, error="没有可用的收货仓库")
+
+        clean_elems = []
+        for e in payload.elements:
+            if e.receiving_point_id not in allowed_receiving:
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库）")
+
+            corrected = VCElementSchema(
+                shipping_point_id=sp,
+                receiving_point_id=e.receiving_point_id,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
             business_id=None,
             supply_chain_id=payload.sc_id,
             type=VCType.STOCK_PROCUREMENT,
             elements={
-                "skus": clean_items,
+                "elements": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
@@ -273,7 +623,7 @@ def create_stock_procurement_vc_action(session: Session, payload: CreateStockPro
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
             cash_status=CashStatus.EXE,
-            description=payload.description or f"库存采购: {len(clean_items)}项设备"
+            description=payload.description or f"库存采购: {len(clean_elems)}项设备"
         )
         session.add(new_vc)
         session.flush()
@@ -291,50 +641,75 @@ def allocate_inventory_action(session: Session, payload: AllocateInventorySchema
     try:
         biz = session.query(Business).get(payload.business_id)
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
-        
-        equipment_ids = list(payload.allocation_map.keys())
-        equipments = []
-        for eq_id in equipment_ids:
-            eq = session.query(EquipmentInventory).get(eq_id)
-            if not eq or eq.operational_status != OperationalStatus.STOCK:
-                return ActionResult(success=False, error=f"设备 ID={eq_id} 不在库或不存在")
-            equipments.append(eq)
 
-        target_point_ids = set(payload.allocation_map.values())
-        point_map = {}
+        if not biz.customer_id:
+            return ActionResult(success=False, error="业务未关联客户，无法创建库存拨付单")
+
+        # 商业逻辑
+        # shipping_point_id：用户选择，范围=有该SKU库存的所有点位（来自EquipmentInventory）
+        # receiving_point_id：用户选择，范围=客户所有点位（运营点位+仓库）
+        allowed_receiving = _get_customer_points(session, biz.customer_id)
+        if not allowed_receiving:
+            return ActionResult(success=False, error=f"客户 {biz.customer_id} 没有可用点位，请先配置")
+
+        allowed_shipping_by_sku = {}
+        for e in payload.elements:
+            # 校验收货点
+            if e.receiving_point_id not in allowed_receiving:
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在客户运营点位范围内")
+
+            # 校验发货点：设备必须已在库
+            for eq_id in e.sn_list:
+                eq = session.query(EquipmentInventory).filter(EquipmentInventory.sn == str(eq_id)).first()
+                if not eq or eq.operational_status != OperationalStatus.STOCK:
+                    return ActionResult(success=False, error=f"设备 SN={eq_id} 不在库或不存在")
+
+            # 发货点范围：EquipmentInventory 中该 SKU 在库的点位
+            if e.sku_id not in allowed_shipping_by_sku:
+                allowed_shipping_by_sku[e.sku_id] = set(_get_equipment_stock_points(session, e.sku_id))
+            allowed_sp = allowed_shipping_by_sku[e.sku_id]
+            if e.shipping_point_id not in allowed_sp:
+                return ActionResult(success=False, error=f"发货点 {e.shipping_point_id} 没有 SKU {e.sku_id} 的设备库存")
+
+        # 验证目标点位存在
+        target_point_ids = set(e.receiving_point_id for e in payload.elements)
         for p_id in target_point_ids:
             p = session.query(Point).get(p_id)
             if not p: return ActionResult(success=False, error=f"未找到目标点位 ID={p_id}")
-            point_map[p_id] = p
 
-        biz_pricing = biz.details.get("pricing", {}) if biz.details else {}
-        total_deposit = 0.0
-        alloc_items = []
-        for eq in equipments:
-            t_point_id = payload.allocation_map[eq.id]
-            t_point = point_map[t_point_id]
-            sku_name = eq.sku.name if eq.sku else "未知"
-            deposit = biz_pricing.get(sku_name, {}).get("deposit", 0.0) if isinstance(biz_pricing.get(sku_name), dict) else 0.0
-            total_deposit += deposit
-            alloc_items.append({"equipment_id": eq.id, "sn": eq.sn, "sku_id": eq.sku_id, "deposit": deposit, "target_point_id": t_point_id})
-
+        clean_elems = []
+        for e in payload.elements:
+            corrected = VCElementSchema(
+                shipping_point_id=e.shipping_point_id,
+                receiving_point_id=e.receiving_point_id,
+                sku_id=e.sku_id, qty=e.qty, price=e.price,
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+            )
+            clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
             business_id=payload.business_id,
             type=VCType.INVENTORY_ALLOCATION,
-            elements={"allocation_items": alloc_items, "total_amount": 0.0},
-            deposit_info={"should_receive": total_deposit, "total_deposit": 0.0},
+            elements={
+                "elements": clean_elems,
+                "total_amount": 0.0
+            },
+            deposit_info={"should_receive": 0.0, "total_deposit": 0.0},
             status=VCStatus.EXE, subject_status=SubjectStatus.FINISH,
-            cash_status=CashStatus.EXE if total_deposit > 0 else CashStatus.FINISH,
-            description=payload.description or f"库存拨付: {len(equipments)}台设备"
+            cash_status=CashStatus.FINISH,
+            description=payload.description or f"库存拨付: {sum(e.qty for e in payload.elements)}台设备"
         )
         session.add(new_vc)
         session.flush()
-        for eq in equipments:
-            eq.operational_status = OperationalStatus.OPERATING
-            eq.point_id = payload.allocation_map[eq.id]
-            eq.virtual_contract_id = new_vc.id
+        # 更新设备状态
+        for e in payload.elements:
+            target_pt = e.receiving_point_id
+            for eq_id in e.sn_list:
+                eq = session.query(EquipmentInventory).filter(EquipmentInventory.sn == str(eq_id)).first()
+                eq.operational_status = OperationalStatus.OPERATING
+                eq.point_id = target_pt
+                eq.virtual_contract_id = new_vc.id
 
-        emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "equipment_count": len(equipments)})
+        emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "equipment_count": sum(e.qty for e in payload.elements)})
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"库存拨付完成")
     except Exception as e:

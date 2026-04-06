@@ -125,7 +125,8 @@ class VirtualContract(Base):
     related_vc_id = Column(Integer, ForeignKey('virtual_contracts.id'), nullable=True)
     type = Column(String(100)) # 设备采购、物料供应、物料采购、退货、设备维护
     summary = Column(Text)
-    elements = Column(JSON) # SKU、数量、单价、时间、物流、支付模式
+    elements = Column(JSON) # 统一结构：{elements[{id, shipping_point_id, receiving_point_id, sku_id, qty, price, deposit, subtotal, sn_list}], total_amount, payment_terms}
+    return_direction = Column(String(50), nullable=True) # 退货方向：CUSTOMER_TO_US / US_TO_SUPPLIER
     deposit_info = Column(JSON) # 应收/实收押金、总额、最后流水 ID、调整原因
     status = Column(String(50)) # 执行、完成、终止
     subject_status = Column(String(50)) # 执行、发货、签收、完成

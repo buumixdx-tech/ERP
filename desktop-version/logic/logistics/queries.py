@@ -244,7 +244,7 @@ def get_express_orders_for_ui(
                 "status": order.status,
                 "status_label": _get_logistics_status_label(order.status),
                 "status_icon": _get_logistics_status_icon(order.status),
-                "point_name": addr_info.get("pointName", "未知点位"),
+                "point_name": addr_info.get("收货点位名称", addr_info.get("发货点位名称", "未知点位")),
                 "address": addr_info.get("address", "未知地址"),
                 "items_summary": items_summary,
                 "raw_items": order.items,
