@@ -30,6 +30,20 @@ desktop-version/data/finance/finance-report/*.json
 # Claude memory / plans
 .claude/
 
+# Android / Kotlin build
+.kotlin/
+build/
+app/build/
+app/release/
+app/release/baselineProfiles/
+*.apk
+*.aab
+*.dm
+local.properties
+
+# Gradle
+.gradle/
+
 # OS
 .DS_Store
 Thumbs.db
