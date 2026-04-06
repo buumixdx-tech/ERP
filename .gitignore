@@ -34,8 +34,8 @@ desktop-version/data/finance/finance-report/*.json
 .kotlin/
 build/
 app/build/
-app/release/
-app/release/baselineProfiles/
+**/app/release/
+**/app/release/baselineProfiles/
 *.apk
 *.aab
 *.dm
