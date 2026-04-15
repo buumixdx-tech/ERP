@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text, JSON, Boolean, Index
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text, JSON, Boolean, Index, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, object_session
 from logic.events.dispatcher import emit_event
 from logic.constants import SystemEventType, SystemAggregateType
@@ -263,6 +263,27 @@ class ExternalPartner(Base):
     address = Column(String(512))
     content = Column(Text)
 
+
+class PartnerRelation(Base):
+    """11. 合作方关系表：记录合作方与业务/供应链/我方的关联"""
+    __tablename__ = 'partner_relations'
+    id = Column(Integer, primary_key=True)
+    partner_id = Column(Integer, ForeignKey('external_partners.id'), nullable=False)
+    owner_type = Column(String(50), nullable=False)  # business / supply_chain / ourselves
+    owner_id = Column(Integer)  # OURSELVES 时为 NULL
+    relation_type = Column(String(100), nullable=False)  # 合作模式
+    remark = Column(Text)
+    established_at = Column(DateTime, default=datetime.now)
+    ended_at = Column(DateTime, nullable=True)  # null = 有效
+
+    __table_args__ = (
+        UniqueConstraint('partner_id', 'owner_type', 'owner_id', 'relation_type',
+                         name='uq_partner_relation'),
+        Index('ix_partner_relations_partner_id', 'partner_id'),
+        Index('ix_partner_relations_owner', 'owner_type', 'owner_id'),
+    )
+
+
 class BankAccount(Base):
     """11. 资金账户"""
     __tablename__ = 'bank_accounts'
@@ -277,19 +298,49 @@ class Business(Base):
     __tablename__ = 'business'
     id = Column(Integer, primary_key=True)
     customer_id = Column(Integer, ForeignKey('channel_customers.id'))
-    contract_id = Column(Integer, ForeignKey('contracts.id'), nullable=True)
     status = Column(String(50)) # 前期接洽、业务评估、客户反馈、合作落地、业务开展、业务暂缓、业务终止
     timestamp = Column(DateTime, default=datetime.now)
     details = Column(JSON) # 记录业务演进历史
 
     customer = relationship("ChannelCustomer")
 
+
+class AddonBusiness(Base):
+    """24. 附加业务政策（原子化）: 依附于 Business 的有效期促销/补充协议"""
+    __tablename__ = 'addon_business'
+
+    id = Column(Integer, primary_key=True)
+    business_id = Column(Integer, ForeignKey('business.id'), nullable=False)
+    addon_type = Column(String(50), nullable=False)  # PRICE_ADJUST / NEW_SKU / PAYMENT_TERMS
+    status = Column(String(20), default="生效")       # 生效 / 失效 / 过期
+
+    # SKU 维度（PRICE_ADJUST / NEW_SKU 必填，PAYMENT_TERMS 可空）
+    sku_id = Column(Integer, nullable=True)
+
+    # 原子化覆盖值
+    override_price = Column(Float, nullable=True)
+    override_deposit = Column(Float, nullable=True)
+
+    # 有效期
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime, nullable=True)      # NULL = 永久有效
+
+    # 备注
+    remark = Column(Text, nullable=True)
+
+    business = relationship("Business")
+
+    __table_args__ = (
+        Index('ix_addon_biz_business_id', 'business_id'),
+        Index('ix_addon_biz_type_sku', 'addon_type', 'sku_id'),
+    )
+
+
 class SupplyChain(Base):
     """13. 供应链: 记录与某个供应商签订合同建立的供应链"""
     __tablename__ = 'supply_chains'
     id = Column(Integer, primary_key=True)
     supplier_id = Column(Integer, ForeignKey('suppliers.id'))
-    supplier_name = Column(String(255))
     type = Column(String(50)) # 物料 or 设备
     contract_id = Column(Integer, ForeignKey('contracts.id'))
     pricing_config = Column(JSON) # 兼容旧版
@@ -427,6 +478,37 @@ class SystemEvent(Base):
     payload = Column(JSON)              # 关键快照数据
     created_at = Column(DateTime, default=datetime.now)
     pushed_to_ai = Column(Boolean, default=False) # AI 是否已消费
+
+
+class OperationTransaction(Base):
+    """23. 操作事务表：记录所有写操作快照，支持回滚和撤销回滚"""
+    __tablename__ = 'operation_transactions'
+
+    id = Column(Integer, primary_key=True)
+
+    # 操作标识
+    action_name = Column(String(50))      # 'create_procurement_vc' | 'create_cash_flow' | ...
+    ref_type = Column(String(50))         # 'VirtualContract' | 'CashFlow' | 'Logistics' | ...
+    ref_id = Column(Integer)              # 关联记录 ID（主记录）
+    ref_vc_id = Column(Integer, ForeignKey('virtual_contracts.id'), nullable=True)
+
+    # 快照（JSON）
+    snapshot_before = Column(JSON)        # 回滚时的恢复依据（修改前）
+    snapshot_after = Column(JSON)         # redo 时的恢复依据（修改后）
+
+    # 快速查询辅助（不存 JSON，只存 ID 列表）
+    involved_ids = Column(JSON, nullable=True)  # [vc_id, logistics_id, ...]
+
+    # 事务状态
+    status = Column(String(20))           # 'committed' | 'rolled_back' | 'failed'
+
+    # 审计
+    reason = Column(Text, nullable=True)   # 回滚原因（仅回滚时填写）
+    created_by = Column(String(100))
+    created_at = Column(DateTime, default=datetime.now)
+    rolled_back_at = Column(DateTime, nullable=True)
+    rolled_back_by = Column(String(100), nullable=True)
+
 
 # Database Setup
 engine = None

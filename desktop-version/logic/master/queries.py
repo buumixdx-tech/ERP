@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Any
 from sqlalchemy import func, String
 from models import (
     get_session, ChannelCustomer, Supplier, Point, SKU, ExternalPartner, BankAccount,
-    EquipmentInventory, MaterialInventory, SupplyChain, Contract
+    EquipmentInventory, MaterialInventory, SupplyChain, Contract, PartnerRelation
 )
 from logic.constants import (
     AccountOwnerType, SKUType, BankInfoKey, OperationalStatus
@@ -226,7 +226,15 @@ def get_points_for_ui(
                 "status": "active",
                 "status_label": "正常",
                 "created_at": "",
-                "owner_label": (customer_map.get(point.customer_id) if point.customer_id else (supplier_map.get(point.supplier_id) if point.supplier_id else "我方 (自有)"))
+                "owner_label": (
+                    f"[客户] {customer_map.get(point.customer_id)}"
+                    if point.customer_id
+                    else (
+                        f"[供应商] {supplier_map.get(point.supplier_id)}"
+                        if point.supplier_id
+                        else "[公司] 闪饮自身"
+                    )
+                )
             })
 
         return result
@@ -367,13 +375,44 @@ def get_material_inventory_list() -> List[Dict[str, Any]]:
     try:
         from sqlalchemy.orm import joinedload
         invs = session.query(MaterialInventory).options(joinedload(MaterialInventory.sku)).all()
+
+        # 收集所有需要的点位ID并批量查询
+        all_point_ids = set()
+        for inv in invs:
+            if inv.stock_distribution:
+                for k in inv.stock_distribution.keys():
+                    try:
+                        all_point_ids.add(int(k))
+                    except (ValueError, TypeError):
+                        pass  # 跳过非数字 key 如 'default'
+        point_map = {}
+        if all_point_ids:
+            pts = session.query(Point).filter(Point.id.in_(all_point_ids)).all()
+            point_map = {p.id: p.name for p in pts}
+
+        # 转换库存分布：point_id -> "点位名称: 数量"，只显示有库存的
+        def format_dist(dist):
+            if not dist:
+                return {}
+            result = {}
+            for pid, qty in dist.items():
+                # 过滤掉 None、null 字符串、0 和负数
+                if qty is None or qty == "null" or (isinstance(qty, (int, float)) and qty <= 0):
+                    continue
+                try:
+                    name = point_map.get(int(pid), f"点位{pid}")
+                except (ValueError, TypeError):
+                    name = f"点位{pid}"
+                result[name] = qty
+            return result
+
         return [
             {
                 "物料ID": i.sku_id,
                 "物料名称": i.sku.name if i.sku else "未知",
                 "总余额": i.total_balance,
                 "平均单价": i.average_price or 0.0,
-                "库存分布": i.stock_distribution or {}
+                "库存分布": format_dist(i.stock_distribution or {})
             }
             for i in invs
         ]
@@ -388,6 +427,118 @@ def get_warehouse_points() -> List[Dict[str, Any]]:
         return [{"id": p.id, "name": p.name, "type": p.type, "address": p.address} for p in points]
     finally:
         session.close()
+
+
+def get_material_movement_timeline(sku_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    重建物料出入库流水记录。
+    基于 VC 类型 + subject_status 完成时间 + 仓库点位信息，重建每笔出入库明细。
+
+    返回: [{
+        "sku_id": int,
+        "sku_name": str,
+        "vc_id": int,
+        "vc_type": str,
+        "direction": str,       # 入库 / 出库
+        "warehouse": str,       # 仓库名称
+        "qty": float,
+        "timestamp": datetime,
+        "biz_id": int or None,
+        "description": str,
+    }]
+    """
+    session = get_session()
+    try:
+        from models import VirtualContract, VirtualContractStatusLog, SKU, Point, Business, ChannelCustomer
+        from logic.constants import VCType, SubjectStatus, SystemConstants
+
+        # 1. 查 subject=FINISH 的时间戳
+        status_logs = session.query(VirtualContractStatusLog).filter(
+            VirtualContractStatusLog.category == 'subject',
+            VirtualContractStatusLog.status_name == SubjectStatus.FINISH
+        ).all()
+        vc_finish_time = {}
+        for log in status_logs:
+            if log.vc_id not in vc_finish_time:
+                vc_finish_time[log.vc_id] = log.timestamp
+
+        # 2. 查物料采购/物料供应 VC（subject_status = FINISH）
+        vc_query = session.query(VirtualContract).filter(
+            VirtualContract.type.in_([VCType.MATERIAL_PROCUREMENT, VCType.MATERIAL_SUPPLY]),
+            VirtualContract.subject_status == SubjectStatus.FINISH
+        )
+        if sku_id:
+            # 需要通过 elements 过滤，这个在 Python 层处理
+            pass
+
+        all_movements = []
+        point_map = {}
+        sku_map = {}
+
+        for vc in vc_query.all():
+            elements = vc.elements or {}
+            items = elements.get('elements') or []
+
+            # 过滤指定 sku_id
+            if sku_id:
+                items = [it for it in items if int(it.get('sku_id') or 0) == sku_id]
+                if not items:
+                    continue
+
+            ts = vc_finish_time.get(vc.id, vc.status_timestamp)
+
+            # 预加载 SKU 和 Point（批量）
+            for item in items:
+                sid = int(item.get('sku_id') or 0)
+                if sid not in sku_map:
+                    sku = session.query(SKU).get(sid)
+                    sku_map[sid] = sku.name if sku else f"SKU-{sid}"
+
+                if vc.type == VCType.MATERIAL_PROCUREMENT:
+                    direction = "入库"
+                    point_id = item.get('receiving_point_id')
+                    warehouse = None
+                    if point_id:
+                        if point_id not in point_map:
+                            pt = session.query(Point).get(int(point_id))
+                            point_map[point_id] = pt.name if pt else None
+                        warehouse = point_map[point_id]
+                    qty = float(item.get('qty') or 0)
+                    desc = f"物料采购入库"
+                else:
+                    direction = "出库"
+                    point_id = item.get('shipping_point_id')
+                    warehouse = None
+                    if point_id:
+                        if point_id not in point_map:
+                            pt = session.query(Point).get(int(point_id))
+                            point_map[point_id] = pt.name if pt else None
+                        warehouse = point_map[point_id]
+                    qty = -float(item.get('qty') or 0)
+                    desc = f"物料供应出库"
+
+                if not warehouse:
+                    warehouse = SystemConstants.DEFAULT_POINT
+
+                all_movements.append({
+                    "sku_id": sid,
+                    "sku_name": sku_map[sid],
+                    "vc_id": vc.id,
+                    "vc_type": vc.type,
+                    "direction": direction,
+                    "warehouse": warehouse,
+                    "qty": qty,
+                    "timestamp": ts,
+                    "biz_id": vc.business_id,
+                    "description": desc,
+                })
+
+        # 按时间倒序
+        all_movements.sort(key=lambda x: x["timestamp"] or "", reverse=True)
+        return all_movements
+    finally:
+        session.close()
+
 
 def get_sku_map_by_names(names: List[str]) -> Dict[str, Any]:
     """获取 SKU 名称到详情的映射"""
@@ -469,6 +620,62 @@ def get_partners_for_ui(
         session.close()
 
 
+def get_partner_detail_for_ui(partner_id: int) -> Optional[Dict[str, Any]]:
+    """
+    获取外部合作方详情（专用于UI展示，含银行账户和合作关系）
+
+    Args:
+        partner_id: 合作方ID
+
+    Returns:
+        合作方详情字典，如果不存在则返回None
+    """
+    session = get_session()
+    try:
+        partner = session.query(ExternalPartner).get(partner_id)
+        if not partner:
+            return None
+
+        # 获取银行账户
+        bank_accounts = get_bank_accounts_for_ui(
+            owner_type=AccountOwnerType.PARTNER,
+            owner_id=partner_id
+        )
+
+        # 获取合作关系
+        relations = get_partner_relations(partner_id=partner_id, active_only=False)
+
+        # 获取归属主体名称
+        for rel in relations:
+            rel["owner_name"] = _get_owner_name(session, rel["owner_type"], rel["owner_id"])
+
+        return {
+            "id": partner.id,
+            "name": partner.name or "",
+            "type": partner.type or "",
+            "address": partner.address or "",
+            "content": partner.content or "",
+            "status": "active",
+            "bank_accounts": bank_accounts,
+            "relations": relations,
+            "created_at": ""
+        }
+    finally:
+        session.close()
+
+
+def _get_owner_name(session, owner_type: str, owner_id: Optional[int]) -> str:
+    """获取归属主体名称"""
+    if owner_type == AccountOwnerType.OURSELVES:
+        return "[我方] 闪饮业务中心"
+    elif owner_type == "business":
+        return f"[业务] ID:{owner_id}"
+    elif owner_type == "supply_chain":
+        return f"[供应链] ID:{owner_id}"
+    else:
+        return f"[{owner_type}] ID:{owner_id}"
+
+
 # ============================================================================
 # 6. 银行账户相关查询（master领域）
 # ============================================================================
@@ -507,7 +714,7 @@ def get_bank_accounts_for_ui(
         # 批量获取所有者名称，消除 N+1
         customer_ids = list(set(a.owner_id for a in accounts if a.owner_type == AccountOwnerType.CUSTOMER))
         supplier_ids = list(set(a.owner_id for a in accounts if a.owner_type == AccountOwnerType.SUPPLIER))
-        partner_ids = list(set(a.owner_id for a in accounts if a.owner_type == AccountOwnerType.OTHER))
+        partner_ids = list(set(a.owner_id for a in accounts if a.owner_type == AccountOwnerType.PARTNER))
         
         customer_names = {c.id: c.name for c in session.query(ChannelCustomer).filter(ChannelCustomer.id.in_(customer_ids)).all()} if customer_ids else {}
         supplier_names = {s.id: s.name for s in session.query(Supplier).filter(Supplier.id.in_(supplier_ids)).all()} if supplier_ids else {}
@@ -522,7 +729,7 @@ def get_bank_accounts_for_ui(
                 owner_name = f"[客户] {customer_names.get(acc.owner_id, '未知')}"
             elif acc.owner_type == AccountOwnerType.SUPPLIER:
                 owner_name = f"[供应商] {supplier_names.get(acc.owner_id, '未知')}"
-            elif acc.owner_type == AccountOwnerType.OTHER:
+            elif acc.owner_type == AccountOwnerType.PARTNER:
                 owner_name = f"[合作方] {partner_names.get(acc.owner_id, '未知')}"
             elif acc.owner_type == AccountOwnerType.OURSELVES:
                 owner_name = f"[我方] {info.get(BankInfoKey.BANK_NAME, '未知账户')}"
@@ -619,18 +826,30 @@ def get_material_stock_for_supply(
         materials = session.query(MaterialInventory).filter(
             MaterialInventory.total_balance >= min_balance
         ).limit(limit).all()
-        
+
+        # 收集所有需要的点位ID并批量查询
+        all_point_ids = set()
+        for mat in materials:
+            if mat.stock_distribution:
+                all_point_ids.update(int(k) for k in mat.stock_distribution.keys() if str(k).isdigit())
+        point_map = {}
+        if all_point_ids:
+            pts = session.query(Point).filter(Point.id.in_(all_point_ids)).all()
+            point_map = {p.id: p.name for p in pts}
+
         result = []
         for mat in materials:
             sku = session.query(SKU).get(mat.sku_id) if mat.sku_id else None
-            
-            # 解析库存分布，获取有库存的仓库
+
+            # 解析库存分布，获取有库存的仓库（key 已改为 point_id，需转换为名称）
             stock_dist = mat.stock_distribution or {}
-            available_warehouses = [
-                {"warehouse": wh, "qty": qty}
-                for wh, qty in stock_dist.items() if qty > 0
-            ]
-            
+            available_warehouses = []
+            for wh_key, qty in stock_dist.items():
+                if qty > 0:
+                    pt_id = int(wh_key) if str(wh_key).isdigit() else None
+                    wh_name = point_map.get(pt_id, wh_key) if pt_id else wh_key
+                    available_warehouses.append({"warehouse": wh_name, "qty": qty, "point_id": pt_id})
+
             result.append({
                 "id": mat.id,
                 "sku_id": mat.sku_id,
@@ -642,7 +861,7 @@ def get_material_stock_for_supply(
                 "stock_distribution": stock_dist,
                 "available_warehouses": available_warehouses,
             })
-        
+
         return result
     finally:
         session.close()
@@ -731,7 +950,7 @@ def get_supply_chains_by_type(sku_type: str) -> List[Dict[str, Any]]:
             {
                 "id": c.id,
                 "supplier_id": c.supplier_id,
-                "supplier_name": c.supplier_name,
+                "supplier_name": c.supplier.name if c.supplier else "未知",
                 "type": c.type,
                 "payment_terms": c.payment_terms
             }
@@ -747,13 +966,26 @@ def get_supply_chain_by_id(sc_id: int) -> Optional[Dict[str, Any]]:
         from sqlalchemy.orm import joinedload
         c = session.query(SupplyChain).options(joinedload(SupplyChain.supplier)).get(sc_id)
         if not c: return None
+
+        pricing_dict = c.get_pricing_dict()
+        # 构建 sku_id -> sku_name 映射
+        sku_name_map = {}
+        for sku_id_key in pricing_dict.keys():
+            sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
+            if sku_id_int:
+                sku_obj = session.query(SKU).get(sku_id_int)
+                sku_name_map[sku_id_key] = sku_obj.name if sku_obj else sku_id_key
+            else:
+                sku_name_map[sku_id_key] = sku_id_key
+
         return {
             "id": c.id,
             "supplier_id": c.supplier_id,
-            "supplier_name": c.supplier_name,
+            "supplier_name": c.supplier.name if c.supplier else "未知供应商",
             "type": c.type,
             "payment_terms": c.payment_terms,
-            "pricing_dict": c.get_pricing_dict(),
+            "pricing_dict": pricing_dict,
+            "sku_name_map": sku_name_map,
             "supplier": {"name": c.supplier.name} if c.supplier else None
         }
     finally:
@@ -791,6 +1023,63 @@ def get_partner_by_id(partner_id: int) -> Optional[Dict[str, Any]]:
         return {"id": p.id, "name": p.name, "type": p.type}
     finally:
         session.close()
+
+
+def get_partner_relations(
+    partner_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[int] = None,
+    active_only: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    查询合作方关系列表，支持多维过滤。
+
+    Args:
+        partner_id: 合作方ID
+        owner_type: 归属主体类型 (customer/supplier/ourselves)
+        owner_id: 归属主体ID
+        active_only: 是否仅查询有效关系（ended_at IS NULL）
+    """
+    session = get_session()
+    try:
+        query = session.query(PartnerRelation)
+
+        if partner_id is not None:
+            query = query.filter(PartnerRelation.partner_id == partner_id)
+        if owner_type is not None:
+            query = query.filter(PartnerRelation.owner_type == owner_type)
+        if owner_id is not None:
+            query = query.filter(PartnerRelation.owner_id == owner_id)
+        if active_only:
+            query = query.filter(PartnerRelation.ended_at.is_(None))
+
+        relations = query.order_by(PartnerRelation.id.desc()).all()
+
+        # 批量获取合作方名称
+        partner_ids = list(set(r.partner_id for r in relations))
+        partner_names = {
+            p.id: p.name for p in
+            session.query(ExternalPartner).filter(ExternalPartner.id.in_(partner_ids)).all()
+        } if partner_ids else {}
+
+        result = []
+        for r in relations:
+            result.append({
+                "id": r.id,
+                "partner_id": r.partner_id,
+                "partner_name": partner_names.get(r.partner_id, ""),
+                "owner_type": r.owner_type,
+                "owner_id": r.owner_id,
+                "relation_type": r.relation_type,
+                "remark": r.remark or "",
+                "established_at": r.established_at.strftime("%Y-%m-%d") if r.established_at else "",
+                "ended_at": r.ended_at.strftime("%Y-%m-%d") if r.ended_at else None,
+                "is_active": r.ended_at is None
+            })
+        return result
+    finally:
+        session.close()
+
 
 def get_bank_account_by_id(account_id: int) -> Optional[Dict[str, Any]]:
     """获取银行账户详情"""

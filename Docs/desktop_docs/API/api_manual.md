@@ -96,7 +96,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 - **`delete_vc_action(session, vc_id)`**: 删除虚拟合同。使用 `DeleteVCSchema`。
 
 ### VC 库存操作
-- **`allocate_inventory_action(session, payload)`**: 拨付库存到虚拟合同（替代旧版 `bulk_allocate_inventory_action`）。使用 `AllocateInventorySchema`。
+- **`create_inventory_allocation_action(session, payload)`**: 拨付库存到虚拟合同（替代旧版 `bulk_allocate_inventory_action`）。使用 `AllocateInventorySchema`。
 
 ### VC 查询
 - **`get_vc_list(vc_type=None, status=None, limit=100)`**: 获取虚拟合同列表（别名：`get_vc_list_for_ui`）。

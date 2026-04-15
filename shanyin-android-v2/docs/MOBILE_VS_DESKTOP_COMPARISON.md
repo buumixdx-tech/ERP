@@ -140,7 +140,7 @@
 | 创建物料采购 VC | `create_mat_procurement_vc_action()` | ❌ 缺失 (仅有 SaveVirtualContractUseCase) |
 | 创建库存采购 VC | `create_stock_procurement_vc_action()` | ❌ 缺失 (仅有 SaveVirtualContractUseCase) |
 | 创建退货 VC | `create_return_vc_action()` | `CreateReturnVCUseCase` ✅ |
-| 库存拨付 | `allocate_inventory_action()` | ❌ 缺失 (仅有 TransferInventoryUseCase) |
+| 库存拨付 | `create_inventory_allocation_action()` | ❌ 缺失 (仅有 TransferInventoryUseCase) |
 | 更新 VC | `update_vc_action()` | `SaveVirtualContractUseCase` ✅ |
 | 删除 VC | `delete_vc_action()` | `DeleteVirtualContractUseCase` ✅ |
 | 完成 VC | - | `CompleteVirtualContractUseCase` ✅ |
@@ -351,7 +351,7 @@
 
 1. **物料采购 VC 创建** - 无 `create_mat_procurement_vc_action` 等效 (可用 `SaveVirtualContractUseCase` 代替)
 2. **库存采购 VC 创建** - 无 `create_stock_procurement_vc_action` 等效 (可用 `SaveVirtualContractUseCase` 代替)
-3. **库存拨付 VC 创建** - 无 `allocate_inventory_action` 等效 (仅 `TransferInventoryUseCase` 处理库存层面)
+3. **库存拨付 VC 创建** - 无 `create_inventory_allocation_action` 等效 (仅 `TransferInventoryUseCase` 处理库存层面)
 4. **批量快递单推进** - 无 `bulk_progress_express_orders_action` 等效
 5. **事件监听器/响应器** - `emit_event` 仅记录到 `SystemEventRepository`，无实际响应逻辑
 6. **规则继承解析器** - `InheritanceResolver` 未单独实现 (简化版本在 `SyncRulesFrom*UseCase` 中)

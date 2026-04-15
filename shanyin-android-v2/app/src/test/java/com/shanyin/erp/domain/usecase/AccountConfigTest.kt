@@ -506,6 +506,16 @@ class AccountConfigTest {
         }
     }
 
+    @Test(expected = IllegalArgumentException::class)
+    fun `JournalEntry throws when both debit and credit are positive`() {
+        AccountConfig.JournalEntry(
+            account = "测试科目",
+            debit = 100.0,
+            credit = 50.0,
+            summary = "这条分录应该抛出异常"
+        )
+    }
+
     @Test
     fun `amount为0时分录金额均为0`() {
         val group = AccountConfig.getJournalEntries(

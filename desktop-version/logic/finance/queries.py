@@ -10,7 +10,7 @@ from sqlalchemy import func, cast, String
 from models import (
     get_session, FinanceAccount, FinancialJournal, BankAccount,
     CashFlow, VirtualContract, ChannelCustomer, Supplier,
-    Point, EquipmentInventory, MaterialInventory, SKU
+    Point, EquipmentInventory, MaterialInventory, SKU, ExternalPartner
 )
 from logic.constants import (
     CashFlowType, AccountOwnerType, BankInfoKey, FinanceConstants,
@@ -395,7 +395,11 @@ def _get_account_counterparty_info(session, account) -> Optional[Dict[str, Any]]
         obj = session.query(Supplier).get(account.counterpart_id)
         if obj:
             return {"type": "供应商", "name": obj.name}
-    
+    elif account.counterpart_type == 'partner':
+        obj = session.query(ExternalPartner).get(account.counterpart_id)
+        if obj:
+            return {"type": "合作伙伴", "name": obj.name}
+
     return None
 
 

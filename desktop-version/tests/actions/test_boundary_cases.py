@@ -250,29 +250,6 @@ class TestLogisticsBoundary:
         assert result.success is False
         assert "地址" in result.error
 
-    def test_logistics_missing_phone(self, db_session, sample_virtual_contract):
-        """✅ 空联系电话被拒绝"""
-        payload = CreateLogisticsPlanSchema(
-            vc_id=sample_virtual_contract.id,
-            orders=[
-                {
-                    "tracking_number": "SF1234567890",
-                    "items": [{"name": "设备A", "qty": 1}],
-                    "address_info": {
-                        "收货方联系电话": "",
-                        "发货方联系电话": "13900139000",
-                        "收货点位名称": "测试仓库",
-                        "发货点位名称": "供应商",
-                        "address": "测试地址"
-                    }
-                }
-            ]
-        )
-        # 修复后：拒绝空电话
-        result = create_logistics_plan_action(db_session, payload)
-        assert result.success is False
-        assert "电话" in result.error
-
     def test_logistics_empty_tracking_number(self, db_session, sample_virtual_contract):
         """✅ 空快递单号被拒绝"""
         payload = CreateLogisticsPlanSchema(

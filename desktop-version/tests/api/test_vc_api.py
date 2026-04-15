@@ -57,41 +57,40 @@ class TestVCAPI:
         assert data["success"] is False
         assert "error" in data
 
-    def test_vc_detail_includes_relations(self, client: TestClient):
+    def test_vc_detail_includes_relations(self, client: TestClient, db_session, monkeypatch):
         """✅ 详情接口包含关联数据"""
         # Given: 需要先创建一个 VC
-        # 先创建必要的测试数据
-        from models import ChannelCustomer, Business, VirtualContract, get_session
-        
-        session = get_session()
-        try:
-            # 创建测试数据
-            customer = ChannelCustomer(name="API测试客户")
-            session.add(customer)
-            session.flush()
+        # 通过 monkeypatch 让 models.get_session 返回 db_session，避免污染生产库
+        import models
+        monkeypatch.setattr(models, "get_session", lambda: db_session)
 
-            business = Business(
-                customer_id=customer.id,
-                status="业务开展",
-                details={}
-            )
-            session.add(business)
-            session.flush()
+        from models import ChannelCustomer, Business, VirtualContract
 
-            vc = VirtualContract(
-                business_id=business.id,
-                type="设备采购",
-                elements={"total_amount": 10000},
-                deposit_info={},
-                status="执行",
-                subject_status="执行",
-                cash_status="执行"
-            )
-            session.add(vc)
-            session.commit()
-            vc_id = vc.id
-        finally:
-            session.close()
+        customer = ChannelCustomer(name="API测试客户")
+        db_session.add(customer)
+        db_session.flush()
+
+        business = Business(
+            customer_id=customer.id,
+            status="业务开展",
+            details={}
+        )
+        db_session.add(business)
+        db_session.flush()
+
+        vc = VirtualContract(
+            business_id=business.id,
+            type="设备采购",
+            elements={"total_amount": 10000},
+            deposit_info={},
+            status="执行",
+            subject_status="执行",
+            cash_status="执行"
+        )
+        db_session.add(vc)
+        db_session.flush()
+        vc_id = vc.id
+        db_session.commit()  # 提交到测试库，API 可读
 
         # When: 获取详情
         response = client.get(
@@ -148,22 +147,19 @@ class TestVCAPI:
 
 
 # 为 pytest 提供的 client fixture
-@pytest.fixture(scope="session")
-def client():
-    """创建测试客户端"""
+@pytest.fixture(scope="function")
+def client(db_session):
+    """创建测试客户端，使用与 db_session 相同的测试数据库"""
+    import models
     from api.app import create_app
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    # 强制让 models 使用测试库的 engine/session（覆盖 create_app lifespan 中的 init_db）
+    test_engine = db_session.get_bind()
+    models.engine = test_engine
+    models.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
     app = create_app()
-
-    # 对 API 数据库执行 ADD COLUMN（如果列不存在）
-    engine = create_engine("sqlite:///data/business_system.db")
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE virtual_contracts ADD COLUMN return_direction VARCHAR(50)"))
-            conn.commit()
-    except Exception:
-        pass
-    engine.dispose()
 
     return TestClient(app)

@@ -384,17 +384,18 @@ def get_valid_receiving_points_for_procurement(session, business_id: int) -> lis
 
 def get_valid_receiving_points_for_mat_procurement(session, sc_id: int) -> list[dict]:
     """
-    物料采购/库存采购：收货点 = 我们仓库 + 供应商仓库
+    物料采购/库存采购：收货点 = 我们仓库 + 供应商仓库 + 客户仓库
     """
     sc = session.query(SupplyChain).get(sc_id)
     our = session.query(Point).filter(Point.type == "自有仓").all()
     supplier_pts = []
+    customer_pts = session.query(Point).filter(Point.type == "客户仓").all()
     if sc:
         supplier_pts = session.query(Point).filter(
             Point.supplier_id == sc.supplier_id,
             Point.type == "供应商仓"
         ).all()
-    pts = our + supplier_pts
+    pts = our + supplier_pts + customer_pts
     return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
 
 
@@ -422,14 +423,22 @@ def get_valid_receiving_points_for_material_supply(session, business_id: int) ->
 def get_valid_shipping_points_for_material_supply(session, sku_id: int) -> list[dict]:
     """
     物料供应：发货点 = 有该 SKU 物料库存的仓库
-    从 MaterialInventory.stock_distribution 的 key（仓库名称）匹配 Point.name
+    stock_distribution 的 key 是 Point.id，数量是库存量
     """
-    mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).first()
-    if not mat_inv or not mat_inv.stock_distribution:
+    mat_invs = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).all()
+    if not mat_invs:
         return []
-    wh_names = list(mat_inv.stock_distribution.keys())
-    pts = session.query(Point).filter(Point.name.in_(wh_names)).all()
-    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+    # 聚合所有点位ID和库存量（同一SKU可能存在于多个仓库）
+    point_qty = {}  # point_id -> total qty
+    for mat_inv in mat_invs:
+        if mat_inv.stock_distribution:
+            for k, qty in mat_inv.stock_distribution.items():
+                pid = int(k)
+                point_qty[pid] = point_qty.get(pid, 0) + qty
+    if not point_qty:
+        return []
+    pts = session.query(Point).filter(Point.id.in_(point_qty.keys())).all()
+    return [{"id": p.id, "name": p.name, "type": p.type or "", "qty": point_qty.get(p.id, 0)} for p in pts]
 
 
 def get_valid_receiving_points_for_allocation(session, business_id: int) -> list[dict]:

@@ -20,6 +20,7 @@ interface MaterialInventoryRepository {
     fun getAll(): Flow<List<MaterialInventory>>
     suspend fun getById(id: Long): MaterialInventory?
     suspend fun getBySkuId(skuId: Long): MaterialInventory?
+    suspend fun getBySkuIds(skuIds: List<Long>): List<MaterialInventory>
     suspend fun insert(material: MaterialInventory): Long
     suspend fun update(material: MaterialInventory)
     suspend fun delete(material: MaterialInventory)

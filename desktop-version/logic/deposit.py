@@ -1,7 +1,10 @@
 from models import get_session, VirtualContract, EquipmentInventory, CashFlow
 from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime
-from logic.constants import VCType, OperationalStatus, VCStatus, SubjectStatus, CashStatus, CashFlowType
+from logic.constants import VCType, OperationalStatus, VCStatus, SubjectStatus, CashStatus, CashFlowType, EPSILON
+import logging
+
+logger = logging.getLogger(__name__)
 
 def deposit_module(vc_id=None, cf_id=None, session=None):
     ext_session = session is not None
@@ -34,7 +37,7 @@ def process_cf_deposit(session, cf_id):
         original_vc = session.query(VirtualContract).get(vc.related_vc_id)
         if original_vc:
             target_vc = original_vc
-            print(f"DEBUG: Redirecting deposit adjustment from Return VC {vc.id} to Original VC {target_vc.id}")
+            logger.debug(f"Redirecting deposit adjustment from Return VC {vc.id} to Original VC {target_vc.id}")
 
     # 调整押金总额
     deposit_info = dict(target_vc.deposit_info) if target_vc.deposit_info else {}
@@ -69,8 +72,7 @@ def process_vc_deposit(session, vc_id):
     new_should_receive = 0.0
     
     if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
-        # 兼容新旧两种 elements 结构
-        items = elements.get("elements") or elements.get("skus") or []
+        items = elements.get("elements") or []
         if not items:
             return
 
@@ -81,11 +83,11 @@ def process_vc_deposit(session, vc_id):
             if sid:
                 sku_to_dep[int(sid)] = float(item.get("deposit", 0.0))
 
-        print(f"DEBUG deposit: VC {vc_id} sku_to_dep = {sku_to_dep}")
+        logger.debug(f"deposit: VC {vc_id} sku_to_dep = {sku_to_dep}")
 
         # 统计是否已经产生过实物档案（发货后的）
         inv_exists = session.query(EquipmentInventory).filter(EquipmentInventory.virtual_contract_id == vc_id).first() is not None
-        print(f"DEBUG deposit: VC {vc_id} inv_exists = {inv_exists}")
+        logger.debug(f"deposit: VC {vc_id} inv_exists = {inv_exists}")
 
         if inv_exists:
             # 方案 A: 基于实物库存（处理后期退货变动）
@@ -95,14 +97,14 @@ def process_vc_deposit(session, vc_id):
                     EquipmentInventory.sku_id == sid,
                     EquipmentInventory.operational_status == OperationalStatus.OPERATING
                 ).count()
-                print(f"DEBUG deposit: SKU {sid} count={count} dep={target_dep}")
+                logger.debug(f"deposit: SKU {sid} count={count} dep={target_dep}")
                 new_should_receive += count * target_dep
         else:
             # 方案 B: 基于初始合同计划（处理刚创建尚未发货阶段）
             for item in items:
                 new_should_receive += float(item.get("qty", 0)) * float(item.get("deposit", 0.0))
         
-        print(f"DEBUG deposit: VC {vc_id} new_should_receive = {new_should_receive}")
+        logger.debug(f"deposit: VC {vc_id} new_should_receive = {new_should_receive}")
         
         # 更新 should_receive
         deposit_info["should_receive"] = new_should_receive
@@ -133,11 +135,11 @@ def process_vc_deposit(session, vc_id):
     total_due = elements.get('total_amount', 0.0)
     dep_due = new_should_receive
     
-    is_goods_cleared = (paid_goods >= (total_due - 0.01))
-    is_deposit_cleared = (dep_due <= 0 or actual_net_deposit >= (dep_due - 0.01))
-    
+    is_goods_cleared = (paid_goods >= (total_due - EPSILON))
+    is_deposit_cleared = (dep_due <= 0 or actual_net_deposit >= (dep_due - EPSILON))
+
     # --- 特殊处理：客户押金未付足时，自动完结不需要退押金的退货 VC ---
-    if actual_net_deposit <= (dep_due + 0.01):
+    if actual_net_deposit <= (dep_due + EPSILON):
         for ret_vc in related_return_vcs:
             if (ret_vc.status == VCStatus.EXE and 
                 ret_vc.cash_status == CashStatus.EXE and 
@@ -150,11 +152,11 @@ def process_vc_deposit(session, vc_id):
                 if ret_cf_count == 0:
                     ret_vc.update_cash_status(CashStatus.FINISH)
                     ret_vc.update_status(VCStatus.FINISH)
-                    print(f"DEBUG: Return VC {ret_vc.id} auto-completed (no deposit refund needed)")
+                    logger.debug(f"Return VC {ret_vc.id} auto-completed (no deposit refund needed)")
     
     if is_goods_cleared and is_deposit_cleared and vc.cash_status != CashStatus.FINISH:
         vc.update_cash_status(CashStatus.FINISH)
-        print(f"DEBUG: VC {vc_id} cash_status updated to FINISH")
+        logger.debug(f"VC {vc_id} cash_status updated to FINISH")
         
         # 调用状态机处理后续状态同步
         from logic.state_machine import check_vc_overall_status
@@ -177,7 +179,7 @@ def process_vc_deposit(session, vc_id):
     # 获取 SKU 与约定押金的映射
     sku_to_agreed_deposit = {}
     if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
-        items = elements.get("elements") or elements.get("skus") or []
+        items = elements.get("elements") or []
         for item in items:
             sid = item.get("sku_id")
             if sid:
@@ -185,7 +187,7 @@ def process_vc_deposit(session, vc_id):
     
     # 计算分摊比例（实收/应收）
     # 如果应收为0或负数，则比例为1（全额分摊）
-    ratio = (total_deposit / should_receive) if should_receive > 0.01 else 1.0
+    ratio = (total_deposit / should_receive) if should_receive > EPSILON else 1.0
     
     # 按 SKU 约定押金 × 比例 分摊到每台设备
     for inv in inventories:
@@ -193,5 +195,5 @@ def process_vc_deposit(session, vc_id):
         inv.deposit_amount = agreed_deposit * ratio
         inv.deposit_timestamp = datetime.now()
     
-    print(f"DEBUG: VC {vc_id} proportionally distributed deposit (ratio={ratio:.4f}, total={total_deposit}, should={should_receive})")
+    logger.debug(f"VC {vc_id} proportionally distributed deposit (ratio={ratio:.4f}, total={total_deposit}, should={should_receive})")
 

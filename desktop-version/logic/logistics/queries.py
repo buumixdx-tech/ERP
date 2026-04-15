@@ -160,10 +160,12 @@ def get_logistics_list_by_vc(vc_id: int) -> List[Dict[str, Any]]:
         for l in logs:
             orders_data = []
             for o in l.express_orders:
+                addr_data = o.address_info or {}
                 orders_data.append({
                     "tracking_number": o.tracking_number,
                     "status": o.status,
-                    "address": (o.address_info or {}).get("address", "未知"),
+                    "发货点位": addr_data.get("发货点位名称", "未知"),
+                    "收货点位": addr_data.get("收货点位名称", "未知"),
                     "items": o.items or []
                 })
             

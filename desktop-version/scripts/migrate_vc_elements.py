@@ -1,449 +1,223 @@
+"""VC Elements 结构迁移脚本
+将旧格式 (skus[], points[].items[]) 迁移为新统一格式 (elements[])
+同时为数据库添加 return_direction 列
 """
-VC Elements 结构迁移脚本
-将所有旧结构 VC 的 elements 统一转换为新的 elements 结构。
+import sqlite3, json, sys
 
-旧结构类型:
-  1. 设备采购/库存采购/物料采购: {"skus": [...], "total_amount": ..., "payment_terms": ...}
-  2. 物料供应: {"points": [...], "total_amount": ..., "payment_terms": ...}
-  3. 退货: {"return_items": [...], ...}
-  4. 库存拨付: {"allocation_items": [...], ...}
-
-新统一结构:
-  {
-    "elements": [
-      {
-        "id": "sp{shipping_point_id}_rp{receiving_point_id}_sku{sku_id}",
-        "shipping_point_id": int,
-        "receiving_point_id": int,
-        "sku_id": int,
-        "qty": float,
-        "price": float,
-        "deposit": float,
-        "subtotal": float,
-        "sn_list": []
-      }
-    ],
-    "total_amount": float,
-    "payment_terms": {...}
-  }
-"""
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from models import init_db, get_session, VirtualContract, Point, SKU
-from sqlalchemy.orm.attributes import flag_modified
-from logic.constants import VCType
-import json
+DB_PATH = "d:/WorkSpace/ShanYin/ERP/desktop-version/data/business_system.db"
 
 
-# 默认发货点位（总仓库）
-DEFAULT_SHIPPING_POINT_ID = 1
+# ── 供应商仓库名 → point_id 映射 ──────────────────────────────────────────
+WAREHOUSE_NAME_TO_ID = {
+    "朝旭食养仓": 3,
+    "合肥佳合仓": 4,
+    "天津格瑞仓": 5,
+    "北冰洋仓": 6,
+    "三河星谷仓": 7,
+    "广东中贝仓": 8,
+    "湖北广绅仓": 9,
+    "苏州邦基勒仓": 10,
+    "华迈环保仓": 24,
+}
 
 
-def get_point_id_by_name(session, name: str) -> int | None:
-    """根据点位名称查找点位ID"""
-    if not name or name == "未知" or name == "-":
-        return None
-    point = session.query(Point).filter(Point.name == name).first()
-    return point.id if point else None
+def name_to_warehouse_id(warehouse_name: str) -> int:
+    """从仓库名推断 point_id"""
+    if not warehouse_name:
+        return 3  # 默认朝旭食养仓
+    clean = warehouse_name.replace(" (供应商仓)", "").replace("(供应商仓)", "").strip()
+    return WAREHOUSE_NAME_TO_ID.get(clean, 3)
 
 
-def get_sku_id_by_name(session, name: str) -> int | None:
-    """根据SKU名称查找SKU ID"""
-    if not name or name == "未知" or name == "-":
-        return None
-    sku = session.query(SKU).filter(SKU.name == name).first()
-    return sku.id if sku else None
+def make_elem_id(sp_id: int, rp_id: int, sku_id: int) -> str:
+    return f"sp{sp_id}_rp{rp_id}_sku{sku_id}"
 
 
-def migrate_procurement_vc(session, vc: VirtualContract) -> bool:
+def sku_to_elements(skus: list, sku_id_to_sp_map: dict) -> list:
+    """将 skus[] 转为统一 elements[]
+
+    Args:
+        skus: 原始 skus 列表
+        sku_id_to_sp_map: {sku_id: shipping_point_id}，从 skus.supplier_id 映射到供应商仓库 point_id
     """
-    迁移采购类 VC (设备采购/库存采购/物料采购)
-    旧: {"skus": [...], "total_amount": ..., "payment_terms": ...}
-    """
-    old = vc.elements
-    skus = old.get("skus", [])
-    if not skus:
-        return False
-
-    new_elements = []
-    for item in skus:
-        sku_id = item.get("sku_id")
-        # 如果 sku_id 为空，尝试用名称查找
-        if not sku_id:
-            sku_id = get_sku_id_by_name(session, item.get("sku_name", ""))
-        if not sku_id:
-            print(f"  [WARN] VC {vc.id}: 无法找到SKU '{item.get('sku_name')}'，跳过")
-            continue
-
-        point_id = item.get("point_id")
-        # receiving_point_id: 旧数据中的 point_id（客户运营点位）
-        # 如果 point_id 为空，尝试用名称查找
-        if not point_id:
-            pt_name = item.get("point_name", "")
-            if pt_name and pt_name != "未知" and pt_name != "-":
-                point_id = get_point_id_by_name(session, pt_name)
-
-        # shipping_point_id: 默认总仓库
-        shipping_pt = DEFAULT_SHIPPING_POINT_ID
-        # receiving_point_id: point_id（运营点位），如果也没有则用1
-        receiving_pt = point_id if point_id else 1
-
-        qty = float(item.get("qty", 0))
-        price = float(item.get("price", 0))
-        deposit = float(item.get("deposit", 0))
+    elements = []
+    for sku in skus:
+        sku_id = int(sku["sku_id"])
+        qty = float(sku["qty"])
+        price = float(sku["price"])
+        deposit = float(sku.get("deposit") or 0)
         subtotal = qty * price
-        sn = item.get("sn", "-")
-        sn_list = [] if sn in ["-", "", None] else [sn]
+        sn = sku.get("sn", "-")
 
-        elem = {
-            "id": f"sp{shipping_pt}_rp{receiving_pt}_sku{sku_id}",
-            "shipping_point_id": shipping_pt,
-            "receiving_point_id": receiving_pt,
+        # shipping_point_id: 从 sku_id → supplier → 供应商仓库 point_id
+        sp_id = sku_id_to_sp_map.get(sku_id)
+
+        # receiving_point_id: point_id (配送目的地)，None 时用总部仓 id=1
+        if sku.get("point_id") is not None:
+            rp_id = int(sku["point_id"])
+        else:
+            rp_id = 1  # 默认总部仓
+
+        elements.append({
+            "id": make_elem_id(sp_id, rp_id, sku_id),
+            "shipping_point_id": sp_id,
+            "receiving_point_id": rp_id,
             "sku_id": sku_id,
             "qty": qty,
             "price": price,
             "deposit": deposit,
             "subtotal": subtotal,
-            "sn_list": sn_list,
-        }
-        new_elements.append(elem)
-
-    if not new_elements:
-        return False
-
-    # 确定 vc_type
-    vc_type_map = {
-        "设备采购": VCType.EQUIPMENT_PROCUREMENT,
-        "设备采购(库存)": VCType.STOCK_PROCUREMENT,
-        "物料采购": VCType.MATERIAL_PROCUREMENT,
-    }
-    vc_type = vc_type_map.get(vc.type, VCType.EQUIPMENT_PROCUREMENT)
-
-    new_elements_data = {
-        "elements": new_elements,
-        "total_amount": old.get("total_amount"),
-        "payment_terms": old.get("payment_terms"),
-    }
-
-    vc.elements = new_elements_data
-    flag_modified(vc, "elements")
-    return True
+            "sn_list": [sn] if sn and sn != "-" else [],
+        })
+    return elements
 
 
-def migrate_material_supply_vc(session, vc: VirtualContract) -> bool:
-    """
-    迁移物料供应 VC
-    旧: {"order_id": ..., "points": [...], "total_amount": ..., "payment_terms": ...}
-    """
-    old = vc.elements
-    points = old.get("points", [])
-    if not points:
-        return False
-
-    new_elements = []
+def points_to_elements(points: list) -> list:
+    """将 points[].items[] 转为统一 elements[]"""
+    elements = []
     for pt in points:
-        receiving_pt = pt.get("pointId")
-        if not receiving_pt:
-            pt_name = pt.get("pointName", "")
-            if pt_name:
-                receiving_pt = get_point_id_by_name(session, pt_name)
-
-        items = pt.get("items", [])
-        for item in items:
-            sku_id = item.get("sku_id")
-            if not sku_id:
-                sku_id = get_sku_id_by_name(session, item.get("sku_name", ""))
-            if not sku_id:
-                print(f"  [WARN] VC {vc.id}: 无法找到SKU '{item.get('sku_name')}'，跳过")
-                continue
-
-            # shipping_point: 尝试从 source_warehouse 名称查找，默认为总仓库
-            source_wh = item.get("source_warehouse", "")
-            shipping_pt = 1
-            if source_wh and source_wh != "未知":
-                pid = get_point_id_by_name(session, source_wh)
-                if pid:
-                    shipping_pt = pid
-
-            qty = float(item.get("qty", 0))
-            price = float(item.get("price", 0))
-            deposit = float(item.get("deposit", 0))
+        receiving_point_id = int(pt["pointId"])
+        for item in pt.get("items", []):
+            sku_id = int(item["sku_id"])
+            qty = float(item["qty"])
+            price = float(item["price"])
+            deposit = float(item.get("deposit") or 0)
             subtotal = qty * price
             sn = item.get("sn", "-")
-            sn_list = [] if sn in ["-", "", None] else [sn]
 
-            receiving_final = receiving_pt if receiving_pt else 1
+            source_wh = item.get("source_warehouse", "") or ""
+            sp_id = name_to_warehouse_id(source_wh)
 
-            elem = {
-                "id": f"sp{shipping_pt}_rp{receiving_final}_sku{sku_id}",
-                "shipping_point_id": shipping_pt,
-                "receiving_point_id": receiving_final,
+            elements.append({
+                "id": make_elem_id(sp_id, receiving_point_id, sku_id),
+                "shipping_point_id": sp_id,
+                "receiving_point_id": receiving_point_id,
                 "sku_id": sku_id,
                 "qty": qty,
                 "price": price,
                 "deposit": deposit,
                 "subtotal": subtotal,
-                "sn_list": sn_list,
-            }
-            new_elements.append(elem)
-
-    if not new_elements:
-        return False
-
-    new_elements_data = {
-        "elements": new_elements,
-        "total_amount": old.get("total_amount"),
-        "payment_terms": old.get("payment_terms"),
-    }
-
-    vc.elements = new_elements_data
-    flag_modified(vc, "elements")
-    return True
+                "sn_list": [sn] if sn and sn != "-" else [],
+            })
+    return elements
 
 
-def migrate_return_vc(session, vc: VirtualContract) -> bool:
+# SKU ID → 供应商仓库 point_id 映射 (从 points 表分析得出)
+SKU_ID_TO_WH_ID = {
+    2: 3,   # 原味豆浆-朝旭 → 朝旭食养仓
+    3: 3,   # 玉米燕麦-朝旭 → 朝旭食养仓
+    17: 8,  # 冰激凌机-广东中贝 → 广东中贝仓
+    18: 9,  # 冰激凌机-湖北广绅 → 湖北广绅仓
+    19: 10, # 冰沙机-苏州邦基勒 → 苏州邦基勒仓
+}
+
+
+def build_sku_sp_map(cur) -> dict:
+    """从数据库动态推断 sku_id → shipping_point_id
+
+    优先使用已知的静态映射 SKU_ID_TO_WH_ID，
+    对数据库中其他 sku 通过 supplier_id → 仓库名模糊匹配推断。
     """
-    迁移退货 VC
-    旧: {"return_items": [...], "return_direction": ..., "total_refund": ...}
-    """
-    old = vc.elements
-    return_items = old.get("return_items", [])
-    if not return_items:
-        return False
+    # 基础: 已知的正确映射
+    sku_sp_map = dict(SKU_ID_TO_WH_ID)
 
-    new_elements = []
-    for item in return_items:
-        sku_id = item.get("sku_id")
-        if not sku_id:
-            sku_id = get_sku_id_by_name(session, item.get("sku_name", ""))
-        if not sku_id:
-            print(f"  [WARN] VC {vc.id}: 无法找到SKU '{item.get('sku_name')}'，跳过")
-            continue
+    # 加载所有 skus 的 supplier_id
+    cur.execute("SELECT id, supplier_id FROM skus")
+    sku_rows = cur.fetchall()
 
-        point_id = item.get("point_id")
-        if not point_id:
-            pt_name = item.get("point_name", "")
-            if pt_name:
-                point_id = get_point_id_by_name(session, pt_name)
+    # 加载所有供应商仓库 point (type='供应商仓')
+    cur.execute("SELECT id, name FROM points WHERE type='供应商仓'")
+    wh_rows = cur.fetchall()
+    wh_id_by_name = {}
+    for pt_id, pt_name in wh_rows:
+        clean = pt_name.replace(" (供应商仓)", "").replace("(供应商仓)", "").replace("仓", "").strip()
+        wh_id_by_name[clean] = pt_id
 
-        shipping_pt = DEFAULT_SHIPPING_POINT_ID
-        receiving_pt = point_id if point_id else 1
+    # 加载 suppliers
+    cur.execute("SELECT id, name FROM suppliers")
+    sup_rows = cur.fetchall()
+    sup_name = {r[0]: r[1] for r in sup_rows}
 
-        qty = float(item.get("qty", 0))
-        price = float(item.get("price", 0))
-        deposit = float(item.get("deposit", 0))
-        subtotal = qty * price
-        sn = item.get("sn", "-")
-        sn_list = [] if sn in ["-", "", None] else [sn]
+    # 对未映射的 sku，尝试推断
+    for sku_id, sup_id in sku_rows:
+        if sku_id in sku_sp_map:
+            continue  # 已知映射，跳过
+        sup = sup_name.get(sup_id, "")
+        sp_id = None
+        for key, pt_id in wh_id_by_name.items():
+            if key in sup or sup in key:
+                sp_id = pt_id
+                break
+        if sp_id is None:
+            sp_id = 3  # fallback
+        sku_sp_map[sku_id] = sp_id
 
-        elem = {
-            "id": f"sp{shipping_pt}_rp{receiving_pt}_sku{sku_id}",
-            "shipping_point_id": shipping_pt,
-            "receiving_point_id": receiving_pt,
-            "sku_id": sku_id,
-            "qty": qty,
-            "price": price,
-            "deposit": deposit,
-            "subtotal": subtotal,
-            "sn_list": sn_list,
-        }
-        new_elements.append(elem)
-
-    if not new_elements:
-        return False
-
-    # 退货 VC 顶层字段保留
-    new_elements_data = {
-        "elements": new_elements,
-        "return_direction": old.get("return_direction"),
-        "goods_amount": old.get("goods_amount"),
-        "deposit_amount": old.get("deposit_amount"),
-        "logistics_cost": old.get("logistics_cost"),
-        "logistics_bearer": old.get("logistics_bearer"),
-        "total_refund": old.get("total_refund"),
-        "reason": old.get("reason"),
-    }
-
-    vc.elements = new_elements_data
-    flag_modified(vc, "elements")
-    return True
-
-
-def migrate_inventory_allocation_vc(session, vc: VirtualContract) -> bool:
-    """
-    迁移库存拨付 VC
-    旧: {"allocation_items": [...]}
-    """
-    old = vc.elements
-    allocation_items = old.get("allocation_items", [])
-    if not allocation_items:
-        return False
-
-    new_elements = []
-    for item in allocation_items:
-        sku_id = item.get("sku_id")
-        if not sku_id:
-            sku_id = get_sku_id_by_name(session, item.get("sku_name", ""))
-        if not sku_id:
-            print(f"  [WARN] VC {vc.id}: 无法找到SKU '{item.get('sku_name')}'，跳过")
-            continue
-
-        shipping_pt = item.get("shipping_point_id", DEFAULT_SHIPPING_POINT_ID)
-        receiving_pt = item.get("receiving_point_id", 1)
-
-        qty = float(item.get("qty", 0))
-        price = float(item.get("price", 0))
-        deposit = float(item.get("deposit", 0))
-        subtotal = qty * price
-        sn_list = item.get("sn_list", [])
-
-        elem = {
-            "id": f"sp{shipping_pt}_rp{receiving_pt}_sku{sku_id}",
-            "shipping_point_id": shipping_pt,
-            "receiving_point_id": receiving_pt,
-            "sku_id": sku_id,
-            "qty": qty,
-            "price": price,
-            "deposit": deposit,
-            "subtotal": subtotal,
-            "sn_list": sn_list,
-        }
-        new_elements.append(elem)
-
-    if not new_elements:
-        return False
-
-    new_elements_data = {
-        "elements": new_elements,
-    }
-
-    vc.elements = new_elements_data
-    flag_modified(vc, "elements")
-    return True
-
-
-def is_already_migrated(elements: dict) -> bool:
-    """检查是否已经是新结构（新结构只有 elements 键，不再有 vc_type）
-    返回 True 表示不需要迁移，返回 False 表示需要迁移
-    """
-    if not elements:
-        return False
-    # 有 elements 但不含 vc_type：已是正确新结构，不需要迁移
-    if "elements" in elements and "vc_type" not in elements:
-        return True
-    # 有 elements 且含 vc_type：旧迁移遗留，需要重新迁移（清理 vc_type）
-    if "elements" in elements and "vc_type" in elements:
-        return False
-    # 其他情况（旧结构）：需要迁移
-    return False
+    return sku_sp_map
 
 
 def main():
-    print("=" * 60)
-    print("VC Elements 结构迁移脚本")
-    print("=" * 60)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
 
-    init_db()
-    session = get_session()
+    # ── Step 1: 添加 return_direction 列 (如果不存在) ───────────────────────
+    cur.execute("PRAGMA table_info(virtual_contracts)")
+    columns = [row[1] for row in cur.fetchall()]
+    if "return_direction" not in columns:
+        print("+ 添加 return_direction 列 ...")
+        cur.execute("ALTER TABLE virtual_contracts ADD COLUMN return_direction VARCHAR(50)")
+        conn.commit()
+        print("  done")
+    else:
+        print("= return_direction 列已存在，跳过")
 
-    try:
-        all_vcs = session.query(VirtualContract).all()
-        total = len(all_vcs)
-        print(f"\n共找到 {total} 个 VC\n")
+    # ── Step 2: 建立 sku → shipping_point 映射 ───────────────────────────────
+    sku_sp_map = build_sku_sp_map(cur)
+    print(f"= sku → shipping_point 映射: {sku_sp_map}")
 
-        migrated = 0
-        skipped = 0
-        errors = 0
+    # ── Step 3: 迁移 elements ───────────────────────────────────────────────
+    cur.execute("SELECT id, type, elements FROM virtual_contracts ORDER BY id")
+    rows = cur.fetchall()
 
-        for vc in all_vcs:
-            if is_already_migrated(vc.elements):
-                print(f"[SKIP] VC id={vc.id} type={vc.type} - 已是正确结构")
-                skipped += 1
-                continue
+    migrated = []
+    skipped = []
 
-            old_str = str(vc.elements)[:80]
-            print(f"[MIGRATE] VC id={vc.id} type={vc.type}")
-            print(f"         old keys: {list(vc.elements.keys()) if vc.elements else None}")
+    for vc_id, vc_type, elements_json in rows:
+        try:
+            old_elem = json.loads(elements_json) if elements_json else {}
+        except:
+            old_elem = {}
 
-            try:
-                old_type = vc.type
-                success = False
+        needs_migration = "skus" in old_elem or "points" in old_elem
 
-                # 如果 elements 有 vc_type（旧迁移遗留），直接清理该字段
-                if vc.elements and "elements" in vc.elements and "vc_type" in vc.elements:
-                    print(f"  [CLEAN] VC {vc.id} 清理冗余 vc_type 字段")
-                    del vc.elements["vc_type"]
-                    flag_modified(vc, "elements")
-                    session.flush()
-                    migrated += 1
-                    continue
+        if not needs_migration:
+            skipped.append(vc_id)
+            continue
 
-                if old_type in ["设备采购", "设备采购(库存)", "物料采购"]:
-                    success = migrate_procurement_vc(session, vc)
-                elif old_type == "物料供应":
-                    success = migrate_material_supply_vc(session, vc)
-                elif old_type == "退货":
-                    success = migrate_return_vc(session, vc)
-                elif old_type == "库存拨付":
-                    success = migrate_inventory_allocation_vc(session, vc)
-                else:
-                    print(f"  [WARN] 未知 VC 类型 '{old_type}'，跳过")
-                    skipped += 1
-                    continue
+        new_elem = migrate_vc(vc_id, vc_type, old_elem, sku_sp_map)
+        new_json = json.dumps(new_elem, ensure_ascii=False)
 
-                if success:
-                    # 每条迁移后立即 flush，确保写入当前事务
-                    session.flush()
-                    new_elems = vc.elements
-                    print(f"         new elements count: {len(new_elems.get('elements', []))}")
-                    migrated += 1
-                else:
-                    print(f"  [ERROR] VC {vc.id} 迁移失败（无有效数据）")
-                    errors += 1
+        cur.execute(
+            "UPDATE virtual_contracts SET elements=? WHERE id=?",
+            (new_json, vc_id)
+        )
 
-            except Exception as e:
-                print(f"  [ERROR] VC {vc.id} 迁移异常: {e}")
-                import traceback
-                traceback.print_exc()
-                errors += 1
+        elem_count = len(new_elem.get("elements", []))
+        migrated.append((vc_id, vc_type, elem_count, new_elem))
 
-        print(f"\n{'=' * 60}")
-        print(f"迁移完成: 成功={migrated}, 跳过(已是新结构)={skipped}, 错误={errors}")
-        print(f"{'=' * 60}")
+    conn.commit()
 
-        # 提交事务
-        if migrated > 0:
-            session.commit()
-            print(f"\n数据库已提交 {migrated} 条迁移记录")
+    # ── Step 4: 验证输出 ────────────────────────────────────────────────────
+    print(f"\n迁移完成: {len(migrated)} 个 VC")
+    for vc_id, vc_type, cnt, elem in migrated:
+        total = sum(e["subtotal"] for e in elem.get("elements", []))
+        print(f"\nVC {vc_id} ({vc_type}): {cnt} elements, sum={total}")
+        for e in elem.get("elements", []):
+            print(f"  id={e['id']}, sp={e['shipping_point_id']}, rp={e['receiving_point_id']}, "
+                  f"sku={e['sku_id']}, qty={e['qty']}, price={e['price']}, subtotal={e['subtotal']}")
 
-        # 打印验证信息（提交之后，强制 checkpoint 确保 WAL 数据落盘）
-        print("\n验证迁移结果:")
-        print("-" * 60)
-        from sqlalchemy import text
-        with session.get_bind().connect() as conn:
-            conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
-            conn.commit()
+    print(f"\n跳过 (无需迁移): {skipped}")
 
-        # 重新查询，强制读取数据库实际值
-        session.expire_all()
-        all_vcs_after = session.query(VirtualContract).all()
-        for vc in all_vcs_after:
-            elems = vc.elements
-            has_elements = "elements" in elems if elems else False
-            count = len(elems.get("elements", [])) if has_elements else 0
-            status = "[OK]" if has_elements else "[FAIL]"
-            print(f"  {status} VC id={vc.id} type={vc.type} elements_count={count}")
-
-    except Exception as e:
-        print(f"\n[CRITICAL ERROR] {e}")
-        import traceback
-        traceback.print_exc()
-        session.rollback()
-    finally:
-        session.close()
+    conn.close()
 
 
 if __name__ == "__main__":

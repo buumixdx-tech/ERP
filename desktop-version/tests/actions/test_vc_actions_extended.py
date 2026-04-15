@@ -7,7 +7,7 @@ import pytest
 from logic.vc import (
     create_mat_procurement_vc_action,
     create_stock_procurement_vc_action,
-    allocate_inventory_action,
+    create_inventory_allocation_action,
     CreateMatProcurementVCSchema,
     CreateStockProcurementVCSchema,
     AllocateInventorySchema,
@@ -32,7 +32,6 @@ class TestMatProcurementVCAction:
 
         sc = SupplyChain(
             supplier_id=sample_supplier.id,
-            supplier_name=sample_supplier.name,
             type=SKUType.MATERIAL,
             pricing_config={"物料A": 10}
         )
@@ -117,6 +116,6 @@ class TestAllocateInventoryAction:
             ]
         )
 
-        result = allocate_inventory_action(db_session, payload)
+        result = create_inventory_allocation_action(db_session, payload)
 
         assert result.success is False

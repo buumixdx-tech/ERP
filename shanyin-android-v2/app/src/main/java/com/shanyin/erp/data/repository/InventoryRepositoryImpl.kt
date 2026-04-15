@@ -114,6 +114,9 @@ class MaterialInventoryRepositoryImpl @Inject constructor(
     override suspend fun getBySkuId(skuId: Long): MaterialInventory? =
         dao.getBySkuId(skuId)?.toDomain()
 
+    override suspend fun getBySkuIds(skuIds: List<Long>): List<MaterialInventory> =
+        dao.getBySkuIds(skuIds).map { it.toDomain() }
+
     override suspend fun insert(material: MaterialInventory): Long =
         dao.insert(material.toEntity())
 

@@ -7,7 +7,6 @@ queries 层集成测试
 2. 关联对象缺失时是否安全处理
 3. N+1 查询问题验证
 4. 接口一致性（公开函数不应接受 session 参数）
-5. 字段访问正确性（queries 访问的字段是否在 models 中存在）
 """
 
 import pytest
@@ -176,89 +175,7 @@ class TestQueryInterfaceConsistency:
 
 
 # =============================================================================
-# 2. 字段访问正确性测试（检测 queries 访问不存在的 model 字段）
-# =============================================================================
-
-class TestModelFieldAccess:
-    """
-    验证 queries 层访问的字段在 models 中实际存在。
-    这些测试预期会失败，用于记录 queries 与 models 的字段不匹配问题。
-    """
-
-    def test_customer_fields_in_model(self):
-        """ChannelCustomer 实际字段：id, name, info, created_at"""
-        c = ChannelCustomer(name="test", info=None)
-        # 以下字段在 queries 中被访问，但 models 中不存在
-        missing = []
-        for field in ['contact', 'phone', 'email', 'address', 'status']:
-            if not hasattr(c, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"ChannelCustomer 缺少字段（queries 中被访问）: {missing}")
-
-    def test_point_fields_in_model(self):
-        """Point 实际字段：id, customer_id, supplier_id, name, address, type, receiving_address"""
-        p = Point(name="test")
-        missing = []
-        for field in ['contact', 'phone', 'status']:
-            if not hasattr(p, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"Point 缺少字段（queries 中被访问）: {missing}")
-
-    def test_sku_fields_in_model(self):
-        """SKU 实际字段：id, supplier_id, name, type_level1, type_level2, model, description, certification, params"""
-        s = SKU(name="test")
-        missing = []
-        for field in ['spec', 'category', 'unit', 'status', 'price_info']:
-            if not hasattr(s, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"SKU 缺少字段（queries 中被访问）: {missing}")
-
-    def test_business_fields_in_model(self):
-        """Business 实际字段：id, customer_id, contract_id, status, timestamp, details"""
-        b = Business(status="test", details={})
-        missing = []
-        for field in ['created_at', 'updated_at']:
-            if not hasattr(b, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"Business 缺少字段（queries 中被访问）: {missing}")
-
-    def test_cashflow_fields_in_model(self):
-        """CashFlow 实际字段：id, virtual_contract_id, type, amount, ..., timestamp"""
-        cf = CashFlow(type="test", amount=0)
-        missing = []
-        for field in ['created_at']:
-            if not hasattr(cf, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"CashFlow 缺少字段（queries 中被访问）: {missing}")
-
-    def test_express_order_fields_in_model(self):
-        """ExpressOrder 实际字段：id, logistics_id, tracking_number, items, address_info, status, timestamp"""
-        o = ExpressOrder(tracking_number="test")
-        missing = []
-        for field in ['created_at', 'updated_at']:
-            if not hasattr(o, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"ExpressOrder 缺少字段（queries 中被访问）: {missing}")
-
-    def test_logistics_fields_in_model(self):
-        """Logistics 实际字段：id, virtual_contract_id, finance_triggered, status, timestamp"""
-        l = Logistics(status="test")
-        missing = []
-        for field in ['created_at']:
-            if not hasattr(l, field):
-                missing.append(field)
-        if missing:
-            pytest.xfail(f"Logistics 缺少字段（queries 中被访问）: {missing}")
-
-
-# =============================================================================
-# 3. 业务查询集成测试（仅测试不依赖缺失字段的功能）
+# 2. 业务查询集成测试
 # =============================================================================
 
 class TestBusinessQueriesIntegration:
@@ -276,7 +193,7 @@ class TestBusinessQueriesIntegration:
 
 
 # =============================================================================
-# 4. VC 查询集成测试
+# 3. VC 查询集成测试
 # =============================================================================
 
 class TestVCQueriesIntegration:
@@ -296,13 +213,10 @@ class TestVCQueriesIntegration:
         session.flush()
 
         with patch.object(vc_queries, 'get_session', return_value=session):
-            try:
-                result = vc_queries.get_vc_list(vc_type=VCType.EQUIPMENT_PROCUREMENT)
-                types = [r['type'] for r in result]
-                assert VCType.EQUIPMENT_PROCUREMENT in types
-                assert VCType.MATERIAL_SUPPLY not in types
-            except AttributeError as e:
-                pytest.xfail(f"vc/queries.py 使用了 VirtualContract.business 关系，但 models 中未定义: {e}")
+            result = vc_queries.get_vc_list(vc_type=VCType.EQUIPMENT_PROCUREMENT)
+            types = [r['type'] for r in result]
+            assert VCType.EQUIPMENT_PROCUREMENT in types
+            assert VCType.MATERIAL_SUPPLY not in types
 
     def test_detail_returns_elements(self, session, virtual_contract):
         with patch.object(vc_queries, 'get_session', return_value=session):
@@ -349,30 +263,26 @@ class TestVCQueriesIntegration:
 
 
 # =============================================================================
-# 5. 主数据查询集成测试
+# 4. 主数据查询集成测试
 # =============================================================================
 
 class TestMasterQueriesIntegration:
 
     def test_customer_search_keyword(self, session):
-        """关键词搜索应过滤结果（不依赖缺失字段的部分）"""
+        """关键词搜索应过滤结果"""
         c1 = ChannelCustomer(name="北京科技公司", info=None)
         c2 = ChannelCustomer(name="上海贸易公司", info=None)
         session.add_all([c1, c2])
         session.flush()
 
-        # get_customers_for_ui 访问了不存在的字段，预期失败
         with patch.object(master_queries, 'get_session', return_value=session):
-            try:
-                result = master_queries.get_customers_for_ui(search_keyword="北京")
-                names = [r['name'] for r in result]
-                assert "北京科技公司" in names
-                assert "上海贸易公司" not in names
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = master_queries.get_customers_for_ui(search_keyword="北京")
+            names = [r['name'] for r in result]
+            assert "北京科技公司" in names
+            assert "上海贸易公司" not in names
 
     def test_skus_filter_by_supplier(self, session, supplier, sku):
-        """supplier_id 过滤（不依赖缺失字段的部分）"""
+        """supplier_id 过滤"""
         s2 = Supplier(name="其他供应商", category="物料", address="地址")
         session.add(s2)
         session.flush()
@@ -381,13 +291,10 @@ class TestMasterQueriesIntegration:
         session.flush()
 
         with patch.object(master_queries, 'get_session', return_value=session):
-            try:
-                result = master_queries.get_skus_for_ui(supplier_id=supplier.id)
-                names = [r['name'] for r in result]
-                assert "测试设备A" in names
-                assert "其他物料" not in names
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = master_queries.get_skus_for_ui(supplier_id=supplier.id)
+            names = [r['name'] for r in result]
+            assert "测试设备A" in names
+            assert "其他物料" not in names
 
     def test_stock_equipment_status_filter(self, session, sku):
         """operational_status 过滤应只返回库存中的设备"""
@@ -436,7 +343,7 @@ class TestMasterQueriesIntegration:
 
 
 # =============================================================================
-# 6. 物流查询集成测试
+# 5. 物流查询集成测试
 # =============================================================================
 
 class TestLogisticsQueriesIntegration:
@@ -477,7 +384,7 @@ class TestLogisticsQueriesIntegration:
         assert all(r['vc_id'] == vc1.id for r in result)
 
     def test_express_orders_by_logistics(self, session, virtual_contract):
-        """get_express_orders_by_logistics 访问了不存在的 created_at 字段"""
+        """get_express_orders_by_logistics 返回指定物流的快递单"""
         log = Logistics(virtual_contract_id=virtual_contract.id, status=LogisticsStatus.PENDING)
         session.add(log)
         session.flush()
@@ -487,11 +394,8 @@ class TestLogisticsQueriesIntegration:
         session.flush()
 
         with patch.object(logistics_queries, 'get_session', return_value=session):
-            try:
-                result = logistics_queries.get_express_orders_by_logistics(log.id)
-                assert any(r['tracking_number'] == "SF001" for r in result)
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = logistics_queries.get_express_orders_by_logistics(log.id)
+            assert any(r['tracking_number'] == "SF001" for r in result)
 
     def test_empty_returns_list(self, session):
         with patch.object(logistics_queries, 'get_session', return_value=session):
@@ -501,22 +405,19 @@ class TestLogisticsQueriesIntegration:
     def test_dashboard_summary_structure(self, session):
         """dashboard 返回结构应包含必要字段"""
         with patch.object(logistics_queries, 'get_session', return_value=session):
-            try:
-                result = logistics_queries.get_logistics_dashboard_summary()
-                assert 'logistics_summary' in result
-                assert 'express_summary' in result
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = logistics_queries.get_logistics_dashboard_summary()
+            assert 'logistics_summary' in result
+            assert 'express_summary' in result
 
 
 # =============================================================================
-# 7. 财务查询集成测试
+# 6. 财务查询集成测试
 # =============================================================================
 
 class TestFinanceQueriesIntegration:
 
     def test_cash_flow_filter_by_vc(self, session, virtual_contract):
-        """get_cash_flow_list_for_ui 访问了不存在的 created_at 字段"""
+        """get_cash_flow_list_for_ui 按 vc_id 过滤资金流"""
         cf = CashFlow(
             virtual_contract_id=virtual_contract.id,
             type="预付款", amount=1000.0,
@@ -526,12 +427,9 @@ class TestFinanceQueriesIntegration:
         session.flush()
 
         with patch.object(finance_queries, 'get_session', return_value=session):
-            try:
-                result = finance_queries.get_cash_flow_list_for_ui(vc_id=virtual_contract.id)
-                assert len(result) >= 1
-                assert all(r['vc_id'] == virtual_contract.id for r in result)
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = finance_queries.get_cash_flow_list_for_ui(vc_id=virtual_contract.id)
+            assert len(result) >= 1
+            assert all(r['vc_id'] == virtual_contract.id for r in result)
 
     def test_cash_flow_no_payer_account_no_crash(self, session, virtual_contract):
         """payer_account 为 None 时，格式化不应崩溃"""
@@ -545,11 +443,8 @@ class TestFinanceQueriesIntegration:
         session.flush()
 
         with patch.object(finance_queries, 'get_session', return_value=session):
-            try:
-                result = finance_queries.get_cash_flow_list_for_ui(vc_id=virtual_contract.id)
-                assert result[0]['payer_info']['label'] == "未指定/现金"
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = finance_queries.get_cash_flow_list_for_ui(vc_id=virtual_contract.id)
+            assert result[0]['payer_info']['label'] == "未指定/现金"
 
     def test_journal_entries_filter_by_account(self, session):
         acc1 = FinanceAccount(level1_name="应收账款", direction="Debit", category="资产")
@@ -575,7 +470,7 @@ class TestFinanceQueriesIntegration:
 
 
 # =============================================================================
-# 8. N+1 查询检测测试
+# 7. N+1 查询检测测试
 # =============================================================================
 
 class TestNPlusOneDetection:
@@ -595,11 +490,8 @@ class TestNPlusOneDetection:
             sql_count[0] += 1
 
         with patch.object(master_queries, 'get_session', return_value=session):
-            try:
-                result = master_queries.get_points_for_ui(customer_id=customer.id)
-                assert len(result) == 5
-                print(f"\nget_points_for_ui(5个点位) 执行了 {sql_count[0]} 次 SQL")
-                # 修复 N+1 后取消注释：
-                # assert sql_count[0] <= 3
-            except AttributeError as e:
-                pytest.xfail(f"queries 访问了 models 中不存在的字段: {e}")
+            result = master_queries.get_points_for_ui(customer_id=customer.id)
+            assert len(result) == 5
+            print(f"\nget_points_for_ui(5个点位) 执行了 {sql_count[0]} 次 SQL")
+            # 修复 N+1 后取消注释：
+            assert sql_count[0] <= 3

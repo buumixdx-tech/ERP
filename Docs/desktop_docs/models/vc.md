@@ -111,7 +111,7 @@ VC 的业务明细存储在 `elements` JSON 字段中，结构因类型而异：
 | `create_mat_procurement_vc_action` | 物料采购 VC 创建 |
 | `create_material_supply_vc_action` | 物料供应 VC 创建 |
 | `create_return_vc_action` | 退货 VC 创建（含商业逻辑校验） |
-| `allocate_inventory_action` | 库存拨付（更新 EquipmentInventory 状态） |
+| `create_inventory_allocation_action` | 库存拨付（更新 EquipmentInventory 状态） |
 | `update_vc_action` | 底层 VC 数据修正 |
 | `delete_vc_action` | 物理删除 VC（级联清理 Logistics） |
 

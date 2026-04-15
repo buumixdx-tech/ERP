@@ -9,8 +9,10 @@ from logic.master import (
     create_supplier_action, update_suppliers_action, delete_suppliers_action,
     create_sku_action, update_skus_action, delete_skus_action,
     create_partner_action, update_partners_action, delete_partners_action,
+    create_partner_relation_action, delete_partner_relations_action,
     CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema,
-    DeleteMasterDataSchema,
+    DeleteMasterDataSchema, PartnerRelationSchema,
+    get_partner_relations,
 )
 from logic.finance import (
     create_bank_account_action, update_bank_accounts_action,
@@ -89,6 +91,15 @@ def update_partners(payloads: List[PartnerSchema], session: Session = Depends(ge
 def delete_partners(payloads: List[DeleteMasterDataSchema], session: Session = Depends(get_db)):
     return delete_partners_action(session, payloads).model_dump()
 
+# --- Partner Relation ---
+@router.post("/create-partner-relation", summary="创建合作方关系")
+def create_partner_relation(payload: PartnerRelationSchema, session: Session = Depends(get_db)):
+    return create_partner_relation_action(session, payload).model_dump()
+
+@router.post("/delete-partner-relations", summary="批量删除合作方关系")
+def delete_partner_relations(payloads: List[DeleteMasterDataSchema], session: Session = Depends(get_db)):
+    return delete_partner_relations_action(session, payloads).model_dump()
+
 # --- Bank Account ---
 @router.post("/create-bank-account", summary="创建银行账户")
 def create_bank_account(payload: CreateBankAccountSchema, session: Session = Depends(get_db)):
@@ -158,11 +169,25 @@ def get_sku(sku_id: int, session: Session = Depends(get_db)):
 def list_partners(page: int = 1, size: int = 50, session: Session = Depends(get_db)):
     return {"success": True, "data": paginate(session, session.query(ExternalPartner), page, size)}
 
+@router.get("/partner-relations", summary="合作方关系列表")
+def list_partner_relations(
+    partner_id: Optional[int] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[int] = None,
+    session: Session = Depends(get_db)
+):
+    return {"success": True, "data": get_partner_relations(partner_id, owner_type, owner_id)}
+
+
 @router.get("/bank-accounts", summary="银行账户列表")
 def list_bank_accounts(owner_type: Optional[str] = None, owner_id: Optional[int] = None, session: Session = Depends(get_db)):
     q = session.query(BankAccount)
     if owner_type:
         q = q.filter(BankAccount.owner_type == owner_type)
-    if owner_id is not None:
+        # ourselves 类型 owner_id 为 NULL，按传入的 owner_id 值过滤时需兼容 NULL 语义
+        # 传入 owner_id=0 等同于查所有 ourselves 账户（忽略 owner_id 过滤）
+        if owner_type != 'ourselves' and owner_id is not None:
+            q = q.filter(BankAccount.owner_id == owner_id)
+    elif owner_id is not None:
         q = q.filter(BankAccount.owner_id == owner_id)
     return {"success": True, "data": {"items": [row_to_dict(a) for a in q.all()]}}

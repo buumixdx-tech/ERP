@@ -1,18 +1,26 @@
 from models import (
-    get_session, Logistics, CashFlow, VirtualContract, SKU, 
+    get_session, Logistics, CashFlow, VirtualContract, SKU,
     EquipmentInventory, MaterialInventory, Supplier, ChannelCustomer, ExternalPartner,
-    FinanceAccount, FinancialJournal, CashFlowLedger, BankAccount
+    FinanceAccount, FinancialJournal, CashFlowLedger, BankAccount, Business, PartnerRelation
+)
+from logic.constants import (
+    VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection,
+    CashFlowType, AccountLevel1, CounterpartType, AccountOwnerType,
+    LogisticsBearer, BankInfoKey, PartnerRelationType
 )
 import os
 import json
 import uuid
+import logging
 from datetime import datetime
 from sqlalchemy import func
 from logic.constants import (
-    VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection, 
-    CashFlowType, AccountLevel1, CounterpartType, AccountOwnerType, 
+    VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection,
+    CashFlowType, AccountLevel1, CounterpartType, AccountOwnerType,
     LogisticsBearer, BankInfoKey
 )
+
+logger = logging.getLogger(__name__)
 
 VOUCHER_DIR = 'data/finance/finance-voucher'
 REPORT_DIR = 'data/finance/finance-report'
@@ -29,7 +37,6 @@ ACCOUNT_CONFIG = {
     AccountLevel1.PRE_COLLECTION: {"category": "负债", "direction": "Credit"},
     AccountLevel1.DEPOSIT_PAYABLE: {"category": "负债", "direction": "Credit"},
     AccountLevel1.OTHER_PAYABLE: {"category": "负债", "direction": "Credit"},
-    "应付款": {"category": "负债", "direction": "Credit"},
     AccountLevel1.EQUITY: {"category": "所有者权益", "direction": "Credit"},
     AccountLevel1.REVENUE: {"category": "损益", "direction": "Credit"},
     AccountLevel1.NON_OP_REVENUE_PENALTY: {"category": "损益", "direction": "Credit"},
@@ -57,13 +64,31 @@ def finance_module(logistics_id=None, cash_flow_id=None, session=None):
         if not ext_session:
             session.close()
 
-def get_or_create_account(session, level1_name, counterpart_type=None, counterpart_id=None):
+def _get_biz_procurement_partner(session, biz_id):
+    """查询 Business 是否关联恰好一个"采购执行"类型的有效合作方，返回 (partner_name) 或 (None,)"""
+    rels = session.query(PartnerRelation).filter(
+        PartnerRelation.owner_type == "business",
+        PartnerRelation.owner_id == biz_id,
+        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+        PartnerRelation.ended_at == None
+    ).all()
+    if len(rels) == 1:
+        partner = session.query(ExternalPartner).get(rels[0].partner_id)
+        return (partner.name,) if partner else (None,)
+    return (None,)
+
+def get_or_create_account(session, level1_name, counterpart_type=None, counterpart_id=None, business_id=None):
     config = ACCOUNT_CONFIG.get(level1_name, {"category": "其他", "direction": "Debit"})
     level2_name = None
     if counterpart_type and counterpart_id:
         if counterpart_type == CounterpartType.CUSTOMER:
             obj = session.query(ChannelCustomer).get(counterpart_id)
-            if obj: level2_name = f"{level1_name} - {obj.name}"
+            if obj:
+                partner_name, = _get_biz_procurement_partner(session, business_id) if business_id else (None,)
+                if partner_name:
+                    level2_name = f"{level1_name} - {obj.name} - {partner_name}"
+                else:
+                    level2_name = f"{level1_name} - {obj.name}"
         elif counterpart_type == CounterpartType.SUPPLIER:
             obj = session.query(Supplier).get(counterpart_id)
             if obj: level2_name = f"{level1_name} - {obj.name}"
@@ -95,12 +120,18 @@ def get_or_create_account(session, level1_name, counterpart_type=None, counterpa
         session.flush()
     return account
 
-def record_entries(session, voucher_no, ref_vc_id, ref_type, ref_id, entries, transaction_date=None):
+def record_entries(session, voucher_no, ref_vc_id, ref_type, ref_id, entries, transaction_date=None, business_id=None):
     if not transaction_date:
         transaction_date = datetime.now()
+    # 若未传入 business_id，尝试从 VC 反查
+    if business_id is None and ref_vc_id is not None:
+        vc = session.query(VirtualContract).get(ref_vc_id)
+        if vc and vc.business_id:
+            business_id = vc.business_id
     db_entries = []
     for entry in entries:
-        acc = get_or_create_account(session, entry["level1"], entry.get("cp_type"), entry.get("cp_id"))
+        acc = get_or_create_account(session, entry["level1"], entry.get("cp_type"), entry.get("cp_id"),
+                                    business_id=business_id)
         journal = FinancialJournal(
             voucher_no=voucher_no, account_id=acc.id,
             debit=entry.get("debit", 0.0), credit=entry.get("credit", 0.0),
@@ -194,6 +225,50 @@ def process_logistics_finance(session, logistics_id):
     if entries:
         record_entries(session, voucher_no, vc.id, "Logistics", logistics_id, entries, logistics.timestamp)
 
+def _get_deposit_party(session, vc, payer_account_id=None):
+    """
+    押金资金流的对手方：始终为 business 的付款方（客户或合作方），而非供应商。
+    优先使用实际付款银行账户的归属信息，其次使用 business 的合作方结构。
+    返回 (cp_type, cp_id)。
+    """
+    from models import Business, PartnerRelation, BankAccount
+    from logic.constants import CounterpartType, PartnerRelationType
+
+    # 优先：直接从实际付款账户的归属确定对手方
+    if payer_account_id:
+        bank_acc = session.query(BankAccount).get(payer_account_id)
+        if bank_acc and bank_acc.owner_type:
+            # owner_type: 'customer' / 'partner' / 'supplier' / 'ourselves'
+            owner_type_map = {
+                AccountOwnerType.CUSTOMER: CounterpartType.CUSTOMER,
+                AccountOwnerType.PARTNER: CounterpartType.PARTNER,
+                AccountOwnerType.SUPPLIER: CounterpartType.SUPPLIER,
+            }
+            mapped = owner_type_map.get(bank_acc.owner_type)
+            if mapped and bank_acc.owner_id:
+                return mapped, bank_acc.owner_id
+
+    # 兜底：根据 business 的合作方结构推断
+    if not vc or not vc.business_id:
+        return None, None
+
+    biz_id = vc.business_id
+    rels = session.query(PartnerRelation).filter(
+        PartnerRelation.owner_type == "business",
+        PartnerRelation.owner_id == biz_id,
+        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+        PartnerRelation.ended_at == None
+    ).all()
+
+    if len(rels) == 1:
+        return CounterpartType.PARTNER, rels[0].partner_id
+
+    biz = session.query(Business).get(biz_id)
+    if biz and biz.customer_id:
+        return CounterpartType.CUSTOMER, biz.customer_id
+
+    return None, None
+
 def process_cash_flow_finance(session, cash_flow_id):
     from logic.services import get_cashflow_finance_context
     ctx = get_cashflow_finance_context(session, cash_flow_id)
@@ -218,18 +293,24 @@ def process_cash_flow_finance(session, cash_flow_id):
             if pre_amt > 0: entries.append({"level1": AccountLevel1.PREPAYMENT, "cp_type": cp_type, "cp_id": cp_id, "debit": pre_amt, "summary": "计入预付"})
             entries.append(get_money_entry(cf.amount, is_income=False, summary=f"支付资金 ({cf.type})"))
     elif cf.type == CashFlowType.DEPOSIT:
+        dep_cp_type, dep_cp_id = _get_deposit_party(session, vc, cf.payer_account_id)
         if is_income:
             entries.append(get_money_entry(cf.amount, is_income=True, summary="收到押金"))
-            entries.append({"level1": AccountLevel1.DEPOSIT_PAYABLE, "cp_type": cp_type, "cp_id": cp_id, "credit": cf.amount, "summary": "押金入账"})
+            if dep_cp_type and dep_cp_id:
+                entries.append({"level1": AccountLevel1.DEPOSIT_PAYABLE, "cp_type": dep_cp_type, "cp_id": dep_cp_id, "credit": cf.amount, "summary": "押金入账"})
         else:
-            entries.append({"level1": AccountLevel1.DEPOSIT_RECEIVABLE, "cp_type": cp_type, "cp_id": cp_id, "debit": cf.amount, "summary": "支付押金"})
+            if dep_cp_type and dep_cp_id:
+                entries.append({"level1": AccountLevel1.DEPOSIT_RECEIVABLE, "cp_type": dep_cp_type, "cp_id": dep_cp_id, "debit": cf.amount, "summary": "支付押金"})
             entries.append(get_money_entry(cf.amount, is_income=False, summary="支付押金"))
     elif cf.type == CashFlowType.RETURN_DEPOSIT:
+        dep_cp_type, dep_cp_id = _get_deposit_party(session, vc, cf.payer_account_id)
         if is_income:
             entries.append(get_money_entry(cf.amount, is_income=True, summary="收回押金"))
-            entries.append({"level1": AccountLevel1.DEPOSIT_RECEIVABLE, "cp_type": cp_type, "cp_id": cp_id, "credit": cf.amount, "summary": "收回押金冲减"})
+            if dep_cp_type and dep_cp_id:
+                entries.append({"level1": AccountLevel1.DEPOSIT_RECEIVABLE, "cp_type": dep_cp_type, "cp_id": dep_cp_id, "credit": cf.amount, "summary": "收回押金冲减"})
         else:
-            entries.append({"level1": AccountLevel1.DEPOSIT_PAYABLE, "cp_type": cp_type, "cp_id": cp_id, "debit": cf.amount, "summary": "退还押金"})
+            if dep_cp_type and dep_cp_id:
+                entries.append({"level1": AccountLevel1.DEPOSIT_PAYABLE, "cp_type": dep_cp_type, "cp_id": dep_cp_id, "debit": cf.amount, "summary": "退还押金"})
             entries.append(get_money_entry(cf.amount, is_income=False, summary="转账退押金"))
     elif cf.type == CashFlowType.PENALTY:
         if is_income:
@@ -260,7 +341,8 @@ def process_cash_flow_finance(session, cash_flow_id):
             entries.append({"level1": AccountLevel1.AP, "cp_type": cp_type, "cp_id": cp_id, "debit": cf.amount, "summary": "冲抵核销应付"})
             entries.append({"level1": AccountLevel1.PREPAYMENT, "cp_type": cp_type, "cp_id": cp_id, "credit": cf.amount, "summary": "扣减预付冲抵"})
     if entries:
-        record_entries(session, voucher_no, vc.id if vc else None, "CashFlow", cash_flow_id, entries, cf.transaction_date)
+        record_entries(session, voucher_no, vc.id if vc else None, "CashFlow", cash_flow_id, entries,
+                      cf.transaction_date, business_id=vc.business_id if vc else None)
         cf.finance_triggered = True
 
 def save_voucher(data, filename):
@@ -274,7 +356,8 @@ def update_report(voucher):
     if os.path.exists(report_path):
         try:
             with open(report_path, 'r', encoding='utf-8') as f: report = json.load(f)
-        except: pass
+        except Exception as e:
+            logger.warning(f"Failed to load existing report: {e}")
     ts_str = voucher.get("timestamp")
     dt = datetime.fromisoformat(ts_str) if ts_str else datetime.now()
     month = dt.strftime("%Y-%m")
@@ -287,6 +370,13 @@ def update_report(voucher):
             },
             "vouchers": []
         }
+
+    # 幂等去重 by voucher_no
+    voucher_no = voucher.get("voucher_no")
+    existing_vnos = {v.get("voucher_no") for v in report[month]["vouchers"]}
+    if voucher_no and voucher_no in existing_vnos:
+        return  # 已存在，跳过追加
+
     report[month]["vouchers"].append(voucher)
     s = report[month]["summary"]
     for entry in voucher.get("entries", []):

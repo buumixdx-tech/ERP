@@ -47,6 +47,25 @@ object AccountConfig {
     /** 营业外支出-罚金 */
     const val NON_OP_COST_PENALTY = "营业外支出-罚金"
 
+    // ==================== 物流财务专用科目 ====================
+
+    /** 固定资产-原值 */
+    const val FIXED_ASSET = "固定资产-原值"
+
+    /** 库存商品 */
+    const val INVENTORY = "库存商品"
+
+    /** 主营业务收入 */
+    const val SALES_REVENUE = "主营业务收入"
+
+    /** 销售费用 */
+    const val SALES_EXPENSE = "销售费用"
+
+    // ==================== 通用常量 ====================
+
+    /** 最小交易金额阈值（用于浮点数比较） */
+    const val MIN_AMOUNT_THRESHOLD = 0.01
+
     // ==================== 分录条目 ====================
 
     /**

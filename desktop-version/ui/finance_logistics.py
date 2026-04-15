@@ -1,6 +1,6 @@
 import streamlit as st
 
-from models import get_session
+from models import get_session, SKU
 from logic.state_machine import logistics_state_machine, virtual_contract_state_machine
 from logic.finance import finance_module
 from logic.inventory import inventory_module
@@ -228,7 +228,7 @@ def _get_account_identity_html(session, acc):
         owner_name = "闪饮业务中心 (我方)"
         role_label = "我方"
         role_color = "#2ECC71" # Green
-    elif acc['owner_type'] == AccountOwnerType.OTHER:
+    elif acc['owner_type'] == AccountOwnerType.PARTNER:
         obj = get_external_partner_by_id(acc['owner_id'])
         owner_name = obj['name'] if obj else f"合作伙伴ID:{acc['owner_id']}"
         role_label = "伙伴"
@@ -340,6 +340,10 @@ def show_logistics_page():
                     if st.button("初始化物流方案建议", key=f"init_log_{vc['id']}", type="primary"):
                         suggested_rows = []
 
+                        # 格式化 raw_items 为可读字符串
+                        def _format_raw_items(items: list) -> str:
+                            return " | ".join([f"{item.get('sku_name', '未知')}×{item.get('qty', 0)}" for item in items])
+
                         # 1. Advanced Material Supply format - group by destination AND source warehouse
                         if vc['type'] == VCType.MATERIAL_SUPPLY:
                             vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
@@ -390,10 +394,20 @@ def show_logistics_page():
                                         "发货点位名称": src_point,
                                         "发货地址": source_addr,
                                         "发货联系电话": source_phone or "",
-                                        "raw_items": group["items"]
+                                        "raw_items": group["items"],
+                                        "raw_items_display": _format_raw_items(group["items"])
                                     })
                             elif vc_elems:
                                 # 新结构：elements[{shipping_point_id, receiving_point_id, sku_id, qty, ...}]
+                                # 批量查询SKU名称
+                                sku_ids = list(set(e.get("sku_id") for e in vc_elems if e.get("sku_id")))
+                                sku_map = {}
+                                if sku_ids:
+                                    session = get_session()
+                                    skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+                                    sku_map = {s.id: s.name for s in skus}
+                                    session.close()
+
                                 shipment_groups = {}
                                 for e in vc_elems:
                                     sp_id = e.get("shipping_point_id")
@@ -422,7 +436,7 @@ def show_logistics_page():
                                         }
                                     shipment_groups[group_key]["items"].append({
                                         "sku_id": e.get("sku_id"),
-                                        "sku_name": e.get("sku_name") or e.get("name", "未知"),
+                                        "sku_name": sku_map.get(e.get("sku_id")) or e.get("sku_name") or e.get("name") or f"SKU{e.get('sku_id')}",
                                         "qty": int(e.get("qty", 0))
                                     })
                                 for group in shipment_groups.values():
@@ -436,7 +450,8 @@ def show_logistics_page():
                                         "发货点位名称": group["发货点位名称"],
                                         "发货地址": group["发货地址"],
                                         "发货联系电话": group["发货联系电话"] or "",
-                                        "raw_items": group["items"]
+                                        "raw_items": group["items"],
+                                        "raw_items_display": _format_raw_items(group["items"])
                                     })
 
                         # 2. Return Order format - group by destination warehouse
@@ -447,6 +462,15 @@ def show_logistics_page():
                                 vc_elems = vc['elements'].get("return_items", []) if vc['elements'] else []
 
                             if vc_elems:
+                                # 批量查询SKU名称
+                                sku_ids = list(set(item.get("sku_id") for item in vc_elems if item.get("sku_id")))
+                                sku_map = {}
+                                if sku_ids:
+                                    session = get_session()
+                                    skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+                                    sku_map = {s.id: s.name for s in skus}
+                                    session.close()
+
                                 return_groups = {}
                                 for item in vc_elems:
                                     # 新结构：shipping_point_id / receiving_point_id；旧结构：point_name / receiving_point_name
@@ -466,7 +490,7 @@ def show_logistics_page():
                                         return_groups[group_key] = []
                                     return_groups[group_key].append({
                                         "sku_id": item.get("sku_id"),
-                                        "sku_name": item.get("sku_name") or item.get("name", "未知"),
+                                        "sku_name": sku_map.get(item.get("sku_id")) or item.get("sku_name") or item.get("name") or f"SKU{item.get('sku_id')}",
                                         "qty": item.get("qty")
                                     })
 
@@ -522,85 +546,115 @@ def show_logistics_page():
                                     "发货点位名称": src_pt,
                                     "发货地址": s_addr,
                                     "发货联系电话": s_phone or "",
-                                    "raw_items": items
+                                    "raw_items": items,
+                                    "raw_items_display": _format_raw_items(items)
                                 })
 
                         # 3. 设备/库存采购 - 按收货点位分组
-                        elif vc['type'] in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT] and target_items:
-                            groups = {}
-                            for item in target_items:
-                                pid = item.get("point_id")
-                                if pid not in groups: groups[pid] = []
-                                # items 只保留 sku_id, sku_name, qty
-                                groups[pid].append({
-                                    "sku_id": item.get("sku_id"),
-                                    "sku_name": item.get("sku_name"),
-                                    "qty": item.get("qty")
-                                })
+                        elif vc['type'] in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
+                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            if vc_elems:
+                                # 批量查询SKU名称
+                                sku_ids = list(set(item.get("sku_id") for item in vc_elems if item.get("sku_id")))
+                                sku_map = {}
+                                if sku_ids:
+                                    session = get_session()
+                                    skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+                                    sku_map = {s.id: s.name for s in skus}
+                                    session.close()
 
-                            for pid, g_items in groups.items():
-                                p_obj = get_point_by_id(pid) if pid else None
-                                p_name = p_obj['name'] if p_obj else f"{SystemConstants.UNKNOWN}点位"
-                                p_addr = (p_obj.get('receiving_address') or p_obj['address']) if p_obj else "地址不详"
-                                p_phone = p_obj.get('contact_info', {}).get('phone') if p_obj else None
-                                suggested_rows.append({
-                                    "快递单号": f"EXP{pd.Timestamp.now().strftime('%m%d%H%M')}{len(suggested_rows)}",
-                                    "收货点位Id": pid,
-                                    "收货点位名称": p_name,
-                                    "收货地址": p_addr,
-                                    "收货联系电话": p_phone or "",
-                                    "发货点位Id": None,
-                                    "发货点位名称": "",
-                                    "发货地址": "",
-                                    "发货联系电话": "",
-                                    "raw_items": g_items
-                                })
+                                groups = {}
+                                for item in vc_elems:
+                                    pid = item.get("point_id")
+                                    if pid not in groups: groups[pid] = []
+                                    sku_id = item.get("sku_id")
+                                    sku_name = sku_map.get(sku_id) or item.get("sku_name") or item.get("name") or f"SKU{sku_id}"
+                                    groups[pid].append({
+                                        "sku_id": sku_id,
+                                        "sku_name": sku_name,
+                                        "qty": item.get("qty")
+                                    })
+
+                                for pid, g_items in groups.items():
+                                    p_obj = get_point_by_id(pid) if pid else None
+                                    p_name = p_obj['name'] if p_obj else f"{SystemConstants.UNKNOWN}点位"
+                                    p_addr = (p_obj.get('receiving_address') or p_obj['address']) if p_obj else "地址不详"
+                                    p_phone = p_obj.get('contact_info', {}).get('phone') if p_obj else None
+                                    suggested_rows.append({
+                                        "快递单号": f"EXP{pd.Timestamp.now().strftime('%m%d%H%M')}{len(suggested_rows)}",
+                                        "收货点位Id": pid,
+                                        "收货点位名称": p_name,
+                                        "收货地址": p_addr,
+                                        "收货联系电话": p_phone or "",
+                                        "发货点位Id": None,
+                                        "发货点位名称": "",
+                                        "发货地址": "",
+                                        "发货联系电话": "",
+                                        "raw_items": g_items,
+                                        "raw_items_display": _format_raw_items(g_items)
+                                    })
 
                         # 4. 物料采购 - 按入库点位分组
-                        elif vc['type'] == VCType.MATERIAL_PROCUREMENT and target_items:
-                            point_groups = {}
+                        elif vc['type'] == VCType.MATERIAL_PROCUREMENT:
+                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            if vc_elems:
+                                # 批量查询SKU名称
+                                sku_ids = list(set(item.get("sku_id") for item in vc_elems if item.get("sku_id")))
+                                sku_map = {}
+                                if sku_ids:
+                                    session = get_session()
+                                    skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+                                    sku_map = {s.id: s.name for s in skus}
+                                    session.close()
 
-                            for item in target_items:
-                                # 兼容性处理：优先取归一化后的 point_name，再取原始的 warehouse
-                                point = item.get("point_name") or item.get("pointName") or item.get("warehouse") or SystemConstants.DEFAULT_POINT
+                                point_groups = {}
+                                # 收集所有发货点ID（通常一致）
+                                sp_id = None
+                                for item in vc_elems:
+                                    if sp_id is None:
+                                        sp_id = item.get("shipping_point_id")
+                                    rp_id = item.get("receiving_point_id")
+                                    if rp_id:
+                                        rp_point = get_point_by_id(rp_id)
+                                        point_name = rp_point['name'] if rp_point else f"点位-{rp_id}"
+                                    else:
+                                        point_name = item.get("point_name") or item.get("pointName") or SystemConstants.DEFAULT_POINT
+                                    if point_name not in point_groups:
+                                        point_groups[point_name] = {"point_id": rp_id, "items": []}
+                                    sku_id = item.get("sku_id")
+                                    sku_name = sku_map.get(sku_id) or item.get("sku_name") or item.get("name") or f"SKU{sku_id}"
+                                    point_groups[point_name]["items"].append({
+                                        "sku_id": sku_id,
+                                        "sku_name": sku_name,
+                                        "qty": item.get("qty")
+                                    })
 
-                                if point not in point_groups:
-                                    point_groups[point] = []
-                                # items 只保留 sku_id, sku_name, qty
-                                point_groups[point].append({
-                                    "sku_id": item.get("sku_id"),
-                                    "sku_name": item.get("sku_name"),
-                                    "qty": item.get("qty")
-                                })
+                                # 获取发货点信息
+                                sp_point = get_point_by_id(sp_id) if sp_id else None
+                                sp_name = sp_point['name'] if sp_point else ""
+                                sp_addr = (sp_point.get('receiving_address') or sp_point['address']) if sp_point else ""
+                                sp_phone = sp_point.get('contact_info', {}).get('phone') if sp_point else ""
 
-                            # 为每个点位生成一个快递单
-                            for point, items in point_groups.items():
-                                # 查询点位地址
-                                wh_pts = get_points_for_ui(search_keyword=point.split(' ')[0], limit=1)
-                                wh_point = wh_pts[0] if wh_pts else None
-                                if wh_point:
-                                    p_id = wh_point['id']
-                                    p_name = wh_point['name']
-                                    p_addr = wh_point.get('receiving_address') or wh_point['address']
-                                    p_phone = wh_point.get('contact_info', {}).get('phone')
-                                else:
-                                    p_id = None
-                                    p_name = point
-                                    p_addr = "请填写收货地址"
-                                    p_phone = None
+                                # 为每个点位生成一个快递单
+                                for point_name, group_data in point_groups.items():
+                                    p_id = group_data["point_id"]
+                                    p_point = get_point_by_id(p_id) if p_id else None
+                                    p_addr = (p_point.get('receiving_address') or p_point['address']) if p_point else "请填写收货地址"
+                                    p_phone = p_point.get('contact_info', {}).get('phone') if p_point else None
 
-                                suggested_rows.append({
-                                    "快递单号": f"EXP{pd.Timestamp.now().strftime('%m%d%H%M')}{len(suggested_rows)}",
-                                    "收货点位Id": p_id,
-                                    "收货点位名称": p_name,
-                                    "收货地址": p_addr,
-                                    "收货联系电话": p_phone or "",
-                                    "发货点位Id": None,
-                                    "发货点位名称": "",
-                                    "发货地址": "",
-                                    "发货联系电话": "",
-                                    "raw_items": items
-                                })
+                                    suggested_rows.append({
+                                        "快递单号": f"EXP{pd.Timestamp.now().strftime('%m%d%H%M')}{len(suggested_rows)}",
+                                        "收货点位Id": p_id,
+                                        "收货点位名称": point_name,
+                                        "收货地址": p_addr,
+                                        "收货联系电话": p_phone or "",
+                                        "发货点位Id": sp_id,
+                                        "发货点位名称": sp_name,
+                                        "发货地址": sp_addr,
+                                        "发货联系电话": sp_phone or "",
+                                        "raw_items": group_data["items"],
+                                        "raw_items_display": _format_raw_items(group_data["items"])
+                                    })
 
                         st.session_state[f"edit_eo_{vc['id']}"] = suggested_rows
                         st.rerun()
@@ -624,7 +678,8 @@ def show_logistics_page():
                                 "发货点位名称": st.column_config.TextColumn("发货点位"),
                                 "发货地址": st.column_config.TextColumn("发货地址"),
                                 "发货联系电话": st.column_config.TextColumn("发货电话"),
-                                "raw_items": None
+                                "raw_items": None,
+                                "raw_items_display": st.column_config.TextColumn("SKU明细", help="SKU名称和数量")
                             },
                             key=f"eo_editor_{vc['id']}"
                         )
@@ -691,7 +746,7 @@ def show_logistics_page():
                             c_f1, c_f2 = st.columns(2)
                             new_tn = c_f1.text_input("单号", value=o['tracking_number'])
                             new_pname = c_f2.text_input("点位", value=addr_data.get("收货点位名称", ""))
-                            new_addr = st.text_input("详细地址", value=addr_data.get("address", ""))
+                            new_addr = st.text_input("详细地址", value=addr_data.get("收货地址") or addr_data.get("发货地址") or "")
 
                             c_col1, c_col2 = st.columns([1, 4])
                             if c_col1.form_submit_button("保存", type="primary"):
@@ -722,7 +777,7 @@ def show_logistics_page():
                             status_icon = "bi-check-circle"
 
                         addr_data = o.get('address_info') or {}
-                        addr_str = addr_data.get("address", "未知地址")
+                        addr_str = addr_data.get("收货地址") or addr_data.get("发货地址") or addr_data.get("address") or "未知地址"
                         p_name = addr_data.get("收货点位名称") or addr_data.get("发货点位名称") or "未知点位"
                         
                         items_str = format_item_list_preview(o.get('items')) if o.get('items') else "无明细"
@@ -905,7 +960,7 @@ def show_logistics_page():
         <div>
             <div style='color: #a0aec0; font-size: 11px; font-weight: bold; text-transform: uppercase;'>送达点位</div>
             <div style='font-size: 13px; color: #2d3436; font-weight: 500;'>{addr_info.get("收货点位名称") or addr_info.get("发货点位名称") or "未知点位"}</div>
-            <div style='font-size: 12px; color: #718096; margin-top: 2px; line-height: 1.4; max-width: 300px;'>{addr_info.get("address", "无详细地址")}</div>
+            <div style='font-size: 12px; color: #718096; margin-top: 2px; line-height: 1.4; max-width: 300px;'>{addr_info.get("收货地址") or addr_info.get("发货地址") or "无详细地址"}</div>
         </div>
         <div>
             <div style='color: #a0aec0; font-size: 11px; font-weight: bold; text-transform: uppercase;'>包含物品</div>

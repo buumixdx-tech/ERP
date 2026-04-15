@@ -22,7 +22,7 @@ from logic.vc.actions import (
     create_stock_procurement_vc_action,
     create_material_supply_vc_action,
     create_return_vc_action,
-    allocate_inventory_action,
+    create_inventory_allocation_action,
 )
 from logic.vc.schemas import (
     CreateProcurementVCSchema, CreateMatProcurementVCSchema,
@@ -149,7 +149,7 @@ def _create_supplier(session, id, name, category):
 
 def _create_sc(session, id, supplier_id, sc_type, pricing):
     sc = SupplyChain(
-        id=id, supplier_id=supplier_id, supplier_name=f"supplier_{supplier_id}",
+        id=id, supplier_id=supplier_id,
         type=sc_type, pricing_config=pricing,
     )
     session.add(sc)
@@ -680,7 +680,7 @@ class TestInventoryAllocationFullFlow:
             elements=elems,
             description="库存拨付测试",
         )
-        result = allocate_inventory_action(db_session, payload)
+        result = create_inventory_allocation_action(db_session, payload)
         assert result.success, f"拨付VC创建失败: {result.error}"
         vc_id = result.data["vc_id"]
         db_session.flush()

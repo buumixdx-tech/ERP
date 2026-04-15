@@ -4,7 +4,7 @@ from .actions import (
     create_sku_action, update_skus_action, delete_skus_action,
     create_supplier_action, update_suppliers_action, delete_suppliers_action,
     create_partner_action, update_partners_action, delete_partners_action,
-    create_bank_account_action, update_bank_accounts_action, delete_bank_accounts_action
+    create_partner_relation_action, delete_partner_relations_action,
 )
 from .queries import (
     get_customers_for_ui as get_customers,
@@ -13,11 +13,13 @@ from .queries import (
     get_points_for_ui as get_points,
     get_partners_for_ui as get_partners,
     get_bank_accounts_for_ui as get_bank_accounts,
-    get_partner_by_id, get_bank_account_by_id, get_system_constants
+    get_partner_by_id, get_bank_account_by_id, get_system_constants,
+    get_partner_relations,
+    get_partner_detail_for_ui
 )
 from .schemas import (
     CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema, DeleteMasterDataSchema,
-    BankAccountSchema
+    PartnerRelationSchema
 )
 
 __all__ = [
@@ -36,6 +38,8 @@ __all__ = [
     'create_partner_action',
     'update_partners_action',
     'delete_partners_action',
+    'create_partner_relation_action',
+    'delete_partner_relations_action',
     'get_customers',
     'get_suppliers',
     'get_skus',
@@ -45,14 +49,13 @@ __all__ = [
     'get_partner_by_id',
     'get_bank_account_by_id',
     'get_system_constants',
+    'get_partner_relations',
+    'get_partner_detail_for_ui',
     'CustomerSchema',
     'PointSchema',
     'SupplierSchema',
     'SKUSchema',
     'PartnerSchema',
+    'PartnerRelationSchema',
     'DeleteMasterDataSchema',
-    'BankAccountSchema',
-    'create_bank_account_action',
-    'update_bank_accounts_action',
-    'delete_bank_accounts_action',
 ]

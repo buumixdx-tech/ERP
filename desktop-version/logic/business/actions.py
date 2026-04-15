@@ -128,7 +128,12 @@ def advance_business_stage_action(session: Session, payload: AdvanceBusinessStag
             else:
                 target_c_id = existing_c.id
             
-            new_details["contract_id"] = target_c_id
+            contracts = new_details.get("contracts", [])
+            contracts.append({
+                "id": target_c_id,
+                "is_primary": len(contracts) == 0,
+            })
+            new_details["contracts"] = contracts
             
         biz.details = new_details
         attributes.flag_modified(biz, 'details')

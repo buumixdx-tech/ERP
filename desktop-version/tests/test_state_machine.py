@@ -205,3 +205,100 @@ class TestStatusTransitionValidation:
         # Then: 状态不应改变
         db_session.refresh(sample_virtual_contract)
         assert sample_virtual_contract.subject_status == old_status
+
+
+class TestStateMachineEventEmission:
+    """状态机事件派发测试 — 验证 emit_event 被正确调用"""
+
+    def test_vc_goods_cleared_event_emitted(self, db_session, sample_virtual_contract):
+        """✅ 货款结清时发出 VC_GOODS_CLEARED 事件"""
+        from logic.constants import SystemEventType, SystemAggregateType
+        from models import SystemEvent
+
+        # Given: VC 货款全部结清
+        sample_virtual_contract.elements = {"total_amount": 5000}
+        sample_virtual_contract.deposit_info = {"should_receive": 0}
+        db_session.flush()
+
+        # 创建全额货款流水
+        cf = CashFlow(
+            virtual_contract_id=sample_virtual_contract.id,
+            type=CashFlowType.FULFILLMENT,
+            amount=5000,
+            transaction_date=datetime.now()
+        )
+        db_session.add(cf)
+        db_session.flush()
+
+        # When
+        state_machine.virtual_contract_state_machine(
+            sample_virtual_contract.id, 'cash_flow', cf.id, session=db_session
+        )
+
+        # Then: VC_GOODS_CLEARED 事件应被写入 SystemEvent 表
+        db_session.flush()
+        events = db_session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == sample_virtual_contract.id,
+            SystemEvent.event_type == SystemEventType.VC_GOODS_CLEARED
+        ).all()
+        assert len(events) == 1
+        assert events[0].payload.get("type") == "income"
+
+    def test_vc_deposit_cleared_event_emitted(self, db_session, sample_virtual_contract):
+        """✅ 押金结清时发出 VC_DEPOSIT_CLEARED 事件"""
+        from logic.constants import SystemEventType
+        from models import SystemEvent
+
+        # Given: VC 应退押金为 1000（> EPSILON），押金流水 1000 使其结清
+        sample_virtual_contract.elements = {"total_amount": 0}
+        sample_virtual_contract.deposit_info = {"should_receive": 1000}
+        db_session.flush()
+
+        # 创建押金流水（1000 = 应退金额，结清）
+        cf = CashFlow(
+            virtual_contract_id=sample_virtual_contract.id,
+            type=CashFlowType.DEPOSIT,
+            amount=1000,
+            transaction_date=datetime.now()
+        )
+        db_session.add(cf)
+        db_session.flush()
+
+        # When
+        state_machine.virtual_contract_state_machine(
+            sample_virtual_contract.id, 'cash_flow', cf.id, session=db_session
+        )
+
+        # Then: VC_DEPOSIT_CLEARED 事件应被写入
+        db_session.flush()
+        events = db_session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == sample_virtual_contract.id,
+            SystemEvent.event_type == SystemEventType.VC_DEPOSIT_CLEARED
+        ).all()
+        assert len(events) == 1
+
+    def test_vc_overall_finish_emits_status_transition_event(
+        self, db_session, sample_virtual_contract
+    ):
+        """✅ VC 总体状态变为 FINISH 时发出 VC_STATUS_TRANSITION 事件"""
+        from logic.constants import SystemEventType
+        from models import SystemEvent
+
+        # Given: 标的和资金状态都完成
+        sample_virtual_contract.subject_status = SubjectStatus.FINISH
+        sample_virtual_contract.cash_status = CashStatus.FINISH
+        db_session.flush()
+
+        # When
+        state_machine.virtual_contract_state_machine(
+            sample_virtual_contract.id, None, None, session=db_session
+        )
+
+        # Then: VC_STATUS_TRANSITION 事件应被写入
+        db_session.flush()
+        events = db_session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == sample_virtual_contract.id,
+            SystemEvent.event_type == SystemEventType.VC_STATUS_TRANSITION
+        ).all()
+        assert len(events) == 1
+        assert events[0].payload.get("to") == VCStatus.FINISH

@@ -6,6 +6,7 @@ import com.shanyin.erp.domain.model.*
 import com.shanyin.erp.domain.repository.LogisticsRepository
 import com.shanyin.erp.domain.repository.MaterialInventoryRepository
 import com.shanyin.erp.domain.repository.VirtualContractRepository
+import com.shanyin.erp.domain.usecase.finance.engine.AccountConfig
 import com.shanyin.erp.domain.usecase.finance.engine.AccountResolver
 import kotlinx.coroutines.flow.first
 import javax.inject.Inject
@@ -74,8 +75,8 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 // 借: 固定资产-原值, 贷: 应付账款-设备款
                 createJournalPair(
                     logisticsId = logistics.id,
-                    debitAccount = "固定资产-原值",
-                    creditAccount = "应付账款-设备款",
+                    debitAccount = AccountConfig.FIXED_ASSET,
+                    creditAccount = AccountConfig.AP_EQUIPMENT,
                     amount = vc.depositInfo.totalAmount,
                     transactionDate = transactionDate,
                     summary = "设备采购入库 ${vc.description ?: ""} VC#${vcId}",
@@ -87,8 +88,8 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 // 借: 库存商品, 贷: 应付账款-物料款
                 createJournalPair(
                     logisticsId = logistics.id,
-                    debitAccount = "库存商品",
-                    creditAccount = "应付账款-物料款",
+                    debitAccount = AccountConfig.INVENTORY,
+                    creditAccount = AccountConfig.AP_MATERIAL,
                     amount = vc.depositInfo.totalAmount,
                     transactionDate = transactionDate,
                     summary = "物料采购入库 ${vc.description ?: ""} VC#${vcId}",
@@ -101,8 +102,8 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 // 借: 应收账款-客户, 贷: 主营业务收入
                 createJournalPair(
                     logisticsId = logistics.id,
-                    debitAccount = "应收账款-客户",
-                    creditAccount = "主营业务收入",
+                    debitAccount = AccountConfig.AR_CUSTOMER,
+                    creditAccount = AccountConfig.SALES_REVENUE,
                     amount = vc.depositInfo.totalAmount,
                     transactionDate = transactionDate,
                     summary = "物料供应确认收入 ${vc.description ?: ""} VC#${vcId}",
@@ -112,12 +113,12 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 // 第2组：结转销售成本（Desktop: items_cost > 0 时写入）
                 // 计算销货成本：从 MaterialInventory 按 SKU 查找加权平均采购价
                 val itemsCost = calculateSupplyCost(vc)
-                if (itemsCost > 0.01) {
+                if (itemsCost > AccountConfig.MIN_AMOUNT_THRESHOLD) {
                     // 借: 主营业务成本, 贷: 库存商品
                     createJournalPair(
                         logisticsId = logistics.id,
-                        debitAccount = "主营业务成本",
-                        creditAccount = "库存商品",
+                        debitAccount = AccountConfig.COST_OF_GOODS,
+                        creditAccount = AccountConfig.INVENTORY,
                         amount = itemsCost,
                         transactionDate = transactionDate,
                         summary = "结转物料销售成本 VC#${vcId}",
@@ -146,13 +147,17 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
      * 如果 MaterialInventory 中无记录，则使用 vc.elements 的 unitPrice（简化）
      */
     private suspend fun calculateSupplyCost(vc: VirtualContract): Double {
-        if (vc.elements.isEmpty()) return 0.0
+        val validElements = vc.elements.filter { it.quantity > AccountConfig.MIN_AMOUNT_THRESHOLD }
+        if (validElements.isEmpty()) return 0.0
+
+        // 批量查询所有 SKU 的库存，避免 N+1 查询
+        val skuIds = validElements.map { it.skuId }
+        val inventories = materialInventoryRepo.getBySkuIds(skuIds).associateBy { it.skuId }
 
         var totalCost = 0.0
-        for (element in vc.elements) {
-            // 尝试从 MaterialInventory 读取加权平均采购价
-            val inventory = materialInventoryRepo.getBySkuId(element.skuId)
-            val costPrice = if (inventory != null && inventory.averagePrice > 0.01) {
+        for (element in validElements) {
+            val inventory = inventories[element.skuId]
+            val costPrice = if (inventory != null && inventory.averagePrice > AccountConfig.MIN_AMOUNT_THRESHOLD) {
                 inventory.averagePrice
             } else {
                 // 降级：用 vc.elements 的 unitPrice（此为供应单价，非采购成本）
@@ -162,6 +167,18 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
             totalCost += element.quantity * costPrice
         }
         return totalCost
+    }
+
+    /**
+     * 安全解析 LogisticsBearer 枚举，避免 DB 中的非法值导致崩溃
+     * 默认返回 SENDER（与 Desktop 行为一致）
+     */
+    private fun safeBearer(value: String?): LogisticsBearer {
+        return try {
+            value?.let { LogisticsBearer.valueOf(it) } ?: LogisticsBearer.SENDER
+        } catch (e: IllegalArgumentException) {
+            LogisticsBearer.SENDER
+        }
     }
 
     private suspend fun createCompletedEntries(logistics: Logistics, vc: VirtualContract) {
@@ -174,18 +191,18 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
         val returnDirection = vc.returnDirection?.name ?: return  // 无方向则跳过
         val goodsAmount = vc.goodsAmount
         val logisticsCost = vc.logisticsCost
-        val logisticsBearer = vc.logisticsBearer?.name ?: "SENDER"  // 默认 SENDER 与 Desktop 一致
+        val logisticsBearer = safeBearer(vc.logisticsBearer?.name)
 
         when (returnDirection) {
             "CUSTOMER_TO_US" -> {
                 // 客户退货给我方：冲减收入 + 物样入库 + 物流费处理
 
                 // 第1组：冲减收入（Dr收入, Cr应收）
-                if (goodsAmount > 0.01) {
+                if (goodsAmount > AccountConfig.MIN_AMOUNT_THRESHOLD) {
                     createJournalPair(
                         logisticsId = logistics.id,
-                        debitAccount = "主营业务收入",
-                        creditAccount = "应收账款-客户",
+                        debitAccount = AccountConfig.SALES_REVENUE,
+                        creditAccount = AccountConfig.AR_CUSTOMER,
                         amount = goodsAmount,
                         transactionDate = transactionDate,
                         summary = "退货收入冲减 ${vc.description ?: ""} VC#$vcId",
@@ -197,7 +214,7 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 createLogisticsFeeEntries(
                     logistics = logistics,
                     vcId = vcId,
-                    direction = "CUSTOMER_TO_US",
+                    direction = ReturnDirection.CUSTOMER_TO_US,
                     bearer = logisticsBearer,
                     logisticsCost = logisticsCost,
                     transactionDate = transactionDate
@@ -208,11 +225,11 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 // 我方向供应商退货：冲减库存和应付 + 物流费
 
                 // 第1组：冲减库存（Dr应付, Cr库存）
-                if (goodsAmount > 0.01) {
+                if (goodsAmount > AccountConfig.MIN_AMOUNT_THRESHOLD) {
                     createJournalPair(
                         logisticsId = logistics.id,
-                        debitAccount = "应付账款-设备款",
-                        creditAccount = "库存商品",
+                        debitAccount = AccountConfig.AP_EQUIPMENT,
+                        creditAccount = AccountConfig.INVENTORY,
                         amount = goodsAmount,
                         transactionDate = transactionDate,
                         summary = "退货冲销应付 ${vc.description ?: ""} VC#$vcId",
@@ -224,7 +241,7 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                 createLogisticsFeeEntries(
                     logistics = logistics,
                     vcId = vcId,
-                    direction = "US_TO_SUPPLIER",
+                    direction = ReturnDirection.US_TO_SUPPLIER,
                     bearer = logisticsBearer,
                     logisticsCost = logisticsCost,
                     transactionDate = transactionDate
@@ -245,34 +262,34 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
     private suspend fun createLogisticsFeeEntries(
         logistics: Logistics,
         vcId: Long,
-        direction: String,
-        bearer: String,
+        direction: ReturnDirection,
+        bearer: LogisticsBearer,
         logisticsCost: Double,
         transactionDate: Long
     ) {
-        if (logisticsCost < 0.01) return
+        if (logisticsCost < AccountConfig.MIN_AMOUNT_THRESHOLD) return
 
         when (direction) {
-            "CUSTOMER_TO_US" -> {
+            ReturnDirection.CUSTOMER_TO_US -> {
                 when (bearer) {
-                    "RECEIVER" -> {
+                    LogisticsBearer.RECEIVER -> {
                         // 我方承担运费：Dr 销售费用, Cr 应收账款-客户（应收客户物流费补偿）
                         createJournalPair(
                             logisticsId = logistics.id,
-                            debitAccount = "销售费用",
-                            creditAccount = "应收账款-客户",
+                            debitAccount = AccountConfig.SALES_EXPENSE,
+                            creditAccount = AccountConfig.AR_CUSTOMER,
                             amount = logisticsCost,
                             transactionDate = transactionDate,
                             summary = "退货物流费-我方承担 VC#$vcId",
                             vcId = vcId
                         )
                     }
-                    "SENDER" -> {
+                    LogisticsBearer.SENDER -> {
                         // 客户自付：Dr 应收账款-客户, Cr 销售费用（收回代垫款）
                         createJournalPair(
                             logisticsId = logistics.id,
-                            debitAccount = "应收账款-客户",
-                            creditAccount = "销售费用",
+                            debitAccount = AccountConfig.AR_CUSTOMER,
+                            creditAccount = AccountConfig.SALES_EXPENSE,
                             amount = logisticsCost,
                             transactionDate = transactionDate,
                             summary = "退货物流费-客户自付收回 VC#$vcId",
@@ -281,26 +298,26 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
                     }
                 }
             }
-            "US_TO_SUPPLIER" -> {
+            ReturnDirection.US_TO_SUPPLIER -> {
                 when (bearer) {
-                    "SENDER" -> {
+                    LogisticsBearer.SENDER -> {
                         // 我方承担：Dr 销售费用, Cr 应付账款-设备款
                         createJournalPair(
                             logisticsId = logistics.id,
-                            debitAccount = "销售费用",
-                            creditAccount = "应付账款-设备款",
+                            debitAccount = AccountConfig.SALES_EXPENSE,
+                            creditAccount = AccountConfig.AP_EQUIPMENT,
                             amount = logisticsCost,
                             transactionDate = transactionDate,
                             summary = "退货物流费-我方承担 VC#$vcId",
                             vcId = vcId
                         )
                     }
-                    "RECEIVER" -> {
+                    LogisticsBearer.RECEIVER -> {
                         // 代垫供应商：Dr 应付账款-设备款, Cr 销售费用（冲销代垫）
                         createJournalPair(
                             logisticsId = logistics.id,
-                            debitAccount = "应付账款-设备款",
-                            creditAccount = "销售费用",
+                            debitAccount = AccountConfig.AP_EQUIPMENT,
+                            creditAccount = AccountConfig.SALES_EXPENSE,
                             amount = logisticsCost,
                             transactionDate = transactionDate,
                             summary = "退货物流费-代垫供应商 VC#$vcId",
@@ -321,7 +338,7 @@ class ProcessLogisticsFinanceUseCase @Inject constructor(
         summary: String,
         vcId: Long
     ) {
-        if (amount < 0.01) return  // 金额过小时跳过
+        if (amount < AccountConfig.MIN_AMOUNT_THRESHOLD) return
 
         val debitId = accountResolver.resolveId(debitAccount)
             ?: throw IllegalStateException("Finance account not found: $debitAccount. Please seed finance_accounts table.")

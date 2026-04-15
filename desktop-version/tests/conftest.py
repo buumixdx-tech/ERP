@@ -181,16 +181,15 @@ def sample_business(db_session, sample_customer):
 def sample_supply_chain(db_session, sample_supplier):
     """创建测试用供应链数据"""
     from logic.constants import SKUType
-    
+
     sc = SupplyChain(
         supplier_id=sample_supplier.id,
-        supplier_name=sample_supplier.name,
         type=SKUType.EQUIPMENT,
         pricing_config={"测试设备-001": 1000}
     )
     db_session.add(sc)
     db_session.flush()
-    
+
     return sc
 
 

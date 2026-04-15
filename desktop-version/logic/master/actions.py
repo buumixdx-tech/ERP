@@ -1,13 +1,13 @@
 from sqlalchemy.orm import Session
-from models import ChannelCustomer, Point, Supplier, SKU, ExternalPartner, BankAccount
+from models import ChannelCustomer, Point, Supplier, SKU, ExternalPartner, PartnerRelation
 from .schemas import (
     CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema, DeleteMasterDataSchema,
-    BankAccountSchema
+    PartnerRelationSchema
 )
 from logic.base import ActionResult
 from logic.events.dispatcher import emit_event
 from typing import List
-from logic.constants import SystemEventType, SystemAggregateType, BankInfoKey
+from logic.constants import SystemEventType, SystemAggregateType
 
 def create_customer_action(session: Session, payload: CustomerSchema) -> ActionResult:
     try:
@@ -233,51 +233,34 @@ def delete_partners_action(session: Session, payloads: List[DeleteMasterDataSche
         session.rollback()
         return ActionResult(success=False, error=str(e))
 
-def create_bank_account_action(session: Session, payload: BankAccountSchema) -> ActionResult:
+
+def create_partner_relation_action(session: Session, payload: PartnerRelationSchema) -> ActionResult:
     try:
-        new_obj = BankAccount(
+        new_obj = PartnerRelation(
+            partner_id=payload.partner_id,
             owner_type=payload.owner_type,
             owner_id=payload.owner_id,
-            account_info={
-                BankInfoKey.BANK_NAME: payload.bank_name,
-                BankInfoKey.ACCOUNT_NO: payload.account_no
-            },
-            is_default=payload.is_default
+            relation_type=payload.relation_type,
+            remark=payload.remark or ""
         )
         session.add(new_obj)
         session.flush()
-        emit_event(session, SystemEventType.MASTER_CREATED, SystemAggregateType.BANK_ACCOUNT, new_obj.id, {"account_no": payload.account_no})
         session.commit()
-        return ActionResult(success=True, message="银行账户创建成功")
+        return ActionResult(success=True, data={"id": new_obj.id}, message="合作方关系创建成功")
     except Exception as e:
         session.rollback()
         return ActionResult(success=False, error=str(e))
 
-def update_bank_accounts_action(session: Session, payloads: List[BankAccountSchema]) -> ActionResult:
-    try:
-        for p in payloads:
-            obj = session.query(BankAccount).get(p.id)
-            if obj:
-                obj.owner_type = p.owner_type
-                obj.owner_id = p.owner_id
-                obj.account_info = {
-                    BankInfoKey.BANK_NAME: p.bank_name,
-                    BankInfoKey.ACCOUNT_NO: p.account_no
-                }
-                obj.is_default = p.is_default
-        session.commit()
-        return ActionResult(success=True, message="银行账户已更新")
-    except Exception as e:
-        session.rollback()
-        return ActionResult(success=False, error=str(e))
 
-def delete_bank_accounts_action(session: Session, payloads: List[DeleteMasterDataSchema]) -> ActionResult:
+def delete_partner_relations_action(session: Session, payloads: List[DeleteMasterDataSchema]) -> ActionResult:
     try:
         for p in payloads:
-            obj = session.query(BankAccount).get(p.id)
+            obj = session.query(PartnerRelation).get(p.id)
             if obj: session.delete(obj)
         session.commit()
-        return ActionResult(success=True, message="删除成功")
+        return ActionResult(success=True, message="合作方关系删除成功")
     except Exception as e:
         session.rollback()
         return ActionResult(success=False, error=str(e))
+
+

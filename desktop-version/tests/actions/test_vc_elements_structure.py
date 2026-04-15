@@ -10,7 +10,7 @@ from logic.vc import (
     create_return_vc_action,
     create_mat_procurement_vc_action,
     create_stock_procurement_vc_action,
-    allocate_inventory_action,
+    create_inventory_allocation_action,
     CreateProcurementVCSchema,
     CreateMaterialSupplyVCSchema,
     CreateReturnVCSchema,
@@ -39,7 +39,6 @@ def base_data(db_session, sample_customer, sample_supplier):
     # 供应链
     sc = SupplyChain(
         supplier_id=sample_supplier.id,
-        supplier_name=sample_supplier.name,
         type="设备",
         pricing_config={"测试SKU": 1000}
     )
@@ -140,7 +139,7 @@ class TestEquipmentProcurementElements:
         db_session.flush()
 
         # 3. 供应链（用于查找供应商仓库）
-        sc = SupplyChain(supplier_id=supplier.id, supplier_name=supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 
@@ -217,7 +216,7 @@ class TestEquipmentProcurementElements:
         db_session.add_all([cust_wh1, cust_wh2])
         db_session.flush()
 
-        sc = SupplyChain(supplier_id=supplier.id, supplier_name=supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 
@@ -350,7 +349,6 @@ class TestMaterialProcurementElements:
 
         sc = SupplyChain(
             supplier_id=sample_supplier.id,
-            supplier_name=sample_supplier.name,
             type=SKUType.MATERIAL,
             pricing_config={"测试物料A": 5.0}
         )
@@ -460,7 +458,7 @@ class TestMaterialSupplyElements:
         assert_vc_elements_structure(vc, VCType.MATERIAL_SUPPLY, 1)
         elems = vc.elements
         assert "total_amount" in elems
-        assert "payment_terms" not in elems, "物料供应 elements 不应有 payment_terms"
+        assert "payment_terms" in elems, "物料供应 elements 应包含 payment_terms（状态机需要用于 cash_status 演进）"
 
         item = elems["elements"][0]
         # 商业逻辑：shipping_point_id=有库存的仓库, receiving_point_id=客户运营点位
@@ -564,7 +562,7 @@ class TestReturnElements:
         db_session.flush()
 
         # 创建供应链
-        sc = SupplyChain(supplier_id=supplier.id, supplier_name=supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 
@@ -721,7 +719,7 @@ class TestInventoryAllocationElements:
             description="测试库存拨付"
         )
 
-        result = allocate_inventory_action(db_session, payload)
+        result = create_inventory_allocation_action(db_session, payload)
         assert result.success is True, f"库存拨付创建失败: {result.error}"
 
         from models import VirtualContract
@@ -783,7 +781,7 @@ class TestElementsNoRedundancy:
         cust_wh = Point(name="客户仓库A", type="客户仓", customer_id=biz.customer_id)
         db_session.add(cust_wh)
         db_session.flush()
-        sc = SupplyChain(supplier_id=supplier.id, supplier_name=supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 
@@ -829,7 +827,7 @@ class TestElementsNoRedundancy:
         cust_wh = Point(name="客户仓库A", type="客户仓", customer_id=biz.customer_id)
         db_session.add(cust_wh)
         db_session.flush()
-        sc = SupplyChain(supplier_id=supplier.id, supplier_name=supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 

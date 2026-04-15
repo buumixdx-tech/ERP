@@ -14,6 +14,7 @@ class VCElementSchema(BaseModel):
     deposit: float = Field(default=0.0, ge=0, description="单台押金（设备VC有值，物料VC为0）")
     subtotal: float = Field(..., description="小计金额 = qty × price")
     sn_list: List[str] = Field(default_factory=list, description="设备序列号列表（退货/调拨时填写）")
+    addon_business_ids: List[int] = Field(default_factory=list, description="应用的附加业务ID列表（系统自动填充）")
 
     @field_validator('subtotal', mode='before')
     @classmethod

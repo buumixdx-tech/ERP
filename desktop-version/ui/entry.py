@@ -2,14 +2,16 @@ import streamlit as st
 from models import get_session, ChannelCustomer, Point, Supplier, SKU, ExternalPartner, BankAccount
 import pandas as pd
 import streamlit_antd_components as sac
-from logic.constants import PointType, SupplierCategory, SKUType, ExternalPartnerType, AccountOwnerType, BankInfoKey
+from logic.constants import PointType, SupplierCategory, SKUType, ExternalPartnerType, AccountOwnerType, BankInfoKey, PartnerRelationType
 from logic.master import (
     create_customer_action, update_customers_action,
     create_point_action, update_points_action,
     create_supplier_action, update_suppliers_action,
     create_sku_action, update_skus_action,
-    create_partner_action, update_partners_action,
-    CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema
+    create_partner_action, update_partners_action, delete_partners_action,
+    create_partner_relation_action, delete_partner_relations_action,
+    CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema,
+    PartnerRelationSchema, DeleteMasterDataSchema, get_partner_detail_for_ui
 )
 from logic.finance import (
     create_bank_account_action, update_bank_accounts_action,
@@ -175,24 +177,300 @@ def show_entry_page():
 
     elif sel_tab == '外部合作方':
         st.markdown("### <i class='bi bi-briefcase'></i> 外部合作方维护", unsafe_allow_html=True)
-        with st.expander("新增合作方"):
-            with st.form("ext_p_form"):
-                name = st.text_input("名称")
-                p_type = st.selectbox("类型", ExternalPartnerType.ALL_TYPES)
-                if st.form_submit_button("保存合作方"):
-                    result = create_partner_action(session, PartnerSchema(name=name, type=p_type))
-                    if result.success: st.rerun()
-                    else: st.error(result.error)
 
+        # ---- 新增合作方 ----
+        with st.expander("➕ 新增合作方"):
+            with st.form("ext_p_form"):
+                name = st.text_input("名称", placeholder="请输入合作方名称")
+                p_type = st.selectbox("类型", ExternalPartnerType.ALL_TYPES)
+                address = st.text_input("地址", placeholder="请输入地址（可选）")
+                content = st.text_area("备注", placeholder="请输入备注信息（可选）", height=80)
+                if st.form_submit_button("💾 保存合作方"):
+                    if not name:
+                        st.error("请输入合作方名称")
+                    else:
+                        result = create_partner_action(session, PartnerSchema(
+                            name=name, type=p_type, address=address, content=content
+                        ))
+                        if result.success:
+                            st.success("合作方创建成功")
+                            st.rerun()
+                        else:
+                            st.error(result.error)
+
+        # ---- 搜索和筛选 ----
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            search_keyword = st.text_input("🔍 搜索", placeholder="搜索合作方名称...", key="partner_search")
+        with col2:
+            type_filter = st.selectbox("类型筛选", ["全部"] + ExternalPartnerType.ALL_TYPES, key="partner_type_filter")
+
+        # ---- 合作方列表（单选）----
         data = get_partners_for_ui()
-        if data:
-            df = pd.DataFrame([{"ID": p["id"], "名称": p["name"], "类型": p["type"]} for p in data])
-            edited_df = st.data_editor(df, use_container_width=True, disabled=["ID"], key="edit_ext", hide_index=True, column_config={"类型": st.column_config.SelectboxColumn("类型", options=ExternalPartnerType.ALL_TYPES)})
-            if st.button("保存修改", key="save_ext"):
-                payloads = [PartnerSchema(id=int(row["ID"]), name=row["名称"], type=row["类型"]) for _, row in edited_df.iterrows()]
-                result = update_partners_action(session, payloads)
-                if result.success: st.rerun()
-                else: st.error(result.error)
+        if search_keyword:
+            data = [p for p in data if search_keyword.lower() in p.get("name", "").lower()]
+        if type_filter != "全部":
+            data = [p for p in data if p.get("partner_type") == type_filter]
+
+        if not data:
+            st.info("暂无合作方数据，请点击上方「新增合作方」创建")
+        else:
+            # ---- 合作方列表（类似Excel风格，可单选）----
+            st.write("**合作方列表：**")
+
+            # 构建表格数据
+            table_data = []
+            for p in data:
+                table_data.append({
+                    "选择": False,
+                    "ID": p["id"],
+                    "名称": p["name"],
+                    "类型": p.get("partner_type", "") or "",
+                    "地址": (p.get("address", "") or "")[:25] + ("..." if len(p.get("address", "") or "") > 25 else ""),
+                })
+
+            df = pd.DataFrame(table_data)
+
+            # 使用 data_editor 显示（只读，ID不可编辑）
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["ID", "名称", "类型", "地址"],
+                key="partner_list",
+                column_config={
+                    "选择": st.column_config.CheckboxColumn("选择", default=False),
+                    "ID": st.column_config.NumberColumn("ID", disabled=True),
+                    "名称": st.column_config.TextColumn("名称"),
+                    "类型": st.column_config.SelectboxColumn("类型", options=ExternalPartnerType.ALL_TYPES),
+                },
+                num_rows="fixed"
+            )
+
+            # 获取选中的行
+            selected_rows = edited_df[edited_df["选择"] == True]
+            selected_partner_id = int(selected_rows["ID"].iloc[0]) if len(selected_rows) > 0 else None
+
+            # ---- 选中后的详情 ----
+            if selected_partner_id:
+                partner_id = selected_partner_id
+                partner_detail = get_partner_detail_for_ui(partner_id)
+
+                if partner_detail:
+                    st.divider()
+                    st.markdown(f"#### 📋 合作方详情: **{partner_detail['name']}**")
+
+                    # Tabs for detail sections
+                    det_tab = sac.tabs([
+                        sac.TabsItem('基本信息', icon='info-circle'),
+                        sac.TabsItem('银行账户', icon='bank'),
+                        sac.TabsItem('合作关系', icon='link'),
+                    ], align='left', variant='pill', key=f'partner_det_tabs_{partner_id}')
+
+                    # ---- Tab 1: 基本信息 ----
+                    if det_tab == '基本信息':
+                        with st.form(f"partner_basic_{partner_id}", clear_on_submit=False):
+                            col1, col2 = st.columns([1, 1])
+                            with col1:
+                                edit_name = st.text_input("名称", value=partner_detail['name'])
+                                edit_type = st.selectbox("类型", ExternalPartnerType.ALL_TYPES,
+                                    index=ExternalPartnerType.ALL_TYPES.index(partner_detail['type']) if partner_detail['type'] in ExternalPartnerType.ALL_TYPES else 0)
+                            with col2:
+                                edit_address = st.text_input("地址", value=partner_detail.get('address', '') or "")
+                            edit_content = st.text_area("备注", value=partner_detail.get('content', '') or "", height=100)
+
+                            col_save, col_del = st.columns([1, 1])
+                            with col_save:
+                                if st.form_submit_button("💾 保存基本信息"):
+                                    result = update_partners_action(session, [PartnerSchema(
+                                        id=partner_id, name=edit_name, type=edit_type,
+                                        address=edit_address, content=edit_content
+                                    )])
+                                    if result.success:
+                                        st.success("已保存")
+                                        st.rerun()
+                                    else:
+                                        st.error(result.error)
+                            with col_del:
+                                if st.form_submit_button("🗑️ 删除此合作方", type="primary"):
+                                    result = delete_partners_action(session, [DeleteMasterDataSchema(id=partner_id)])
+                                    if result.success:
+                                        st.session_state.selected_partner_id = None
+                                        st.success("已删除")
+                                        st.rerun()
+                                    else:
+                                        st.error(result.error)
+
+                    # ---- Tab 2: 银行账户 ----
+                    elif det_tab == '银行账户':
+                        banks = partner_detail.get('bank_accounts', [])
+
+                        st.write(f"**已有银行账户 ({len(banks)} 个)**")
+                        if banks:
+                            for bank in banks:
+                                with st.expander(f"🏦 {bank['bank_name']} - {bank['account_no'][:4]}****", expanded=False):
+                                    with st.form(f"bank_edit_{bank['id']}", clear_on_submit=False):
+                                        acc_name = st.text_input("开户名称", value=bank['holder_name'])
+                                        bank_name = st.text_input("银行名称", value=bank['bank_name'])
+                                        acc_num = st.text_input("账号", value=bank['account_no'])
+                                        is_def = st.checkbox("默认账户", value=bank['is_default'])
+                                        c1, c2 = st.columns(2)
+                                        with c1:
+                                            if st.form_submit_button("💾 保存"):
+                                                payload = UpdateBankAccountSchema(
+                                                    id=bank['id'],
+                                                    owner_type=AccountOwnerType.PARTNER,
+                                                    owner_id=partner_id,
+                                                    account_info={BankInfoKey.HOLDER_NAME: acc_name, BankInfoKey.BANK_NAME: bank_name, BankInfoKey.ACCOUNT_NO: acc_num},
+                                                    is_default=is_def
+                                                )
+                                                result = update_bank_accounts_action(session, [payload])
+                                                if result.success:
+                                                    st.success("已保存")
+                                                    st.rerun()
+                                                else:
+                                                    st.error(result.error)
+                                        with c2:
+                                            if st.form_submit_button("🗑️ 删除"):
+                                                from logic.master import delete_bank_accounts_action
+                                                result = delete_bank_accounts_action(session, [DeleteMasterDataSchema(id=bank['id'])])
+                                                if result.success:
+                                                    st.success("已删除")
+                                                    st.rerun()
+                                                else:
+                                                    st.error(result.error)
+                        else:
+                            st.info("暂无银行账户")
+
+                        st.divider()
+                        # 新增银行账户
+                        with st.expander("➕ 新增银行账户"):
+                            with st.form(f"bank_new_{partner_id}"):
+                                acc_name = st.text_input("开户名称", placeholder="合作方公司名称")
+                                bank_name = st.text_input("银行名称", placeholder="如：招商银行北京分行")
+                                acc_num = st.text_input("银行账号", placeholder="请输入账号")
+                                is_def = st.checkbox("设为默认账户", value=True)
+                                if st.form_submit_button("💾 保存账户"):
+                                    if not acc_name or not bank_name or not acc_num:
+                                        st.error("请填写完整信息")
+                                    else:
+                                        payload = CreateBankAccountSchema(
+                                            owner_type=AccountOwnerType.PARTNER,
+                                            owner_id=partner_id,
+                                            account_info={BankInfoKey.HOLDER_NAME: acc_name, BankInfoKey.BANK_NAME: bank_name, BankInfoKey.ACCOUNT_NO: acc_num},
+                                            is_default=is_def
+                                        )
+                                        result = create_bank_account_action(session, payload)
+                                        if result.success:
+                                            st.success("账户已添加")
+                                            st.rerun()
+                                        else:
+                                            st.error(result.error)
+
+                    # ---- Tab 3: 合作关系 ----
+                    elif det_tab == '合作关系':
+                        relations = partner_detail.get('relations', [])
+
+                        st.write(f"**已有合作关系 ({len(relations)} 个)**")
+                        if relations:
+                            for rel in relations:
+                                status_label = "✅ 有效" if rel['is_active'] else "❌ 已终止"
+                                with st.expander(f"{rel['relation_type']} → {rel.get('owner_name', rel['owner_type'])} ({status_label})", expanded=False):
+                                    st.write(f"**合作模式**: {rel['relation_type']}")
+                                    st.write(f"**归属主体**: {rel.get('owner_name', '未知')}")
+                                    st.write(f"**建立时间**: {rel['established_at'] or '未知'}")
+                                    st.write(f"**状态**: {status_label}")
+                                    st.write(f"**备注**: {rel.get('remark', '') or '无'}")
+                                    if st.button("🗑️ 删除此关系", key=f"del_rel_{rel['id']}"):
+                                        result = delete_partner_relations_action(session, [DeleteMasterDataSchema(id=rel['id'])])
+                                        if result.success:
+                                            st.success("已删除")
+                                            st.rerun()
+                                        else:
+                                            st.error(result.error)
+                        else:
+                            st.info("暂无合作关系")
+
+                        st.divider()
+                        # 新增合作关系
+                        with st.expander("➕ 新增合作关系"):
+                            # owner_type 在 form 外面，以便切换时能动态更新下属组件
+                            owner_type = st.selectbox("归属主体类型",
+                                ["business", "supply_chain", "ourselves"],
+                                format_func=lambda x: {"business": "业务", "supply_chain": "供应链", "ourselves": "我方"}[x],
+                                key=f"owner_type_{partner_id}"
+                            )
+
+                            # 根据 owner_type 动态加载下拉选项（在 form 外面）
+                            if owner_type == "business":
+                                from logic.business.queries import get_business_list
+                                from logic.constants import BusinessStatus, PartnerRelationType
+                                from models import PartnerRelation
+
+                                businesses = get_business_list()
+
+                                # 过滤掉已结束的业务
+                                ended_statuses = [BusinessStatus.TERMINATED, BusinessStatus.FINISHED, BusinessStatus.PAUSED]
+                                active_businesses = [b for b in businesses if b["status"] not in ended_statuses]
+
+                                # 过滤掉已建立"采购执行"合作关系的业务
+                                _session = get_session()
+                                try:
+                                    procurement_biz_ids = _session.query(PartnerRelation.owner_id).filter(
+                                        PartnerRelation.owner_type == "business",
+                                        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+                                        PartnerRelation.ended_at.is_(None)
+                                    ).all()
+                                    procurement_biz_ids = set([r[0] for r in procurement_biz_ids])
+                                finally:
+                                    _session.close()
+
+                                available_businesses = [b for b in active_businesses if b["id"] not in procurement_biz_ids]
+                                owner_options = {b["id"]: b["customer_name"] for b in available_businesses}
+
+                                if not owner_options:
+                                    st.warning("暂无可关联的业务数据")
+                                    owner_id = None
+                                else:
+                                    owner_id = st.selectbox("选择业务", list(owner_options.keys()),
+                                        format_func=lambda x: owner_options[x],
+                                        key=f"owner_id_biz_{partner_id}")
+                            elif owner_type == "supply_chain":
+                                from logic.supply_chain.queries import get_supply_chains_for_ui
+                                chains = get_supply_chains_for_ui()
+                                owner_options = {c["id"]: c["supplier_name"] for c in chains}
+                                if not owner_options:
+                                    st.warning("暂无供应链协议，请先创建供应链")
+                                    owner_id = None
+                                else:
+                                    owner_id = st.selectbox("选择供应链", list(owner_options.keys()),
+                                        format_func=lambda x: owner_options[x],
+                                        key=f"owner_id_sc_{partner_id}")
+                            else:  # ourselves
+                                st.write("**归属主体**: 闪饮业务中心（我方）")
+                                owner_id = None
+
+                            with st.form(f"rel_new_{partner_id}"):
+                                relation_type = st.selectbox("合作模式", PartnerRelationType.ALL_TYPES)
+                                remark = st.text_area("备注", placeholder="请输入备注信息（可选）")
+
+                                if st.form_submit_button("💾 保存合作关系"):
+                                    if owner_type != "ourselves" and not owner_id:
+                                        st.error("请选择归属主体")
+                                    else:
+                                        payload = PartnerRelationSchema(
+                                            partner_id=partner_id,
+                                            owner_type=owner_type,
+                                            owner_id=owner_id,
+                                            relation_type=relation_type,
+                                            remark=remark
+                                        )
+                                        result = create_partner_relation_action(session, payload)
+                                        if result.success:
+                                            st.success("合作关系已创建")
+                                            st.rerun()
+                                        else:
+                                            st.error(result.error)
                 
     elif sel_tab == '银行账户':
         st.markdown("### <i class='bi bi-bank'></i> 银行账户维护", unsafe_allow_html=True)
@@ -204,7 +482,7 @@ def show_entry_page():
         owner_options = {"[公司] 闪饮自身": (AccountOwnerType.OURSELVES, None)}
         for c in customers: owner_options[f"[客户] {c['name']}"] = (AccountOwnerType.CUSTOMER, c["id"])
         for s in suppliers: owner_options[f"[供应商] {s['name']}"] = (AccountOwnerType.SUPPLIER, s["id"])
-        for p in partners: owner_options[f"[合作方] {p['name']}"] = (AccountOwnerType.OTHER, p["id"])
+        for p in partners: owner_options[f"[合作方] {p['name']}"] = (AccountOwnerType.PARTNER, p["id"])
         
         with st.expander("新增银行账户"):
             with st.form("bank_acc_form"):

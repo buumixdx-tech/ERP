@@ -1,5 +1,5 @@
 from models import CashFlow, VirtualContract, BankAccount, FinancialJournal, FinanceAccount
-from logic.constants import CashFlowType, AccountOwnerType, VCType, AccountLevel1, CounterpartType
+from logic.constants import CashFlowType, AccountOwnerType, VCType, AccountLevel1, CounterpartType, PartnerRelationType
 from sqlalchemy import func
 from datetime import datetime
 
@@ -29,14 +29,25 @@ def apply_offset_to_vc(session, vc):
             sc = session.query(SupplyChain).get(vc.supply_chain_id)
             if sc: party_id = sc.supplier_id
     else:
-        # 供应：我们作为收款方，寻找客户‘预存’在我们这里的余额 (负债类)
-        party_type = CounterpartType.CUSTOMER
+        # 供应：我们作为收款方，寻找客户或合作方’预存’在我们这里的余额 (负债类)
         account_level1 = AccountLevel1.PRE_COLLECTION
+        party_id = None
         if vc.business_id:
-            from models import Business
-            biz = session.query(Business).get(vc.business_id)
-            if biz: party_id = biz.customer_id
-            
+            from models import Business, PartnerRelation
+            rels = session.query(PartnerRelation).filter(
+                PartnerRelation.owner_type == "business",
+                PartnerRelation.owner_id == vc.business_id,
+                PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+                PartnerRelation.ended_at == None
+            ).all()
+            if len(rels) == 1:
+                party_type = CounterpartType.PARTNER
+                party_id = rels[0].partner_id
+            else:
+                party_type = CounterpartType.CUSTOMER
+                biz = session.query(Business).get(vc.business_id)
+                if biz: party_id = biz.customer_id
+
     if not party_id:
         return
 

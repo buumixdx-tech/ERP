@@ -8,11 +8,12 @@
 from typing import List, Dict, Optional, Any
 from sqlalchemy import func, cast, String
 from models import (
-    get_session, SupplyChain, Supplier
+    get_session, SupplyChain, Supplier, SKU
 )
 from logic.constants import (
     SKUType
 )
+from logic.master import get_partner_relations
 
 
 # ============================================================================
@@ -119,16 +120,26 @@ def get_supply_chains_for_ui(
         result = []
         for chain in chains:
             supplier = session.query(Supplier).get(chain.supplier_id)
-            
+
             # 解析定价配置
             pricing_dict = chain.get_pricing_dict() if hasattr(chain, 'get_pricing_dict') else (chain.pricing_config or {})
-            
+
             # 解析结算条款
             payment_terms = chain.payment_terms or {}
-            
+
             # 统计SKU数量
             sku_count = len(pricing_dict)
-            
+
+            # pricing_preview 现在是 sku_id，需要转换为名称用于显示
+            preview_names = []
+            for sku_id_key in list(pricing_dict.keys())[:5]:
+                sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
+                if sku_id_int:
+                    sku_obj = session.query(SKU).get(sku_id_int)
+                    preview_names.append(sku_obj.name if sku_obj else sku_id_key)
+                else:
+                    preview_names.append(sku_id_key)
+
             result.append({
                 "id": chain.id,
                 "supplier_id": chain.supplier_id,
@@ -139,7 +150,7 @@ def get_supply_chains_for_ui(
                 "status": "active",
                 "status_label": "正常",
                 "pricing_count": sku_count,
-                "pricing_preview": list(pricing_dict.keys())[:5],  # 只显示前5个
+                "pricing_preview": preview_names,  # 转换为 SKU 名称用于显示
                 "payment_terms": {
                     "prepayment_ratio": payment_terms.get("prepayment_ratio", 0),
                     "prepayment_ratio_pct": int(payment_terms.get("prepayment_ratio", 0) * 100),
@@ -149,9 +160,14 @@ def get_supply_chains_for_ui(
                 },
                 "contract_id": chain.contract_id,
                 "created_at": "",
-                "updated_at": ""
+                "updated_at": "",
+                "partners": get_partner_relations(
+                    owner_type="supply_chain",
+                    owner_id=chain.id,
+                    active_only=True
+                )
             })
-        
+
         return result
     finally:
         if own_session:
@@ -178,12 +194,21 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
         
         # 解析定价配置
         pricing_dict = chain.get_pricing_dict() if hasattr(chain, 'get_pricing_dict') else (chain.pricing_config or {})
-        
-        # 格式化定价明细
+
+        # 格式化定价明细（pricing_config 的 key 已改为 sku_id，需查询 SKU 名称用于显示）
         pricing_details = []
-        for sku_name, price in pricing_dict.items():
+        sku_name_map = {}
+        for sku_id_key, price in pricing_dict.items():
+            sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
+            if sku_id_int:
+                sku_obj = session.query(SKU).get(sku_id_int)
+                sku_display_name = sku_obj.name if sku_obj else sku_id_key
+                sku_name_map[sku_id_key] = sku_display_name
+            else:
+                sku_display_name = sku_id_key
             pricing_details.append({
-                "sku_name": sku_name,
+                "sku_id": sku_id_int,
+                "sku_name": sku_display_name,
                 "price": price if isinstance(price, (int, float)) else 0,
                 "price_display": f"¥{price:,.2f}" if isinstance(price, (int, float)) else str(price),
                 "is_floating": price == "浮动" if isinstance(price, str) else False
@@ -204,6 +229,7 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
             "status_label": "正常",
             "pricing_config": chain.pricing_config or {},
             "pricing_details": pricing_details,
+            "sku_name_map": sku_name_map,
             "pricing_count": len(pricing_details),
             "payment_terms": {
                 "prepayment_ratio": payment_terms.get("prepayment_ratio", 0),
@@ -215,7 +241,12 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
             "contract_id": chain.contract_id,
             "notes": "",
             "created_at": "",
-            "updated_at": ""
+            "updated_at": "",
+            "partners": get_partner_relations(
+                owner_type="supply_chain",
+                owner_id=chain.id,
+                active_only=True
+            )
         }
     finally:
         session.close()

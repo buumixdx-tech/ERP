@@ -240,7 +240,59 @@ def inventory_module(logistics_id, equipment_sn_json=None, session=None):
                 print(f"DEBUG: Triggering deposit_module for original VC {vc.related_vc_id}")
                 from logic.deposit import deposit_module
                 deposit_module(vc_id=vc.related_vc_id, session=session)
-        
+
+        elif vc.type == VCType.INVENTORY_ALLOCATION:
+            """
+            库存拨付：把我们库存的设备发到客户指定的点位
+            设备本来就是我们的，不新建库存记录，只修改 point_id 和状态变为 OPERATING
+            """
+            orders = session.query(models.ExpressOrder).filter(
+                models.ExpressOrder.logistics_id == logistics_id
+            ).all()
+
+            for o in orders:
+                if not o.items: continue
+                addr_info = o.address_info or {}
+                recv_point_id = addr_info.get("收货点位Id")  # 目标点位
+                send_point_id = addr_info.get("发货点位Id")   # 源点位（必须）
+
+                # 校验发货点位是否存在
+                if not send_point_id:
+                    from logic.base import ActionResult
+                    return ActionResult(success=False, error="库存拨付缺少发货点位信息")
+
+                for item in o.items:
+                    sn = item.get("sn", "-")
+                    if not sn or sn == "-": continue
+
+                    equip = session.query(models.EquipmentInventory).filter(
+                        models.EquipmentInventory.sn == sn
+                    ).first()
+
+                    # 找不到设备记录，报错
+                    if not equip:
+                        from logic.base import ActionResult
+                        return ActionResult(success=False, error=f"设备 SN={sn} 不在库存中，无法进行库存拨付")
+
+                    # 校验设备当前点位与发货点位一致，防止错误操作
+                    if equip.point_id != send_point_id:
+                        from logic.base import ActionResult
+                        return ActionResult(success=False, error=f"设备 SN={sn} 当前不在发货点位，无法进行库存拨付")
+
+                    if recv_point_id:
+                        equip.point_id = recv_point_id
+                    equip.operational_status = OperationalStatus.OPERATING
+                    equip.virtual_contract_id = vc.id
+
+        # === 库存流转（待 INVENTORY_TRANSFER 类型创建后实现）===
+        # elif vc.type == VCType.INVENTORY_TRANSFER:
+        #     """
+        #     库存流转：设备/物料暂存供应商仓，发货到我们自己仓库
+        #     所有权不变更，只修改 point_id
+        #     - 设备：根据 sn 找到设备记录，更新 point_id
+        #     - 物料：根据 sku_id 和仓库，更新 stock_distribution
+        #     """
+
         if not ext_session:
             session.commit()
     except Exception as e:

@@ -61,6 +61,37 @@ class ProcessLogisticsFinanceUseCaseTest {
     // §1 幂等性
     // ========================================================================
 
+    // ========================================================================
+    // §0 safeBearer 防御性枚举解析
+    // ========================================================================
+
+    @Test
+    fun `TC46 - safeBearer returns SENDER for null`() = runTest {
+        coEvery { logisticsRepo.getById(20L) } returns logisticsCompleted
+        val vc = createVC(
+            id = 2L,
+            type = VCType.RETURN,
+            returnDirection = ReturnDirection.CUSTOMER_TO_US,
+            goodsAmount = 0.0,
+            logisticsCost = 100.0,
+            logisticsBearer = null  // null → SENDER fallback
+        )
+        coEvery { vcRepo.getById(2L) } returns vc
+
+        processLogisticsFinance(20L)
+
+        // null bearer → SENDER → Dr 应收账款-客户, Cr 销售费用
+        coVerify {
+            journalDao.insert(match {
+                it.summary?.contains("退货物流费-客户自付收回") == true && it.debit == 100.0
+            })
+        }
+    }
+
+    // ========================================================================
+    // §1 幂等性
+    // ========================================================================
+
     @Test
     fun `TC47 - financeTriggered=true且force=false 跳过`() = runTest {
         val triggeredLogistics = logisticsSigned.copy(financeTriggered = true)
@@ -163,7 +194,7 @@ class ProcessLogisticsFinanceUseCaseTest {
         )
         coEvery { vcRepo.getById(1L) } returns vc
         val matInv = MaterialInventory(id = 1L, skuId = 20L, skuName = "物料X", totalBalance = 100.0, averagePrice = 30.0)
-        coEvery { materialInventoryRepo.getBySkuId(20L) } returns matInv
+        coEvery { materialInventoryRepo.getBySkuIds(listOf(20L)) } returns listOf(matInv)
 
         processLogisticsFinance(10L)
 
@@ -184,7 +215,7 @@ class ProcessLogisticsFinanceUseCaseTest {
             elements = listOf(SkusFormatElement(skuId =20L, skuName = "物料X", quantity = 10, unitPrice = 0.0))
         )
         coEvery { vcRepo.getById(1L) } returns vc
-        coEvery { materialInventoryRepo.getBySkuId(20L) } returns null
+        coEvery { materialInventoryRepo.getBySkuIds(listOf(20L)) } returns emptyList()
 
         processLogisticsFinance(10L)
 

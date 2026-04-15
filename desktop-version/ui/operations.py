@@ -1,7 +1,8 @@
 import streamlit as st
-from models import get_session
+from models import get_session, SKU
 import pandas as pd
 import streamlit_antd_components as sac
+import plotly.graph_objects as go
 from datetime import datetime
 from logic.constants import (
     VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection, CashFlowType,
@@ -11,7 +12,7 @@ from logic.constants import (
 from logic.offset_manager import apply_offset_to_vc
 from logic.services import get_returnable_items, get_sku_agreement_price, validate_inventory_availability, normalize_item_data, format_vc_items_for_display
 from logic.time_rules import RuleManager
-from logic.supply_chain import create_supply_chain_action, CreateSupplyChainSchema
+from logic.supply_chain import create_supply_chain_action, CreateSupplyChainSchema, UpdateSupplyChainSchema, DeleteSupplyChainSchema
 from logic.master import (
     create_customer_action, update_customers_action, delete_customers_action,
     create_point_action, update_points_action, delete_points_action,
@@ -47,15 +48,15 @@ from logic.master.queries import (
     get_equipment_inventory_list, get_material_inventory_list,
     get_warehouse_points, get_sku_map_by_names,
     get_stock_equipment_for_allocation, get_material_stock_for_supply,
-    get_customers_for_ui as get_customers, 
+    get_customers_for_ui as get_customers,
     get_suppliers_for_ui as get_suppliers,
-    get_skus_for_ui as get_skus, 
+    get_skus_for_ui as get_skus,
     get_points_for_ui,
     get_partners_for_ui as get_partners,
     get_bank_accounts_for_ui as get_bank_accounts,
     get_points_by_customer, get_skus_by_names, get_material_inventory_all,
     get_supply_chains_by_type, get_supply_chain_by_id,
-    get_contract_detail
+    get_contract_detail, get_material_movement_timeline,
 )
 from logic.business import (
     create_business_action, update_business_status_action, 
@@ -67,11 +68,22 @@ from logic.vc import (
     create_procurement_vc_action, create_material_supply_vc_action,
     create_return_vc_action, create_mat_procurement_vc_action,
     update_vc_action, delete_vc_action,
-    create_stock_procurement_vc_action, allocate_inventory_action,
+    create_stock_procurement_vc_action, create_inventory_allocation_action,
     CreateProcurementVCSchema, VCItemSchema, CreateMaterialSupplyVCSchema,
     CreateReturnVCSchema, CreateMatProcurementVCSchema,
     CreateStockProcurementVCSchema, AllocateInventorySchema, VCElementSchema
 )
+from logic.addon_business import (
+    create_addon_business_action,
+    update_addon_business_action,
+    deactivate_addon_business_action,
+    get_business_addons,
+    get_active_addons,
+    get_addon_detail,
+)
+from logic.addon_business.queries import sku_exists_in_business, get_original_price_and_deposit
+from logic.addon_business.schemas import CreateAddonSchema, UpdateAddonSchema
+from logic.constants import AddonType, AddonStatus
 
 def _save_procurement_vc(_session, business_id, data):
     """
@@ -127,7 +139,7 @@ def _save_procurement_vc(_session, business_id, data):
         
         return result.data["vc_id"]
     else:
-        st.error(f"Action 执行失败: {result.error}")
+        st.session_state[f"supply_error_{business_id}"] = result.error
         return None
 
 @st.dialog("核心业务：确认设备采购执行单", width="large")
@@ -175,25 +187,23 @@ def confirm_procurement_dialog(session, business_id):
 def _save_material_supply_vc(_session, business_id, data):
     """辅助物料供应保存，通过 Action 执行"""
     order = data['order']
-    # 将 points[].items[] 结构转换为统一的 elements[]
+    # 将 flat items 结构直接映射为 elements（与其他 VC 类型一致）
     elems_payload = []
-    for p in order['points']:
-        p_point_id = p.get('point_id') or 0
-        for i in p.get('items', []):
-            norm = normalize_item_data(i)
-            qty = float(norm.get('qty') or 0)
-            price = float(norm.get('price') or 0)
-            elem = VCElementSchema(
-                shipping_point_id=int(norm.get('shipping_point_id') or 0),
-                receiving_point_id=int(p_point_id),
-                sku_id=int(norm.get('sku_id') or 0),
-                qty=qty,
-                price=price,
-                deposit=0.0,
-                subtotal=qty * price,
-                sn_list=[]
-            )
-            elems_payload.append(elem)
+    for i in order.get('items', []):
+        norm = normalize_item_data(i)
+        qty = float(norm.get('qty') or 0)
+        price = float(norm.get('price') or 0)
+        elem = VCElementSchema(
+            shipping_point_id=int(norm.get('shipping_point_id') or 0),
+            receiving_point_id=int(norm.get('receiving_point_id') or 0),
+            sku_id=int(norm.get('sku_id') or 0),
+            qty=qty,
+            price=price,
+            deposit=0.0,
+            subtotal=qty * price,
+            sn_list=[]
+        )
+        elems_payload.append(elem)
 
     payload = CreateMaterialSupplyVCSchema(
         business_id=business_id,
@@ -218,7 +228,7 @@ def _save_material_supply_vc(_session, business_id, data):
         
         return result.data["vc_id"]
     else:
-        st.error(f"Action 执行失败: {result.error}")
+        st.session_state[f"supply_error_{business_id}"] = result.error
         return None
 
 @st.dialog("确认物料供应执行单", width="large")
@@ -233,6 +243,12 @@ def confirm_material_supply_dialog(session, business_id):
         return
 
     st.write("请核对以下物料供应清单及规则。确认后将立即在各个发货点位扣减相应物料库存并生成应收。")
+
+    # 显示之前的错误信息
+    err_key = f"supply_error_{business_id}"
+    if err_key in st.session_state:
+        st.error(st.session_state[err_key])
+        del st.session_state[err_key]
     
     order = data['order']
     c1, c2, c3 = st.columns(3)
@@ -241,19 +257,18 @@ def confirm_material_supply_dialog(session, business_id):
     c3.metric("品类总数", f"{len(order['summary']['sku_summary_list'])} 类")
 
     st.markdown("#### <i class='bi bi-truck'></i> 发货点位明细", unsafe_allow_html=True)
-    # 扁平化展示所有明细
+    # 扁平化展示所有明细（统一从 flat items 读取）
     flat_items = []
-    for p in order['points']:
-        for i in p['items']:
-            ni = normalize_item_data(i)
-            flat_items.append({
-                "收货点位": p.get('point_name') or p.get('pointName'),
-                "物料名称": ni["sku_name"],
-                "数量": ni["qty"],
-                "单价": ni["price"],
-                "金额": ni["qty"] * ni["price"],
-                "发货点位": ni.get("shipping_point_name") or SystemConstants.DEFAULT_POINT
-            })
+    for item in order.get('items', []):
+        ni = normalize_item_data(item)
+        flat_items.append({
+            "收货点位": ni.get("receiving_point_name") or SystemConstants.UNKNOWN,
+            "物料名称": ni["sku_name"],
+            "数量": ni["qty"],
+            "单价": ni["price"],
+            "金额": ni["qty"] * ni["price"],
+            "发货点位": ni.get("shipping_point_name") or SystemConstants.DEFAULT_POINT
+        })
     st.table(pd.DataFrame(flat_items))
 
     # 展示追加规则
@@ -262,10 +277,11 @@ def confirm_material_supply_dialog(session, business_id):
     c_sub1, c_sub2 = st.columns([2, 1])
     with c_sub1:
         if st.button("最终确认：提交供应并出库", type="primary", use_container_width=True):
-            _save_material_supply_vc(session, business_id, data)
-            st.success("服务核算单已成功下达！")
-            st.session_state[f"show_supply_confirm_{business_id}"] = False
-            st.rerun()
+            vc_id = _save_material_supply_vc(session, business_id, data)
+            if vc_id:
+                st.success("服务核算单已成功下达！")
+                st.session_state[f"show_supply_confirm_{business_id}"] = False
+                st.rerun()
 
     with c_sub2:
         if st.button("返回修改", use_container_width=True):
@@ -307,6 +323,7 @@ def _save_mat_procurement_vc(_session, sc_id, data):
     if result.success:
         # 清理 UI 状态
         st.session_state["show_mat_proc_confirm"] = False
+        st.session_state["mat_proc_confirm_dialog_open"] = False
         if "temp_mat_proc_data" in st.session_state: del st.session_state["temp_mat_proc_data"]
         if "mat_proc_df" in st.session_state: del st.session_state["mat_proc_df"]
         if "mat_proc_extra_rules" in st.session_state: del st.session_state["mat_proc_extra_rules"]
@@ -317,17 +334,19 @@ def _save_mat_procurement_vc(_session, sc_id, data):
         
         return result.data["vc_id"]
     else:
-        st.error(f"Action 执行失败: {result.error}")
+        st.session_state[f"supply_error_{business_id}"] = result.error
         return None
 
 @st.dialog("确认物料采购执行单", width="large")
 def confirm_mat_procurement_dialog(session, sc_id):
+    st.session_state["mat_proc_confirm_dialog_open"] = True
     sc = get_supply_chain_detail(sc_id)
     data = st.session_state.get(f"temp_mat_proc_data")
     if not data:
         st.error("数据丢失")
         if st.button("返回"):
             st.session_state[f"show_mat_proc_confirm"] = False
+            st.session_state["mat_proc_confirm_dialog_open"] = False
             st.rerun()
         return
 
@@ -342,9 +361,9 @@ def confirm_mat_procurement_dialog(session, sc_id):
         "sku_name": "品类名称",
         "qty": "数量",
         "price": "单价",
-        "point_name": "存放点位"
+        "receiving_point_name": "存放点位"
     })
-    st.table(df_preview[["品类名称", "数量", "单价", "存放仓库"]])
+    st.table(df_preview[["品类名称", "数量", "单价", "存放点位"]])
 
     # 展示追加规则
     # 移除追加规则预览
@@ -359,6 +378,7 @@ def confirm_mat_procurement_dialog(session, sc_id):
     with c_sub2:
         if st.button("返回修改", use_container_width=True):
             st.session_state["show_mat_proc_confirm"] = False
+            st.session_state["mat_proc_confirm_dialog_open"] = False
             st.rerun()
 
 
@@ -416,7 +436,7 @@ def _save_return_vc(_session, target_vc_id, data):
         
         return result.data["vc_id"]
     else:
-        st.error(f"Action 执行失败: {result.error}")
+        st.session_state[f"supply_error_{business_id}"] = result.error
         return None
 @st.dialog("确认退货执行单召回", width="large")
 def confirm_return_dialog(session, target_vc_id):
@@ -479,6 +499,299 @@ def confirm_return_dialog(session, target_vc_id):
             st.session_state[f"show_return_confirm_{target_vc_id}"] = False
             st.rerun()
 
+# --- 附加业务管理模块 ---
+def show_addon_management_page(session):
+    """附加业务管理顶级页面"""
+    st.markdown("### <i class='bi bi-plus-circle'></i> 附加业务管理", unsafe_allow_html=True)
+
+    # ------------------------------------------------------------------
+    # 业务选择（仅 ACTIVE）
+    # ------------------------------------------------------------------
+    all_biz = get_businesses_for_execution()
+    # 只保留 ACTIVE
+    businesses = [b for b in all_biz if b["status"] == BusinessStatus.ACTIVE]
+    if not businesses:
+        st.info("当前无进行中的业务（ACTIVE 阶段），请先创建或推进业务至 ACTIVE。")
+        return
+
+    biz_options = {str(b["id"]): f"{b['id']} - {b.get('customer_name', '未知')}" for b in businesses}
+    sel_biz_id = st.selectbox(
+        "选择业务",
+        options=list(biz_options.keys()),
+        format_func=lambda bid: biz_options[bid],
+        key="addon_biz_selector",
+    )
+    business_id = int(sel_biz_id)
+    biz = get_business_detail(business_id)
+
+    if biz['status'] != BusinessStatus.ACTIVE:
+        st.warning(f"⚠️ 业务当前阶段「{biz['status']}」不允许管理附加项，仅可在 ACTIVE 阶段操作。")
+        return
+
+    # ------------------------------------------------------------------
+    # 模式管理：None / "create" / "edit"
+    # ------------------------------------------------------------------
+    MODE_KEY = f"addon_mode_{business_id}"
+    EDIT_ID_KEY = f"addon_edit_id_{business_id}"
+    mode = st.session_state.get(MODE_KEY, None)
+
+    # ------------------------------------------------------------------
+    # addon 列表
+    # ------------------------------------------------------------------
+    active = get_active_addons(session, business_id)
+    all_addons = get_business_addons(session, business_id, include_expired=True)
+
+    list_tab_label = sac.tabs([
+        sac.TabsItem(f"生效中 ({len(active)})", icon="lightning-charge"),
+        sac.TabsItem(f"全部记录 ({len(all_addons)})", icon="list-ul"),
+    ], align="left", variant="capsule", key=f"addon_listtabs_{business_id}")
+
+    display_list = active if list_tab_label.startswith("生效") else all_addons
+
+    sku_map = {str(s.id): s.name for s in session.query(SKU).all()}
+
+    def _addon_row(a):
+        sku_name = sku_map.get(str(a.sku_id), f"SKU-{a.sku_id}") if a.sku_id else "—"
+        period = (
+            f"{a.start_date.strftime('%Y-%m-%d')} ~ "
+            f"{a.end_date.strftime('%Y-%m-%d') if a.end_date else '永久'}"
+        )
+        return {
+            "ID": a.id,
+            "类型": a.addon_type,
+            "SKU": sku_name,
+            "覆盖单价": f"¥{a.override_price:.2f}" if a.override_price is not None else "—",
+            "覆盖押金": f"¥{a.override_deposit:.2f}" if a.override_deposit is not None else "—",
+            "有效期": period,
+            "状态": a.status,
+        }
+
+    sel_addon_id = None
+    if display_list:
+        df = pd.DataFrame([_addon_row(a) for a in display_list])
+        sel = st.dataframe(
+            df, use_container_width=True, hide_index=True,
+            key=f"addon_list_{business_id}_{list_tab_label}",
+            selection_mode="single-row",
+            on_select="rerun",
+        )
+        selected_rows = sel.get("selection", {}).get("selectedRows", [])
+        sel_addon_id = selected_rows[0]["ID"] if selected_rows else None
+    else:
+        st.info("暂无附加业务政策。")
+
+    # ------------------------------------------------------------------
+    # 模式切换 + 操作按钮
+    # ------------------------------------------------------------------
+    if mode == "create":
+        st.markdown("---")
+        _render_addon_create_form(session, business_id, biz)
+    elif mode == "edit" and sel_addon_id is not None:
+        st.markdown("---")
+        _render_addon_edit_form(session, business_id, sel_addon_id)
+    else:
+        col_new, col_edit, col_deact = st.columns(3)
+        with col_new:
+            if st.button("➕ 新建附加项", key=f"addon_new_btn_{business_id}"):
+                st.session_state[MODE_KEY] = "create"
+                st.rerun()
+        with col_edit:
+            edit_disabled = sel_addon_id is None
+            if st.button("✏️ 编辑选中项", key=f"addon_edit_btn_{business_id}", disabled=edit_disabled):
+                st.session_state[MODE_KEY] = "edit"
+                st.session_state[EDIT_ID_KEY] = sel_addon_id
+                st.rerun()
+        with col_deact:
+            deact_disabled = sel_addon_id is None
+            if st.button("🚫 失效选中项", key=f"addon_deact_btn_{business_id}", disabled=deact_disabled):
+                result = deactivate_addon_business_action(session, sel_addon_id)
+                if result.success:
+                    st.success("✅ 已失效")
+                    st.rerun()
+                else:
+                    st.error(f"❌ 失败：{result.error}")
+
+
+def _render_addon_create_form(session, business_id, biz):
+    """渲染新建 addon 表单"""
+    st.markdown("**新建附加项**")
+
+    col_type, col_sku = st.columns(2)
+    with col_type:
+        sel_addon_type = st.selectbox(
+            "附加项类型",
+            options=[AddonType.PRICE_ADJUST, AddonType.NEW_SKU],
+            format_func=lambda x: {
+                AddonType.PRICE_ADJUST: "价格调整 (PRICE_ADJUST)",
+                AddonType.NEW_SKU: "新增 SKU (NEW_SKU)",
+            }[x],
+            key=f"new_addon_type_{business_id}",
+        )
+
+    with col_sku:
+        pricing = biz.get("pricing", {})
+        pricing_sku_ids = set(str(k) for k in pricing.keys() if str(k).isdigit())
+
+        if sel_addon_type == AddonType.PRICE_ADJUST:
+            avail = {sid: pricing[sid].get("price", 0) or 0 for sid in pricing_sku_ids}
+            if not avail:
+                st.warning("该业务下暂无定价 SKU，无法添加价格调整附加项。")
+                sel_sku_id = None
+                sel_sku_type = None
+            else:
+                sku_map = {str(s.id): s.name for s in session.query(SKU).all()}
+                sel_sku_id = st.selectbox(
+                    "选择 SKU",
+                    options=[int(sid) for sid in avail],
+                    format_func=lambda sid: sku_map.get(str(sid), f"SKU-{sid}"),
+                    key=f"new_addon_sku_{business_id}",
+                )
+                sel_sku_type = session.query(SKU).get(sel_sku_id).type_level1
+        else:
+            all_skus = {str(s.id): s.name for s in session.query(SKU).all()}
+            avail = {sid: name for sid, name in all_skus.items() if sid not in pricing_sku_ids}
+            if not avail:
+                st.warning("没有可新增的 SKU（所有 SKU 已在业务定价范围内）。")
+                sel_sku_id = None
+                sel_sku_type = None
+            else:
+                sel_sku_id = st.selectbox(
+                    "选择 SKU（新增）",
+                    options=[int(sid) for sid in avail],
+                    format_func=lambda sid: avail.get(str(sid), f"SKU-{sid}"),
+                    key=f"new_addon_sku_{business_id}",
+                )
+                sel_sku_type = session.query(SKU).get(sel_sku_id).type_level1
+
+    # 日期
+    col_start, col_end = st.columns(2)
+    with col_start:
+        start_date = st.date_input("开始日期", value=datetime.now().date(),
+                                    key=f"new_addon_start_{business_id}")
+    with col_end:
+        end_date = st.date_input("结束日期（留空 = 永久）", value=None,
+                                  key=f"new_addon_end_{business_id}")
+
+    # 覆盖值
+    override_val = None
+    if sel_addon_type in [AddonType.PRICE_ADJUST, AddonType.NEW_SKU] and sel_sku_type:
+        if sel_sku_type == "设备":
+            override_label = "覆盖押金（元）"
+        elif sel_sku_type == "物料":
+            override_label = "覆盖单价（元）"
+        else:
+            override_label = "覆盖单价或押金"
+        override_val = st.number_input(override_label, min_value=0.0, format="%.2f",
+                                       value=None, key=f"new_addon_override_{business_id}")
+
+    remark = st.text_area("备注（可选）", placeholder="选填",
+                          key=f"new_addon_remark_{business_id}")
+
+    col_submit, col_cancel = st.columns([1, 4])
+    with col_submit:
+        if st.button("创建", type="primary", key=f"new_addon_submit_{business_id}"):
+            if sel_addon_type in [AddonType.PRICE_ADJUST, AddonType.NEW_SKU] and not sel_sku_id:
+                st.error("请先选择 SKU")
+            else:
+                start_dt = datetime.combine(start_date, datetime.min.time())
+                end_dt = datetime.combine(end_date, datetime.min.time()) if end_date else None
+                override_price = override_val if sel_sku_type == "物料" else None
+                override_deposit = override_val if sel_sku_type == "设备" else None
+                payload = CreateAddonSchema(
+                    business_id=business_id,
+                    addon_type=sel_addon_type,
+                    sku_id=sel_sku_id,
+                    override_price=override_price,
+                    override_deposit=override_deposit,
+                    start_date=start_dt,
+                    end_date=end_dt,
+                    remark=remark or None,
+                )
+                result = create_addon_business_action(session, payload)
+                if result.success:
+                    st.success(f"✅ {result.message}（ID: {result.data['addon_id']}）")
+                    st.session_state[f"addon_mode_{business_id}"] = None
+                    st.rerun()
+                else:
+                    st.error(f"❌ 创建失败：{result.error}")
+    with col_cancel:
+        if st.button("取消", key=f"new_addon_cancel_{business_id}"):
+            st.session_state[f"addon_mode_{business_id}"] = None
+            st.rerun()
+
+
+def _render_addon_edit_form(session, business_id, addon_id):
+    """渲染编辑 addon 表单"""
+    st.markdown(f"**编辑附加项 #{addon_id}**")
+
+    detail = get_addon_detail(session, addon_id)
+    if not detail or detail.business_id != business_id:
+        st.error("附加项不存在或不属于当前业务。")
+        return
+
+    sku_map = {str(s.id): s.name for s in session.query(SKU).all()}
+    sku_name = sku_map.get(str(detail.sku_id), f"SKU-{detail.sku_id}") if detail.sku_id else "—"
+
+    st.caption(f"类型：{detail.addon_type} | SKU：{sku_name}")
+
+    col_price, col_deposit = st.columns(2)
+    with col_price:
+        new_price = st.number_input(
+            "覆盖单价（元）",
+            value=detail.override_price if detail.override_price is not None else 0.0,
+            key=f"edit_price_{addon_id}",
+        )
+    with col_deposit:
+        new_deposit = st.number_input(
+            "覆盖押金（元）",
+            value=detail.override_deposit if detail.override_deposit is not None else 0.0,
+            key=f"edit_deposit_{addon_id}",
+        )
+
+    col_start, col_end = st.columns(2)
+    with col_start:
+        new_start = st.date_input(
+            "开始日期",
+            value=detail.start_date.date(),
+            key=f"edit_start_{addon_id}",
+        )
+    with col_end:
+        new_end = st.date_input(
+            "结束日期",
+            value=detail.end_date.date() if detail.end_date else None,
+            key=f"edit_end_{addon_id}",
+        )
+
+    new_remark = st.text_area(
+        "备注",
+        value=detail.remark or "",
+        key=f"edit_remark_{addon_id}",
+    )
+
+    col_save, col_close = st.columns([1, 4])
+    with col_save:
+        if st.button("💾 保存", type="primary", key=f"save_addon_{addon_id}"):
+            payload = UpdateAddonSchema(
+                addon_id=addon_id,
+                override_price=new_price if new_price != 0.0 else None,
+                override_deposit=new_deposit if new_deposit != 0.0 else None,
+                start_date=datetime.combine(new_start, datetime.min.time()),
+                end_date=datetime.combine(new_end, datetime.min.time()) if new_end else None,
+                remark=new_remark or None,
+            )
+            result = update_addon_business_action(session, payload)
+            if result.success:
+                st.success("✅ 更新成功")
+                st.session_state[f"addon_mode_{business_id}"] = None
+                st.rerun()
+            else:
+                st.error(f"❌ 更新失败：{result.error}")
+    with col_close:
+        if st.button("关闭", key=f"close_edit_{addon_id}"):
+            st.session_state[f"addon_mode_{business_id}"] = None
+            st.rerun()
+
+
 # --- 业务概览模块 ---
 def show_business_overview(session):
     """业务全局概览 - 已重构为使用 queries 层"""
@@ -538,17 +851,19 @@ def show_business_overview(session):
                         st.info(f"**客户主体**: {biz['customer']['name'] if biz['customer'] else 'N/A'}")
                         st.write(f"**当前状态**: `{biz['status']}`")
                         st.write(f"**创建日期**: {biz['created_at']}")
-                    
+
                     with col2:
                         st.write("**商务定价配置 (部分)**")
                         pricing = biz['pricing']
                         if pricing:
+                            sku_name_map = {str(s.id): s.name for s in session.query(SKU).all()}
                             p_df_list = []
-                            for k, v in pricing.items():
+                            for sku_id_key, v in pricing.items():
+                                sku_display_name = sku_name_map.get(str(sku_id_key), f"SKU-{sku_id_key}")
                                 if isinstance(v, dict):
-                                    p_df_list.append({"品类": k, "执行价": v.get("price", 0), "押金": v.get("deposit", 0)})
+                                    p_df_list.append({"品类": sku_display_name, "执行价": v.get("price", 0), "押金": v.get("deposit", 0)})
                                 else:
-                                    p_df_list.append({"品类": k, "执行价": v, "押金": 0})
+                                    p_df_list.append({"品类": sku_display_name, "执行价": v, "押金": 0})
                             st.dataframe(pd.DataFrame(p_df_list), hide_index=True)
                         else:
                             st.caption("暂无定价协议数据")
@@ -569,7 +884,7 @@ def show_business_overview(session):
                         st.dataframe(vc_df, use_container_width=True, hide_index=True)
                     else:
                         st.info("该业务下暂无任何执行中的虚拟合同。")
-                
+
                 elif sel_b_tab == '数据修正与管理':
                     st.warning("⚠️ 此处修改直接影响数据库底层数据，请谨慎操作")
                     
@@ -626,22 +941,23 @@ def show_business_overview(session):
 
 def show_business_management_page():
     st.markdown("<h2 style='font-size: 20px;'><i class='bi bi-briefcase'></i> 业务管理</h2>", unsafe_allow_html=True)
-    
-    # 强制将 Tabs 样式改为 Enterprise Skin 风格
-    # 使用 container 包裹以避免样式污染
+
     with st.container():
         sel_tab = sac.tabs([
             sac.TabsItem('业务概览', icon='eye'),
             sac.TabsItem('客户导入', icon='person-plus'),
+            sac.TabsItem('附加业务', icon='plus-circle'),
         ], align='center', variant='outline', key='business_mgmt_tabs')
-        
+
         session = get_session()
-        
+
         if sel_tab == '业务概览':
             show_business_overview(session)
         elif sel_tab == '客户导入':
             show_customer_inclusion()
-        
+        elif sel_tab == '附加业务':
+            show_addon_management_page(session)
+
         session.close()
 
 def show_supply_chain_management_page():
@@ -704,6 +1020,7 @@ def show_supply_chain_list():
                     sac.TabsItem('价格协议明细', icon='tag'),
                     sac.TabsItem('结算条款详情', icon='file-earmark-ruled'),
                     sac.TabsItem('关联合同信息', icon='journal-text'),
+                    sac.TabsItem('数据修正与管理', icon='pencil-square'),
                     sac.TabsItem('规则管理', icon='shield-check'),
                 ], align='center', variant='outline', key=f"sc_det_tabs_{sc['id']}")
                 
@@ -711,9 +1028,11 @@ def show_supply_chain_list():
                     st.write("**SKU 协议单价约定**")
                     items_data = []
                     pricing_dict = sc.get('pricing_config', {})
-                    for sku_name, price in pricing_dict.items():
+                    sku_name_map = sc.get('sku_name_map', {})  # {sku_id: sku_name}
+                    for sku_id_key, price in pricing_dict.items():
+                        sku_display_name = sku_name_map.get(sku_id_key, sku_id_key)
                         items_data.append({
-                            "品类名称": sku_name,
+                            "品类名称": sku_display_name,
                             "协议单价": price if price != "浮动" else 0.0,
                             "定价模式": "固定协议价" if price != "浮动" else "按次浮动"
                         })
@@ -753,6 +1072,54 @@ def show_supply_chain_list():
                                 st.code(f)
                     else:
                         st.info("该供应链协议未关联正式合同记录")
+
+                elif sel_det_tab == '数据修正与管理':
+                    st.warning("⚠️ 此处修改直接影响数据库底层数据，请谨慎操作")
+
+                    import json
+
+                    with st.form(f"sc_edit_form_{sc['id']}"):
+                        st.markdown("**供应链协议数据 (JSON 格式)**")
+                        st.caption("包含定价配置、结算条款等")
+
+                        pricing_json = json.dumps(sc.get('pricing_config', {}), indent=4, ensure_ascii=False) if sc.get('pricing_config') else "{}"
+                        new_pricing_str = st.text_area("修改定价配置", value=pricing_json, height=200, label_visibility="collapsed")
+
+                        payment_json = json.dumps(sc.get('payment_terms', {}), indent=4, ensure_ascii=False) if sc.get('payment_terms') else "{}"
+                        new_payment_str = st.text_area("修改结算条款", value=payment_json, height=200, label_visibility="collapsed")
+
+                        c1, c2 = st.columns([1, 1])
+                        if c1.form_submit_button("确认并更新供应链数据", type="primary"):
+                            try:
+                                payload = UpdateSupplyChainSchema(
+                                    id=sc['id'],
+                                    supplier_name=sc['supplier_name'],
+                                    type=sc['type'],
+                                    pricing_config=json.loads(new_pricing_str),
+                                    payment_terms=json.loads(new_payment_str)
+                                )
+                                from logic.supply_chain.actions import update_supply_chain_action
+                                result = update_supply_chain_action(session, payload)
+                                if result.success:
+                                    st.success(result.message)
+                                    st.rerun()
+                                else:
+                                    st.error(result.error)
+                            except json.JSONDecodeError as e:
+                                st.error(f"JSON 格式错误: {e}")
+                            except Exception as e:
+                                st.error(f"更新失败: {e}")
+
+                        # 删除协议（仅当无关联合同时）
+                        if c2.form_submit_button("删除此协议"):
+                            from logic.supply_chain.actions import delete_supply_chain_action
+                            delete_payload = DeleteSupplyChainSchema(id=sc['id'])
+                            result = delete_supply_chain_action(session, delete_payload)
+                            if result.success:
+                                st.success(result.message)
+                                st.rerun()
+                            else:
+                                st.error(result.error)
 
                 elif sel_det_tab == '规则管理':
                     from ui.rule_components import show_rule_manager_tab
@@ -862,7 +1229,10 @@ def show_supply_chain_import():
             pricing_config = {}
             for _, row in edited_df.iterrows():
                 if row["品类"]:
-                    pricing_config[row["品类"]] = row["协议单价"] if row["协议单价"] > 0 else "浮动"
+                    sku_name = row["品类"]
+                    sku = session.query(SKU).filter(SKU.name == sku_name).first()
+                    if sku:
+                        pricing_config[str(sku.id)] = row["协议单价"] if row["协议单价"] > 0 else "浮动"
             
             payload = CreateSupplyChainSchema(
                 supplier_id=sid,
@@ -954,27 +1324,73 @@ def show_inventory_dashboard_component():
 
     elif sel_tab == '物料库存':
         st.markdown("#### <i class='bi bi-box-seam'></i> 存量物料统计", unsafe_allow_html=True)
-        
+
         col1, col2 = st.columns([3, 1])
-        col1.write("")  # Spacer
+        col1.write("")
         if col2.button("刷新数据", key="refresh_mat_inv"):
             st.rerun()
-        
-        # 使用 queries 层获取物料列表
+
         mat_data = get_material_inventory_list()
-        if mat_data:
-            mat_df = pd.DataFrame(mat_data)
-            st.dataframe(
-                mat_df, 
-                use_container_width=True,
-                column_config={
-                    "库存分布": st.column_config.TextColumn("库存分布 (JSON)", width="large"),
-                    "平均单价": st.column_config.NumberColumn("平均单价", format="¥%.2f"),
-                    "总余额": st.column_config.NumberColumn("总余额", format="%.1f")
-                }
-            )
-        else:
+        if not mat_data:
             st.info("目前没有物料库存记录")
+        else:
+            # 仓库颜色映射
+            WH_COLOR_MAP = {
+                "成都仓": "#4CAF50",
+                "天津仓": "#2196F3",
+                "深圳仓": "#FF9800",
+                "廊坊仓": "#9C27B0",
+                "北京仓": "#F44336",
+                "上海仓": "#00BCD4",
+                "广州仓": "#FF5722",
+                "武汉仓": "#795548",
+                "西安仓": "#607D8B",
+                "重庆仓": "#F06292",
+            }
+            DEFAULT_COLOR = "#90a4ae"
+
+            for item in mat_data:
+                dist: dict = item.get("库存分布") or {}
+                if not dist:
+                    continue
+
+                total = item.get("总余额") or 0
+                sku_name = item.get("物料名称") or "未知物料"
+                sku_id = item.get("物料ID")
+
+                # 仓库分布文字
+                dist_items = []
+                for wh, qty in dist.items():
+                    pct = qty / total * 100 if total > 0 else 0
+                    warning = " ⚠️" if qty < 10 else ""
+                    dist_items.append(f"**{wh}{warning}**：{qty} 件（{pct:.0f}%）")
+                dist_html = "<br>".join(dist_items)
+
+                with st.container():
+                    st.markdown("---")
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        st.markdown(f"**<span style='font-size:16px;'>{sku_name}</span>**", unsafe_allow_html=True)
+                    with col2:
+                        st.markdown(f"**<span style='font-size:16px;color:#1976D2;'>总库存：{total}</span>**", unsafe_allow_html=True)
+                    st.markdown(dist_html, unsafe_allow_html=True)
+                    with st.expander("查看入库/出库时间线"):
+                        movements = get_material_movement_timeline(sku_id=sku_id)
+                        if not movements:
+                            st.info("暂无出入库记录")
+                        else:
+                            rows = []
+                            for m in movements:
+                                ts = m.get("timestamp")
+                                date_str = ts.strftime("%Y-%m-%d %H:%M") if ts else "-"
+                                rows.append({
+                                    "日期": date_str,
+                                    "类型": "入库 ↑" if m.get("direction") == "入库" else "出库 ↓",
+                                    "仓库": m.get("warehouse") or "-",
+                                    "数量": m.get("qty") or 0,
+                                    "摘要": m.get("description") or "",
+                                })
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=180)
 
 # show_execution_page 已废弃，被拆分为 show_virtual_contract_page 和 show_inventory_dashboard_page
 # def show_execution_page(): ...
@@ -1129,10 +1545,16 @@ def show_customer_inclusion():
                             if is_landing:
                                 for _, row in biz_e_df.iterrows():
                                     if row["设备品类"]:
-                                        p_config[row["设备品类"]] = {"price": 0, "deposit": row["单台押金"]}
+                                        sku_name = row["设备品类"]
+                                        sku = session.query(SKU).filter(SKU.name == sku_name).first()
+                                        if sku:
+                                            p_config[str(sku.id)] = {"price": 0, "deposit": row["单台押金"]}
                                 for _, row in biz_m_df.iterrows():
                                     if row["物料品类"]:
-                                        p_config[row["物料品类"]] = {"price": row["供货单价"], "deposit": 0}
+                                        sku_name = row["物料品类"]
+                                        sku = session.query(SKU).filter(SKU.name == sku_name).first()
+                                        if sku:
+                                            p_config[str(sku.id)] = {"price": row["供货单价"], "deposit": 0}
                                         
                             # 执行推进 Action
                             payload = AdvanceBusinessStageSchema(
@@ -1640,7 +2062,8 @@ def show_business_execution():
                                         order_data.append({
                                             "单号": o['tracking_number'],
                                             "状态": o['status'],
-                                            "地址": o['address'],
+                                            "发货点位": o.get('发货点位', '未知'),
+                                            "收货点位": o.get('收货点位', '未知'),
                                             "品类明细": ", ".join([f"{i.get('sku_name') or 'N/A'} x{i.get('qty') or 0}" for i in o.get('items', [])])
                                         })
                                     l_col2.dataframe(
@@ -1695,9 +2118,11 @@ def show_business_execution():
                             c1, c2 = st.columns([1, 1])
                             if c1.form_submit_button("提交底数修正"):
                                 try:
+                                    from logic.vc.schemas import UpdateVCSchema
                                     e_data = json.loads(new_elements_str)
                                     d_data = json.loads(new_deposit_str) if new_deposit_str.strip() else {}
-                                    result = update_vc_action(session, vc['id'], new_desc, e_data, d_data)
+                                    payload = UpdateVCSchema(id=vc['id'], description=new_desc, elements=e_data, deposit_info=d_data)
+                                    result = update_vc_action(session, payload)
                                     if result.success:
                                         st.success(result.message)
                                         st.rerun()
@@ -1963,7 +2388,7 @@ def show_supply_form(session, business):
 
     # 3. 初始化/获取数据状态
     if df_key not in st.session_state:
-        st.session_state[df_key] = pd.DataFrame(columns=["点位", "物料", "数量", "单价", "发货仓库"])
+        st.session_state[df_key] = pd.DataFrame(columns=["点位", "物料", "数量", "单价", "发货点位"])
 
     # 获取价格协议
     pricing_config = business.get('details', {}).get("pricing", {})
@@ -1976,13 +2401,13 @@ def show_supply_form(session, business):
     for sku_name in sku_list:
         sku_id = sku_id_map.get(sku_name)
         if sku_id:
-            pts = get_valid_shipping_points_for_material_supply(session, sku_id)
-            names = [f"{p['name']} ({p['type']})" for p in pts] if pts else [SystemConstants.DEFAULT_POINT]
+            pts = [p for p in (get_valid_shipping_points_for_material_supply(session, sku_id) or []) if p.get('qty', 0) > 0]
+            names = [f"{sku_name} - {p['name']} ({p['type']}) - {int(p['qty'])}件" for p in pts] if pts else [SystemConstants.DEFAULT_POINT]
         else:
             names = [SystemConstants.DEFAULT_POINT]
         point_options_map[sku_name] = names
         for p in (pts or []):
-            key = f"{p['name']} ({p['type']})"
+            key = f"{sku_name} - {p['name']} ({p['type']}) - {int(p['qty'])}件"
             point_id_map[key] = p['id']
         all_points_set.update(names)
     all_points = sorted(list(all_points_set)) if all_points_set else [SystemConstants.DEFAULT_POINT]
@@ -2010,6 +2435,15 @@ def show_supply_form(session, business):
                             df.at[idx, "单价"] = u_price
                             pt_list = point_options_map.get(val, [SystemConstants.DEFAULT_POINT])
                             df.at[idx, "发货点位"] = pt_list[0]
+                        # 联动逻辑：选择发货点位后自动带出对应 SKU
+                        if col == "发货点位" and val:
+                            parts = str(val).split(" - ", 1)
+                            if len(parts) >= 1:
+                                parsed_sku = parts[0].strip()
+                                if parsed_sku and parsed_sku in sku_id_map:
+                                    df.at[idx, "物料"] = parsed_sku
+                                    u_price, _, _ = get_sku_agreement_price(session, None, business, parsed_sku)
+                                    df.at[idx, "单价"] = u_price
 
             # 3. 处理新增
             for row_data in state.get("added_rows", []):
@@ -2085,7 +2519,7 @@ def show_supply_form(session, business):
         # A. 调用 Service 层进行库存充足性校验
         check_items = []
         for _, row in edited_df.iterrows():
-            check_items.append((row["物料"], row["发货仓库"], row["数量"]))
+            check_items.append((row["物料"], row["发货点位"], row["数量"]))
             
         is_ok, over_stock = validate_inventory_availability(session, check_items)
         
@@ -2107,13 +2541,12 @@ def show_supply_form(session, business):
                     "total_amount": 0.0,
                     "sku_summary_list": []
                 },
-                "points": [],
+                "items": [],
                 "payment_terms": business.get('details', {}).get("payment_terms", {})
             }
 
             sku_sums = {}
-            point_groups = {}
-            
+
             for _, row in edited_df.iterrows():
                 p_name = row["物料"]
                 p_id = point_detail_map[row["点位"]]["id"]
@@ -2127,31 +2560,26 @@ def show_supply_form(session, business):
                 supply_order["summary"]["total_qty"] += qty
                 supply_order["summary"]["total_amount"] += qty * price
 
-                # 分组点位
-                if p_id not in point_groups:
-                    point_groups[p_id] = {
-                        "pointId": p_id,
-                        "pointName": row["点位"],
-                        "pointAddress": point_detail_map[row["点位"]]["address"],
-                        "items": []
-                    }
-                point_groups[p_id]["items"].append({
+                # 统一 flat items 结构（与其他 VC 类型保持一致）
+                supply_order["items"].append({
                     "sku_id": sku_id,
                     "sku_name": p_name,
                     "qty": qty,
                     "price": price,
                     "shipping_point_name": src_wh,
-                    "shipping_point_id": point_id_map.get(src_wh, 0)
+                    "shipping_point_id": point_id_map.get(src_wh, 0),
+                    "receiving_point_id": p_id,
+                    "receiving_point_name": row["点位"],
+                    "receiving_point_address": point_detail_map[row["点位"]]["address"],
                 })
 
             supply_order["summary"]["total_skus"] = len(sku_sums)
             supply_order["summary"]["sku_summary_list"] = [{"sku_name": k, "total_qty": v} for k, v in sku_sums.items()]
-            supply_order["points"] = list(point_groups.values())
-            
+
             # 增加顶层字段以保持与其他虚拟合同类型的兼容性
             supply_order["total_amount"] = supply_order["summary"]["total_amount"]
 
-            if supply_order["points"]:
+            if supply_order["items"]:
                 # 改为弹窗确认模式
                 st.session_state[f"temp_supply_data_{business['id']}"] = {
                     "order": supply_order,
@@ -2211,12 +2639,13 @@ def show_material_procurement_form(session):
     
     # 提取协议配置
     pricing_config = sc['pricing_dict']
+    sku_name_map = sc.get('sku_name_map', {})  # {sku_id: sku_name}
     payment = sc['payment_terms'] or {}
-    sku_list = list(pricing_config.keys())
-    
-    # SKU ID 映射
-    mats = get_skus_by_names(sku_list, supplier_id=sc['supplier_id'])
-    sku_id_map = {s['name']: s['id'] for s in mats}
+    # sku_list 用于 UI 显示（SKU 名称）
+    sku_list = list(sku_name_map.values())
+
+    # 反转映射：sku_name -> sku_id
+    sku_name_to_id = {v: k for k, v in sku_name_map.items()}
 
     # 准备可用点位列表（统一按 Point 体系管理）
     # 发货点 = 供应商仓库；收货点 = 我们仓库 + 供应商仓库
@@ -2243,8 +2672,10 @@ def show_material_procurement_form(session):
     if f"mat_proc_df" not in st.session_state or st.session_state.get("mat_proc_sc_id") != sc['id']:
         initial_sku = sku_list[0] if sku_list else ""
         initial_price = 0.0
-        if initial_sku in pricing_config:
-            p_val = pricing_config[initial_sku]
+        # initial_sku 是 SKU 名称，需要转换为 sku_id 才能查询 pricing_config
+        initial_sku_id = sku_name_to_id.get(initial_sku)
+        if initial_sku_id and initial_sku_id in pricing_config:
+            p_val = pricing_config[initial_sku_id]
             initial_price = float(p_val) if p_val != "浮动" else 0.0
 
         st.session_state["mat_proc_df"] = pd.DataFrame([
@@ -2394,8 +2825,8 @@ def show_material_procurement_form(session):
                 del st.session_state[k]
         st.rerun()
 
-    # 弹窗触发
-    if st.session_state.get(f"trigger_draft_rule_mgr_{draft_key}"):
+    # 弹窗触发 - 只在未打开其他 dialog 时打开规则管理
+    if st.session_state.get(f"trigger_draft_rule_mgr_{draft_key}") and not st.session_state.get("mat_proc_confirm_dialog_open"):
         draft_rule_manager_dialog(draft_key, target_type="物料采购")
 
 
@@ -2418,10 +2849,13 @@ def show_stock_procurement_form(session):
     sc = get_supply_chain_by_id(chain_options[chain_label])
     
     pricing_config = sc['pricing_dict']
+    sku_name_map = sc.get('sku_name_map', {})  # {sku_id: sku_name}
     payment = sc['payment_terms'] or {}
-    sku_list = list(pricing_config.keys())
-    mats = get_skus_by_names(sku_list, supplier_id=sc['supplier_id'])
-    sku_id_map = {s['name']: s['id'] for s in mats}
+    # sku_list 用于 UI 显示（SKU 名称）
+    sku_list = list(sku_name_map.values())
+
+    # 反转映射：sku_name -> sku_id
+    sku_name_to_id = {v: k for k, v in sku_name_map.items()}
     
     # 准备可用点位列表（统一按 Point 体系管理）
     # 发货点 = 供应商仓库；收货点 = 我们仓库 + 供应商仓库
@@ -2447,8 +2881,10 @@ def show_stock_procurement_form(session):
     if "stock_proc_df" not in st.session_state or st.session_state.get("stock_proc_sc_id") != sc['id']:
         initial_sku = sku_list[0] if sku_list else ""
         initial_price = 0.0
-        if initial_sku in pricing_config:
-            p_val = pricing_config[initial_sku]
+        # initial_sku 是 SKU 名称，需要转换为 sku_id 才能查询 pricing_config
+        initial_sku_id = sku_name_to_id.get(initial_sku)
+        if initial_sku_id and initial_sku_id in pricing_config:
+            p_val = pricing_config[initial_sku_id]
             initial_price = float(p_val) if p_val != "浮动" else 0.0
 
         st.session_state["stock_proc_df"] = pd.DataFrame([
@@ -2774,7 +3210,7 @@ def _save_inventory_allocation(session, biz_id: int):
     )
     
     with st.spinner("正在处理资产状态切换..."):
-        res = allocate_inventory_action(session, payload)
+        res = create_inventory_allocation_action(session, payload)
     
     if res.success:
         st.success(res.message)

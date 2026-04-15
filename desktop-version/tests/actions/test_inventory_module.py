@@ -42,7 +42,7 @@ class TestEquipmentProcurementInventory:
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "skus": [
+                "elements": [
                     {
                         "sku_id": sample_sku.id,
                         "sku_name": sample_sku.name,
@@ -121,7 +121,7 @@ class TestEquipmentProcurementInventory:
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "skus": [
+                "elements": [
                     {"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}
                 ],
                 "total_amount": 1000
@@ -165,7 +165,7 @@ class TestEquipmentProcurementInventory:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
-            elements={"skus": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 2, "price": 1000}], "total_amount": 2000},
+            elements={"elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 2, "price": 1000}], "total_amount": 2000},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
@@ -211,7 +211,7 @@ class TestStockProcurementInventory:
             business_id=business.id,
             type=VCType.STOCK_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
+                "elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -274,7 +274,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -335,7 +335,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 200, "price": 10}],
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 200, "price": 10}],
                 "total_amount": 2000
             },
             deposit_info={},
@@ -419,7 +419,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 6}],
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 6}],
                 "total_amount": 180
             },
             deposit_info={},
@@ -487,7 +487,7 @@ class TestMaterialSupplyInventory:
             business_id=business.id,
             type=VCType.MATERIAL_SUPPLY,
             elements={
-                "skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 12}],
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 12}],
                 "total_amount": 360
             },
             deposit_info={},
@@ -552,7 +552,7 @@ class TestMaterialSupplyInventory:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.MATERIAL_SUPPLY,
-            elements={"skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 20, "price": 10}], "total_amount": 200},
+            elements={"elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 20, "price": 10}], "total_amount": 200},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
@@ -743,7 +743,7 @@ class TestInventoryEdgeCases:
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
+                "elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -799,7 +799,7 @@ class TestInventoryEdgeCases:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "skus": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 150, "price": 5}],
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 150, "price": 5}],
                 "total_amount": 750
             },
             deposit_info={},
@@ -855,7 +855,7 @@ class TestInventoryEdgeCases:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
-            elements={"skus": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 10, "price": 100}], "total_amount": 1000},
+            elements={"elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 10, "price": 100}], "total_amount": 1000},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,

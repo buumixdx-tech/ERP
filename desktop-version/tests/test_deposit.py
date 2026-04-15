@@ -19,7 +19,7 @@ class TestDepositModule:
         """✅ 通过 VC ID 触发押金处理"""
         # Given: VC 有押金配置
         sample_virtual_contract.elements = {
-            "skus": [
+            "elements": [
                 {"sku_id": 1, "qty": 10, "deposit": 100}
             ],
             "total_amount": 10000
@@ -61,7 +61,7 @@ class TestProcessVCDeposit:
         # Given: 设备采购合同，有 SKU 明细
         sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
         sample_virtual_contract.elements = {
-            "skus": [
+            "elements": [
                 {"sku_id": 1, "qty": 5, "deposit": 200},
                 {"sku_id": 2, "qty": 3, "deposit": 150}
             ]
@@ -81,7 +81,7 @@ class TestProcessVCDeposit:
         # Given
         sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
         sample_virtual_contract.elements = {
-            "skus": [
+            "elements": [
                 {"sku_id": 1, "qty": 10, "deposit": 0}  # 无押金
             ]
         }
@@ -94,6 +94,78 @@ class TestProcessVCDeposit:
         # Then
         db_session.refresh(sample_virtual_contract)
         assert sample_virtual_contract.deposit_info.get("should_receive") == 0
+
+
+class TestProcessVCDepositEdgeCases:
+    """VC 押金处理边界情况测试"""
+
+    def test_should_receive_from_elements_no_inventory(self, db_session, sample_virtual_contract):
+        """✅ 尚未发货时，根据合同 elements 计算 should_receive（inv_exists=False 路径）"""
+        sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
+        sample_virtual_contract.elements = {
+            "elements": [
+                {"sku_id": 1, "qty": 4, "deposit": 100},
+                {"sku_id": 2, "qty": 2, "deposit": 50}
+            ]
+        }
+        sample_virtual_contract.deposit_info = {}
+        db_session.flush()
+        # 确保没有 EquipmentInventory 记录（inv_exists=False）
+
+        deposit.process_vc_deposit(db_session, sample_virtual_contract.id)
+
+        db_session.refresh(sample_virtual_contract)
+        # 4*100 + 2*50 = 400 + 100 = 500
+        assert sample_virtual_contract.deposit_info.get("should_receive") == 500
+
+    def test_should_receive_zero_uses_epsilon_fallback(self, db_session, sample_virtual_contract):
+        """✅ should_receive=0 时 ratio=1.0 EPSILON 回退（不应导致除零）"""
+        sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
+        sample_virtual_contract.elements = {
+            "elements": [
+                {"sku_id": 1, "qty": 10, "deposit": 0}  # deposit=0 → should_receive=0
+            ]
+        }
+        db_session.flush()
+
+        # 创建一条押金流水，使 paid_deposit > 0，触发分摊逻辑
+        from models import CashFlow
+        cf = CashFlow(
+            virtual_contract_id=sample_virtual_contract.id,
+            type=CashFlowType.DEPOSIT,
+            amount=100,
+            transaction_date=datetime.now()
+        )
+        db_session.add(cf)
+        db_session.flush()
+
+        # 处理押金：should_receive=0 → ratio=1.0（EPSILON fallback），不应除零崩溃
+        deposit.process_vc_deposit(db_session, sample_virtual_contract.id)
+        assert True  # 未抛出异常
+
+    def test_deposit_no_inventories_skip_distribution(self, db_session, sample_virtual_contract):
+        """✅ 没有运营中设备时跳过 distribution 分摊"""
+        sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
+        sample_virtual_contract.elements = {
+            "elements": [{"sku_id": 1, "qty": 5, "deposit": 200}]
+        }
+        # 有押金流水使 paid_deposit > 0
+        sample_virtual_contract.deposit_info = {"should_receive": 1000, "total_deposit": 500}
+        db_session.flush()
+
+        # 有 CashFlow 使 process_vc_deposit 走到分摊逻辑
+        cf = CashFlow(
+            virtual_contract_id=sample_virtual_contract.id,
+            type=CashFlowType.DEPOSIT,
+            amount=500,
+            transaction_date=datetime.now()
+        )
+        db_session.add(cf)
+        db_session.flush()
+
+        # 处理押金：没有 EquipmentInventory，inventories 为空，直接 return
+        deposit.process_vc_deposit(db_session, sample_virtual_contract.id)
+        assert True  # 未抛出异常
 
 
 class TestProcessCFDeposit:
@@ -154,7 +226,7 @@ class TestDepositDistribution:
         # Given: 有设备库存且有押金流水
         sample_virtual_contract.type = VCType.EQUIPMENT_PROCUREMENT
         sample_virtual_contract.elements = {
-            "skus": [{"sku_id": 1, "deposit": 100}]
+            "elements": [{"sku_id": 1, "deposit": 100}]
         }
         db_session.flush()
 

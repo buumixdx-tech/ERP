@@ -8,6 +8,9 @@ class SystemConstants:
     FLOAT_PRICING = "浮动"
     UNKNOWN = "未知"
 
+# 通用浮点比较容差（避免浮点精度问题）
+EPSILON = 0.01
+
 class CounterpartType:
     CUSTOMER = "Customer"
     SUPPLIER = "Supplier"
@@ -37,7 +40,22 @@ class AccountOwnerType:
     OURSELVES = "ourselves"
     CUSTOMER = "customer"
     SUPPLIER = "supplier"
-    OTHER = "other"
+    PARTNER = "partner"
+
+
+class PartnerRelationType:
+    LOGISTICS = "物流服务"
+    OPERATION = "运维服务"
+    CUSTOMER_SERVICE = "客服服务"
+    TECHNICAL = "技术服务"
+    CONSULTING = "咨询服务"
+    PROCUREMENT = "采购执行"
+    MARKETING = "营销推广"
+    INVESTMENT = "投资关联"
+    OTHER = "其他"
+
+    ALL_TYPES = [LOGISTICS, OPERATION, CUSTOMER_SERVICE, TECHNICAL, CONSULTING,
+                 PROCUREMENT, MARKETING, INVESTMENT, OTHER]
 
 class BankInfoKey:
     """BankAccount.account_info JSON 字段的标准键名"""
@@ -93,12 +111,24 @@ class SupplierCategory:
     ALL_TYPES = [EQUIPMENT, MATERIAL, BOTH]
 
 class ExternalPartnerType:
-    OUTSOURCING = "外包服务商"
-    CUSTOMER_RELATED = "客户关联方"
-    SUPPLIER_RELATED = "供应商关联方"
-    OTHER = "其他"
-    
-    ALL_TYPES = [OUTSOURCING, CUSTOMER_RELATED, SUPPLIER_RELATED, OTHER]
+    """外部合作方类型（描述合作方自身的性质/身份）"""
+    SUPPLY_CHAIN_COMPANY = "供应链公司"
+    OPERATION_OUTSOURCING = "运维外包公司"
+    CUSTOMER_SERVICE_OUTSOURCING = "客服外包公司"
+    TECHNICAL_SERVICE = "技术服务公司"
+    CONSULTING_SERVICE = "咨询服务公司"
+    LOGISTICS_COMPANY = "物流公司"
+    RELATED_COMPANY = "关联公司"
+
+    ALL_TYPES = [
+        SUPPLY_CHAIN_COMPANY,
+        OPERATION_OUTSOURCING,
+        CUSTOMER_SERVICE_OUTSOURCING,
+        TECHNICAL_SERVICE,
+        CONSULTING_SERVICE,
+        LOGISTICS_COMPANY,
+        RELATED_COMPANY,
+    ]
 
 class SKUType:
     EQUIPMENT = "设备"
@@ -196,6 +226,18 @@ class OperationalStatus:
 class LogisticsBearer:
     SENDER = "退货方承担 (自付)"
     RECEIVER = "被退方承担 (需补偿)"
+
+class AddonType:
+    """附加业务类型"""
+    PRICE_ADJUST = "PRICE_ADJUST"           # 物料供货价折扣促销
+    NEW_SKU = "NEW_SKU"                   # 新增原本没有的 SKU（设备有押金，物料只有供货价）
+    PAYMENT_TERMS = "PAYMENT_TERMS"         # 付款条款调整
+
+class AddonStatus:
+    """附加业务状态"""
+    ACTIVE = "生效"
+    INACTIVE = "失效"
+    EXPIRED = "过期"
 
 class CashFlowType:
     PREPAYMENT = "预付"
@@ -411,7 +453,9 @@ class SystemEventType:
     
     # 供应链
     SUPPLY_CHAIN_CREATED = "SUPPLY_CHAIN_CREATED"
-    
+    SUPPLY_CHAIN_UPDATED = "SUPPLY_CHAIN_UPDATED"
+    SUPPLY_CHAIN_DELETED = "SUPPLY_CHAIN_DELETED"
+
     # 物流与快递
     LOGISTICS_PLAN_CREATED = "LOGISTICS_PLAN_CREATED"
     LOGISTICS_STATUS_CHANGED = "LOGISTICS_STATUS_CHANGED" # 物流主单状态变化 (取代 LOGISTICS_FINISHED)
@@ -432,6 +476,11 @@ class SystemEventType:
     # 智能预警
     INVENTORY_LOW_STOCK_WARNING = "INVENTORY_LOW_STOCK_WARNING"
 
+    # 附加业务
+    ADDON_CREATED = "ADDON_CREATED"
+    ADDON_UPDATED = "ADDON_UPDATED"
+    ADDON_DEACTIVATED = "ADDON_DEACTIVATED"
+
 class SystemAggregateType:
     """系统领域聚合根类型 (用于记录 SystemEvent.aggregate_type)"""
     BUSINESS = "Business"
@@ -443,6 +492,7 @@ class SystemAggregateType:
     CASH_FLOW = "CashFlow"
     FINANCIAL_JOURNAL = "FinancialJournal"
     MATERIAL_INVENTORY = "MaterialInventory"
+    ADDON_BUSINESS = "AddonBusiness"
     EQUIPMENT_INVENTORY = "EquipmentInventory"
     
     # 主数据

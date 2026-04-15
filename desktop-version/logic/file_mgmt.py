@@ -254,7 +254,7 @@ def generate_master_data_excel(session) -> bytes:
                 s = session.query(Supplier).get(ba.owner_id)
                 nature = "[供应商]"
                 name_val = s.name if s else "未知供应商"
-            elif ba.owner_type == AccountOwnerType.OTHER and ba.owner_id:
+            elif ba.owner_type == AccountOwnerType.PARTNER and ba.owner_id:
                 p = session.query(ExternalPartner).get(ba.owner_id)
                 nature = "[合作方]"
                 name_val = p.name if p else "未知合作方"
@@ -569,7 +569,7 @@ def process_master_data_excel(session, file_bytes: bytes) -> dict:
                 if not resolved_id:
                     report["logs"].append(f"⚠️ 第 {idx+2} 行银行账户处理跳过：找不到合作方 '{owner_name}'")
                     resolve_ok = False
-                resolved_type = AccountOwnerType.OTHER
+                resolved_type = AccountOwnerType.PARTNER
             else:
                 report["logs"].append(f"⚠️ 第 {idx+2} 行银行账户处理跳过：无法识别归属方性质 '{owner_nature}'")
                 resolve_ok = False

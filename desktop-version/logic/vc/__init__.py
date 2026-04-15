@@ -1,7 +1,7 @@
 from .actions import (
     create_procurement_vc_action, create_material_supply_vc_action,
     create_return_vc_action, create_mat_procurement_vc_action,
-    create_stock_procurement_vc_action, allocate_inventory_action,
+    create_stock_procurement_vc_action, create_inventory_allocation_action,
     update_vc_action, delete_vc_action
 )
 from .queries import (
@@ -20,7 +20,7 @@ __all__ = [
     'create_return_vc_action',
     'create_mat_procurement_vc_action',
     'create_stock_procurement_vc_action',
-    'allocate_inventory_action',
+    'create_inventory_allocation_action',
     'update_vc_action',
     'delete_vc_action',
     'get_vc_list',

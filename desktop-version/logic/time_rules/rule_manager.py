@@ -273,3 +273,57 @@ class RuleManager:
 
         return rules_created
 
+    def save_template_rules(
+        self,
+        related_id: int,
+        related_type: str,
+        rules: list
+    ) -> int:
+        """
+        保存用户定义的初始模板规则
+
+        Args:
+            related_id: 关联对象 ID
+            related_type: 关联类型 (TimeRuleRelatedType.SUPPLY_CHAIN 等)
+            rules: 规则列表，每条规则包含:
+                - party: 责任方
+                - trigger_event: 触发事件
+                - offset: 偏移天数
+                - unit: 单位 (TimeRuleOffsetUnit)
+                - direction: 方向 (TimeRuleDirection)
+                - target_event: 目标事件
+
+        Returns:
+            int: 保存的规则数量
+        """
+        if not rules:
+            return 0
+
+        from logic.constants import TimeRuleInherit, TimeRuleStatus
+
+        rules_created = 0
+        for rule in rules:
+            tr = TimeRule(
+                related_id=related_id,
+                related_type=related_type,
+                inherit=TimeRuleInherit.SELF,
+                party=rule.get('责任方'),
+                trigger_event=rule.get('触发事件'),
+                tge_param1=None,
+                tge_param2=None,
+                target_event=rule.get('目标事件'),
+                tae_param1="初始模板",
+                tae_param2=None,
+                offset=rule.get('偏移', 0),
+                unit=rule.get('单位'),
+                direction=rule.get('方向'),
+                status=TimeRuleStatus.TEMPLATE
+            )
+            self.session.add(tr)
+            rules_created += 1
+
+        if rules_created > 0:
+            self.session.flush()
+
+        return rules_created
+

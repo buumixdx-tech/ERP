@@ -3,12 +3,14 @@
 负责处理跨模块的复杂业务计算逻辑，确保 UI 层仅负责数据展示与交互。
 """
 from models import (
-    get_session, VirtualContract, EquipmentInventory, MaterialInventory, 
-    SKU, Point, SupplyChain, Business
+    get_session, VirtualContract, EquipmentInventory, MaterialInventory,
+    SKU, Point, SupplyChain, Business, PartnerRelation
 )
+from sqlalchemy.orm import joinedload
 from logic.constants import (
-    VCType, VCStatus, SubjectStatus, ReturnDirection, OperationalStatus, SKUType, 
-    AccountOwnerType, SystemConstants, CashFlowType, CounterpartType, AccountLevel1
+    VCType, VCStatus, SubjectStatus, ReturnDirection, OperationalStatus, SKUType,
+    AccountOwnerType, SystemConstants, CashFlowType, CounterpartType, AccountLevel1,
+    PartnerRelationType
 )
 import pandas as pd
 
@@ -28,8 +30,8 @@ def normalize_item_data(item: dict) -> dict:
         "deposit": float(item.get("deposit") or 0.0),
         # 发货点位（综合来源：source_warehouse/supplier仓库 或 shipping_point_name/退货原点位）
         "shipping_point_name": item.get("source_warehouse") or item.get("sourceWarehouse") or item.get("shipping_point_name") or item.get("shippingPointName") or SystemConstants.DEFAULT_POINT,
-        # 收货点位（综合来源：target_warehouse/退货目的地 或 receiving_warehouse）
-        "receiving_point_name": item.get("target_warehouse") or item.get("targetWarehouse") or item.get("receiving_warehouse") or item.get("receivingWarehouse") or item.get("退货目的地"),
+        # 目标仓库/退货目的地（用于退货/调拨场景）
+        "target_warehouse": item.get("target_warehouse") or item.get("targetWarehouse") or item.get("receiving_warehouse") or item.get("receivingWarehouse") or item.get("退货目的地"),
         # 目标点位（调拨场景）
         "target_point_id": item.get("target_point_id") or item.get("targetPointId"),
         "target_point_name": item.get("target_point_name") or item.get("targetPointName"),
@@ -95,7 +97,10 @@ def get_returnable_items(session, target_vc_id, return_direction):
     # 2. 设备采购类型的退货逻辑
     if target_vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
         filter_status = OperationalStatus.OPERATING if ReturnDirection.CUSTOMER_TO_US in return_direction else OperationalStatus.STOCK
-        equip_list = session.query(EquipmentInventory).filter(
+        equip_list = session.query(EquipmentInventory).options(
+            joinedload(EquipmentInventory.sku),
+            joinedload(EquipmentInventory.point)
+        ).filter(
             EquipmentInventory.virtual_contract_id == target_vc.id,
             EquipmentInventory.operational_status == filter_status
         ).all()
@@ -128,8 +133,15 @@ def get_returnable_items(session, target_vc_id, return_direction):
             else:
                 unique_skus[sid]["target_total"] += float(i.get("qty") or 0)
 
+        mat_inv_by_sid = {}
+        if unique_skus:
+            mat_invs = session.query(MaterialInventory).filter(
+                MaterialInventory.sku_id.in_(list(unique_skus.keys()))
+            ).all()
+            mat_inv_by_sid = {m.sku_id: m for m in mat_invs}
+
         for sid, meta in unique_skus.items():
-            mat = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
+            mat = mat_inv_by_sid.get(sid)
             if mat and mat.stock_distribution:
                 for wh, wh_qty in mat.stock_distribution.items():
                     if wh_qty > 0:
@@ -152,13 +164,20 @@ def get_returnable_items(session, target_vc_id, return_direction):
         if not points_data and vc_elems:
             # 新结构：elements[] — 按 receiving_point_id 分组
             pt_group = {}
+            pt_ids = set()
             for e in vc_elems:
                 pt_id = e.get("receiving_point_id")
+                if pt_id:
+                    pt_ids.add(pt_id)
                 if pt_id not in pt_group:
-                    pt = session.query(Point).get(pt_id)
-                    pt_group[pt_id] = {"name": pt.name if pt else f"点位{pt_id}", "items": []}
+                    pt_group[pt_id] = {"items": []}
                 pt_group[pt_id]["items"].append(e)
-            points_data = [{"pointName": v["name"], "items": v["items"]} for v in pt_group.values()]
+            # 批量查询所有需要的 Point，避免 N+1
+            point_by_id = {}
+            if pt_ids:
+                points = session.query(Point).filter(Point.id.in_(pt_ids)).all()
+                point_by_id = {p.id: p for p in points}
+            points_data = [{"pointName": (point_by_id.get(pt_id).name if point_by_id.get(pt_id) else f"点位{pt_id}"), "items": v["items"]} for pt_id, v in pt_group.items()]
 
         for p in points_data:
             p_name = p.get("pointName") or "未知点位"
@@ -181,29 +200,39 @@ def get_sku_agreement_price(session, sc_id, business_id, sku_name):
     """
     获取 SKU 在特定业务 and 供应链环境下的协议单价与押金
     返回: (unit_price, deposit, sku_type)
+
+    注意：pricing_config 和 details.pricing 的 key 已迁移为 sku_id (字符串)
+    此函数通过 sku_name 查找对应的 sku_id 后再进行价格查找
     """
+    # 先通过 sku_name 找到 sku_id（pricing key 已改为 sku_id）
+    sku = session.query(SKU).filter(SKU.name == sku_name).first()
+    sku_id = str(sku.id) if sku else None
+
     sc = session.query(SupplyChain).get(sc_id) if sc_id else None
     biz = session.query(Business).get(business_id) if isinstance(business_id, int) else business_id
-    
+
     # 获取供应链提供的单价 (如果有)
     unit_price = 0.0
-    if sc:
+    if sc and sku_id:
         sc_pricing = sc.get_pricing_dict()
-        unit_price = sc_pricing.get(sku_name, 0.0)
-    
-    if not isinstance(unit_price, (int, float)): 
+        unit_price = sc_pricing.get(sku_id, 0.0)
+
+    if not isinstance(unit_price, (int, float)):
         unit_price = 0.0
-        
+
     # 获取客户业务约定的押金与单价 (优先级覆盖)
     if biz and isinstance(biz, dict):
         biz_agreement = biz.get("details", {}).get("pricing", {})
     else:
         biz_agreement = biz.details.get("pricing", {}) if (biz and hasattr(biz, 'details')) else {}
-    sku_config = biz_agreement.get(sku_name, {})
-    
+
+    sku_config = {}
+    if sku_id:
+        sku_config = biz_agreement.get(sku_id, {})
+
     deposit = 0.0
     sku_type = SKUType.EQUIPMENT
-    
+
     if isinstance(sku_config, dict):
         deposit = float(sku_config.get("deposit", 0.0))
         sku_type = sku_config.get("type", SKUType.EQUIPMENT)
@@ -213,7 +242,7 @@ def get_sku_agreement_price(session, sc_id, business_id, sku_name):
     elif isinstance(sku_config, (int, float)):
         # 兼容旧版简单格式 {"SKU": 100.0}
         unit_price = float(sku_config)
-    
+
     return float(unit_price), float(deposit), sku_type
 
 def validate_inventory_availability(session, request_items):
@@ -234,7 +263,9 @@ def validate_inventory_availability(session, request_items):
         dist = mat_inv.stock_distribution if (mat_inv and mat_inv.stock_distribution) else {}
 
         # stock_distribution 的 key 是 str(point_id)，将 warehouse name 转为 point_id 再查询
-        pt = session.query(Point).filter(Point.name == wh_n).first()
+        # warehouse name 格式为 "SKU - 仓库名 (类型) - 数量件"，提取中间段"仓库名"
+        wh_n_clean = wh_n.split(' - ')[1].split(' (')[0] if ' - ' in wh_n else wh_n
+        pt = session.query(Point).filter(Point.name == wh_n_clean).first()
         if pt:
             available = float(dist.get(str(pt.id), 0.0))
         else:
@@ -271,13 +302,48 @@ def get_counterpart_info(session, vc):
         if active_vc_sc_id:
             sc = session.query(SupplyChain).get(active_vc_sc_id)
             if sc: cp_id = sc.supplier_id
+    elif active_vc_type == VCType.MATERIAL_SUPPLY:
+        # 物料供应：判断 business 是否恰好有一个采购执行合作方
+        cp_type = CounterpartType.CUSTOMER
+        cp_id = None
+        if active_vc_biz_id:
+            from models import PartnerRelation
+            rels = session.query(PartnerRelation).filter(
+                PartnerRelation.owner_type == "business",
+                PartnerRelation.owner_id == active_vc_biz_id,
+                PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+                PartnerRelation.ended_at == None
+            ).all()
+            if len(rels) == 1:
+                cp_type = CounterpartType.PARTNER
+                cp_id = rels[0].partner_id
+            else:
+                biz = session.query(Business).get(active_vc_biz_id)
+                if biz: cp_id = biz.customer_id
     else:
         cp_type = CounterpartType.CUSTOMER
         if active_vc_biz_id:
             biz = session.query(Business).get(active_vc_biz_id)
             if biz: cp_id = biz.customer_id
-            
+
     return cp_type, cp_id
+
+
+def _get_biz_procurement_partner(session, biz_id):
+    """
+    查询 Business 是否关联了恰好一个"采购执行"类型的有效合作方。
+    返回 (partner_id, partner_name) 或 (None, None)。
+    """
+    items = session.query(PartnerRelation).filter(
+        PartnerRelation.owner_type == "business",
+        PartnerRelation.owner_id == biz_id,
+        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+        PartnerRelation.ended_at == None
+    ).all()
+    if len(items) == 1:
+        return items[0].partner_id, None
+    return None, None
+
 
 def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:
     """
@@ -313,10 +379,18 @@ def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:
 
     if vc_type == VCType.MATERIAL_SUPPLY:
         # 物料供应：客户(Payer) -> 自己公司(Payee)
-        p_err, p_err_id = AccountOwnerType.CUSTOMER, None
-        biz = session.query(Business).get(vc_bid) if vc_bid else None
-        if biz: p_err_id = biz.customer_id
         p_ee, p_ee_id = AccountOwnerType.OURSELVES, 0
+        biz = session.query(Business).get(vc_bid) if vc_bid else None
+        if biz:
+            partner_pid, _ = _get_biz_procurement_partner(session, biz.id)
+            if partner_pid is not None:
+                # 恰好有一个采购执行合作方 → 使用合作方账户
+                p_err, p_err_id = AccountOwnerType.PARTNER, partner_pid
+            else:
+                # 没有或超过一个 → 退回到渠道客户
+                p_err, p_err_id = AccountOwnerType.CUSTOMER, biz.customer_id
+        else:
+            p_err, p_err_id = AccountOwnerType.CUSTOMER, None
         
     elif vc_type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT, VCType.MATERIAL_PROCUREMENT]:
         # 设备/物料采购（常规货款）：自己公司(Payer) -> 供应商(Payee)
@@ -337,8 +411,12 @@ def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:
             # 客户退回：自己公司(Payer) -> 客户(Payee) [退款流程]
             p_err, p_err_id = AccountOwnerType.OURSELVES, 0
             biz = session.query(Business).get(vc_bid) if vc_bid else None
-            if biz: 
-                p_ee, p_ee_id = AccountOwnerType.CUSTOMER, biz.customer_id
+            if biz:
+                partner_pid, _ = _get_biz_procurement_partner(session, biz.id)
+                if partner_pid is not None:
+                    p_ee, p_ee_id = AccountOwnerType.PARTNER, partner_pid
+                else:
+                    p_ee, p_ee_id = AccountOwnerType.CUSTOMER, biz.customer_id
     
     return p_err, p_err_id, p_ee, p_ee_id
 

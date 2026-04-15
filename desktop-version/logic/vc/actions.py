@@ -1,5 +1,8 @@
 from sqlalchemy.orm import Session
+from sqlalchemy import func
+import sqlalchemy.orm.attributes as _attributes
 from models import VirtualContract, TimeRule, Business, SupplyChain, EquipmentInventory, Point, MaterialInventory
+from models import CashFlow, FinancialJournal, CashFlowLedger, SystemEvent
 from logic.constants import (
     VCType, VCStatus, SubjectStatus, CashStatus, TimeRuleRelatedType,
     TimeRuleStatus, BusinessStatus, SKUType, SystemEventType, SystemAggregateType,
@@ -23,6 +26,18 @@ from datetime import datetime
 
 # 默认总仓库ID
 DEFAULT_WAREHOUSE_ID = 1
+
+
+def _record_vc_created_log(session: Session, vc: VirtualContract):
+    """VC创建时记录初始状态日志（只有status=执行）"""
+    from models import VirtualContractStatusLog
+    log = VirtualContractStatusLog(
+        vc_id=vc.id,
+        category="status",
+        status_name=vc.status
+    )
+    session.add(log)
+    session.flush()
 
 
 def _get_supplier_warehouse(session: Session, supplier_id: int) -> int | None:
@@ -57,14 +72,17 @@ def _get_supplier_warehouses(session: Session, supplier_id: int) -> list[int]:
     return [pt.id for pt in pts]
 
 
-def _get_customer_warehouses(session: Session, customer_id: int) -> list[int]:
+def _get_customer_warehouses(session: Session, customer_id: int = None) -> list[int]:
     """
-    获取指定客户所有的仓库（type=客户仓 且 customer_id）的ID列表
+    获取所有客户仓库的ID列表，或指定客户的仓库
     """
-    pts = session.query(Point).filter(
-        Point.customer_id == customer_id,
-        Point.type == "客户仓"
-    ).all()
+    if customer_id is not None:
+        pts = session.query(Point).filter(
+            Point.customer_id == customer_id,
+            Point.type == "客户仓"
+        ).all()
+    else:
+        pts = session.query(Point).filter(Point.type == "客户仓").all()
     return [pt.id for pt in pts]
 
 
@@ -149,8 +167,69 @@ def _elem_to_dict(elem: VCElementSchema) -> dict:
         "price": elem.price,
         "deposit": elem.deposit,
         "subtotal": elem.subtotal,
-        "sn_list": elem.sn_list
+        "sn_list": elem.sn_list,
+        "addon_business_ids": elem.addon_business_ids
     }
+
+
+def _apply_addons_to_elements(session: Session, business_id: int, elements: list) -> list:
+    """
+    根据 business 探测当前有效的附加业务，对 elements 中的价格/押金进行绝对值覆盖，
+    并在每个元素中标记 addon_business_ids。
+    返回增强后的 elements 列表。
+
+    原子化版本：每个 addon_business 记录 = 一个 SKU × 一个周期 × 一个覆盖值，
+    不再解析 config JSON，直接按 sku_id + addon_type 精确匹配。
+    """
+    from logic.addon_business.queries import get_active_addons
+    from logic.constants import AddonType
+
+    active_addons = get_active_addons(session, business_id)
+    if not active_addons:
+        return elements
+
+    # 按 (sku_id, addon_type) 索引（同一 SKU 可能同时有 PRICE_ADJUST 和 NEW_SKU）
+    addon_index = {}  # {(sku_id, addon_type): addon}
+    for a in active_addons:
+        if a.sku_id is not None:
+            key = (a.sku_id, a.addon_type)
+            if key not in addon_index:  # 同一个 SKU + 类型只保留第一个（理论上不会有重复）
+                addon_index[key] = a
+
+    enhanced = []
+    for elem in elements:
+        elem = dict(elem)  # 复制，避免修改原始数据
+        addon_ids = list(elem.get("addon_business_ids") or [])
+        sku_id = int(elem["sku_id"])
+
+        # 1. PRICE_ADJUST 覆盖
+        pa_key = (sku_id, AddonType.PRICE_ADJUST)
+        if pa_key in addon_index:
+            a = addon_index[pa_key]
+            if a.override_price is not None:
+                elem["price"] = a.override_price
+                elem["subtotal"] = round(elem["qty"] * elem["price"], 2)
+            if a.override_deposit is not None:
+                elem["deposit"] = a.override_deposit
+            if a.id not in addon_ids:
+                addon_ids.append(a.id)
+
+        # 2. NEW_SKU 覆盖（NEW_SKU 同时作为 PRICE_ADJUST 生效，覆盖 price 和 deposit）
+        ns_key = (sku_id, AddonType.NEW_SKU)
+        if ns_key in addon_index:
+            a = addon_index[ns_key]
+            if a.override_price is not None:
+                elem["price"] = a.override_price
+                elem["subtotal"] = round(elem["qty"] * elem["price"], 2)
+            if a.override_deposit is not None:
+                elem["deposit"] = a.override_deposit
+            if a.id not in addon_ids:
+                addon_ids.append(a.id)
+
+        elem["addon_business_ids"] = addon_ids
+        enhanced.append(elem)
+
+    return enhanced
 
 
 def _get_point_name(session: Session, point_id: int) -> str:
@@ -173,7 +252,10 @@ def _get_sku_name(session: Session, sku_id: int) -> str:
 # =============================================================================
 
 def create_procurement_vc_action(session: Session, payload: CreateProcurementVCSchema, draft_rules: list = None) -> ActionResult:
-    """设备采购执行单创建 Action"""
+    """设备采购执行单创建 Action（支持回滚）"""
+    import os
+    import json as _json
+    from logic.finance.engine import VOUCHER_DIR
     try:
         biz = session.query(Business).get(payload.business_id)
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
@@ -187,29 +269,30 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
             if sc.type != SKUType.EQUIPMENT:
                 return ActionResult(success=False, error="该协议类型不属于设备供应，无法用于设备采购")
 
-        # 商业逻辑
-        # shipping_point_id = 供应商仓库（由供应链的supplier_id确定）
-        # receiving_point_id = 用户选择，范围：客户所有点位（运营点位+仓库）
         if not biz.customer_id:
             return ActionResult(success=False, error="业务未关联客户，无法创建设备采购单")
         allowed_receiving = _get_customer_points(session, biz.customer_id)
         if not allowed_receiving:
             return ActionResult(success=False, error=f"客户 {biz.customer_id} 没有可用点位，请先配置")
 
+        # ============ 记录创建前的最大 ID（用于后续捕获新建记录） ============
+        from sqlalchemy import func
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_tr_id_before = session.query(func.max(TimeRule.id)).scalar() or 0
+        max_cf_id_before = session.query(func.max(CashFlow.id)).scalar() or 0
+        max_fj_id_before = session.query(func.max(FinancialJournal.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
+
         clean_elems = []
         for e in payload.elements:
-            # 校验收货点是否在允许范围内
             if e.receiving_point_id not in allowed_receiving:
                 return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在客户仓库范围内")
-
-            # 发货点：由供应链的supplier_id查供应商仓库
             if sc:
                 sp = _get_supplier_warehouse(session, sc.supplier_id)
                 if not sp:
                     return ActionResult(success=False, error=f"未找到供应商仓库，请检查供应商 {sc.supplier_id} 的仓库配置")
             else:
                 sp = None
-
             corrected = VCElementSchema(
                 shipping_point_id=sp,
                 receiving_point_id=e.receiving_point_id,
@@ -217,6 +300,17 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
                 deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
             )
             clean_elems.append(_elem_to_dict(corrected))
+
+        # 提取原始价格（在 _apply_addons 之前），用于同步到 details["pricing"]
+        orig_pricing = {}
+        for elem in clean_elems:
+            sku_key = str(elem["sku_id"])
+            if sku_key not in orig_pricing:
+                orig_pricing[sku_key] = {"price": elem["price"], "deposit": elem["deposit"]}
+
+        # 应用附加业务政策（价格覆盖 + 标记 addon_business_ids）
+        clean_elems = _apply_addons_to_elements(session, payload.business_id, clean_elems)
+
         new_vc = VirtualContract(
             business_id=payload.business_id,
             supply_chain_id=sc.id if sc else None,
@@ -237,6 +331,17 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
         )
         session.add(new_vc)
         session.flush()
+
+        # Sync 原始价格到 business.details["pricing"]（producer）
+        biz_pricing = dict(biz.details.get("pricing", {})) if biz.details else {}
+        biz_pricing.update(orig_pricing)
+        if not biz.details:
+            biz.details = {}
+        if biz_pricing != biz.details.get("pricing", {}):
+            biz.details["pricing"] = biz_pricing
+            _attributes.flag_modified(biz, "details")
+
+        _record_vc_created_log(session, new_vc)
         RuleManager(session).sync_from_parent(TimeRuleRelatedType.VIRTUAL_CONTRACT, new_vc.id)
         if draft_rules:
             for r in draft_rules:
@@ -252,6 +357,74 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {
             "type": new_vc.type, "business_id": new_vc.business_id, "total_amount": payload.total_amt
         })
+        session.flush()
+
+        # ============ 构建 snapshot_after：查询所有新建记录 ============
+        from logic.transactions import serialize_model as _sm
+
+        # VirtualContract
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        # TimeRule（相关且 ID > max_tr_id_before）
+        new_rules = session.query(TimeRule).filter(
+            TimeRule.related_id == new_vc.id,
+            TimeRule.related_type == TimeRuleRelatedType.VIRTUAL_CONTRACT,
+            TimeRule.id > max_tr_id_before
+        ).all()
+        for tr in new_rules:
+            snapshot_records.append({"class": "TimeRule", "id": tr.id, "data": _sm(tr)})
+
+        # CashFlow（ref_vc_id = new_vc.id 且 ID > max_cf_id_before）
+        new_cfs = session.query(CashFlow).filter(
+            CashFlow.virtual_contract_id == new_vc.id,
+            CashFlow.id > max_cf_id_before
+        ).all()
+        for cf in new_cfs:
+            snapshot_records.append({"class": "CashFlow", "id": cf.id, "data": _sm(cf)})
+
+        # FinancialJournal（ref_vc_id = new_vc.id 且 ID > max_fj_id_before）
+        new_fjs = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_vc_id == new_vc.id,
+            FinancialJournal.id > max_fj_id_before
+        ).all()
+        for fj in new_fjs:
+            snapshot_records.append({"class": "FinancialJournal", "id": fj.id, "data": _sm(fj)})
+            if fj.cash_flow_record:
+                snapshot_records.append({"class": "CashFlowLedger", "id": fj.cash_flow_record.id, "data": _sm(fj.cash_flow_record)})
+
+        # SystemEvent（aggregate_id = new_vc.id 且 ID > max_ev_id_before）
+        new_evs = session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == new_vc.id,
+            SystemEvent.aggregate_type == SystemAggregateType.VIRTUAL_CONTRACT,
+            SystemEvent.id > max_ev_id_before
+        ).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        # JSON 文件（可能有多个 CashFlow）
+        snapshot_files = []
+        for cf in new_cfs:
+            voucher_path = os.path.join(VOUCHER_DIR, f"CashFlow_{cf.id}.json")
+            if os.path.exists(voucher_path):
+                with open(voucher_path, "r", encoding="utf-8") as f:
+                    snapshot_files.append({"path": voucher_path, "content": _json.load(f)})
+
+        snapshot_after = {"records": snapshot_records, "files": snapshot_files}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id] + [tr.id for tr in new_rules] + [cf.id for cf in new_cfs] + [fj.id for fj in new_fjs]
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_procurement_vc_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before={},
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"设备采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
@@ -259,7 +432,10 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
         return ActionResult(success=False, error=str(e))
 
 def create_material_supply_vc_action(session: Session, payload: CreateMaterialSupplyVCSchema, draft_rules: list = None) -> ActionResult:
-    """物料供应执行单创建 Action"""
+    """物料供应执行单创建 Action（支持回滚）"""
+    import os
+    import json as _json
+    from logic.finance.engine import VOUCHER_DIR
     try:
         biz = session.query(Business).get(payload.business_id)
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
@@ -270,6 +446,13 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
 
         if not biz.customer_id:
             return ActionResult(success=False, error="业务未关联客户，无法创建物料供应单")
+
+        # ============ 记录创建前的最大 ID（用于后续捕获新建记录） ============
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_tr_id_before = session.query(func.max(TimeRule.id)).scalar() or 0
+        max_cf_id_before = session.query(func.max(CashFlow.id)).scalar() or 0
+        max_fj_id_before = session.query(func.max(FinancialJournal.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
 
         # 商业逻辑
         # shipping_point_id：用户选择，范围=有该SKU库存的所有仓库
@@ -304,6 +487,9 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
             clean_elems.append(_elem_to_dict(corrected))
             check_items.append((_get_sku_name(session, e.sku_id), _get_point_name(session, e.shipping_point_id), e.qty))
 
+        # 应用附加业务政策（价格覆盖 + 标记 addon_business_ids）
+        clean_elems = _apply_addons_to_elements(session, payload.business_id, clean_elems)
+
         is_ok, over_stock = validate_inventory_availability(session, check_items)
         if not is_ok:
             return ActionResult(success=False, error=f"库存严重不足: {' | '.join(over_stock)}")
@@ -323,6 +509,7 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         )
         session.add(new_vc)
         session.flush()
+        _record_vc_created_log(session, new_vc)
         RuleManager(session).sync_from_parent(TimeRuleRelatedType.VIRTUAL_CONTRACT, new_vc.id)
         if draft_rules:
             for r in draft_rules:
@@ -338,6 +525,68 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {
             "type": new_vc.type, "business_id": new_vc.business_id, "total_amount": payload.total_amt
         })
+        session.flush()
+
+        # ============ 构建 snapshot_after：查询所有新建记录 ============
+        from logic.transactions import serialize_model as _sm
+
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        new_rules = session.query(TimeRule).filter(
+            TimeRule.related_id == new_vc.id,
+            TimeRule.related_type == TimeRuleRelatedType.VIRTUAL_CONTRACT,
+            TimeRule.id > max_tr_id_before
+        ).all()
+        for tr in new_rules:
+            snapshot_records.append({"class": "TimeRule", "id": tr.id, "data": _sm(tr)})
+
+        new_cfs = session.query(CashFlow).filter(
+            CashFlow.virtual_contract_id == new_vc.id,
+            CashFlow.id > max_cf_id_before
+        ).all()
+        for cf in new_cfs:
+            snapshot_records.append({"class": "CashFlow", "id": cf.id, "data": _sm(cf)})
+
+        new_fjs = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_vc_id == new_vc.id,
+            FinancialJournal.id > max_fj_id_before
+        ).all()
+        for fj in new_fjs:
+            snapshot_records.append({"class": "FinancialJournal", "id": fj.id, "data": _sm(fj)})
+            if fj.cash_flow_record:
+                snapshot_records.append({"class": "CashFlowLedger", "id": fj.cash_flow_record.id, "data": _sm(fj.cash_flow_record)})
+
+        new_evs = session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == new_vc.id,
+            SystemEvent.aggregate_type == SystemAggregateType.VIRTUAL_CONTRACT,
+            SystemEvent.id > max_ev_id_before
+        ).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        snapshot_files = []
+        for cf in new_cfs:
+            voucher_path = os.path.join(VOUCHER_DIR, f"CashFlow_{cf.id}.json")
+            if os.path.exists(voucher_path):
+                with open(voucher_path, "r", encoding="utf-8") as f:
+                    snapshot_files.append({"path": voucher_path, "content": _json.load(f)})
+
+        snapshot_after = {"records": snapshot_records, "files": snapshot_files}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id] + [tr.id for tr in new_rules] + [cf.id for cf in new_cfs] + [fj.id for fj in new_fjs]
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_material_supply_vc_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before={},
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"物料供应单 VC-{new_vc.id} 创建成功")
     except Exception as e:
@@ -345,7 +594,10 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         return ActionResult(success=False, error=str(e))
 
 def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, draft_rules: list = None) -> ActionResult:
-    """退货执行单创建 Action"""
+    """退货执行单创建 Action（支持回滚）"""
+    import os
+    import json as _json
+    from logic.finance.engine import VOUCHER_DIR
     try:
         target_vc = session.query(VirtualContract).get(payload.target_vc_id)
         if not target_vc: return ActionResult(success=False, error="未找到目标虚拟合同")
@@ -444,6 +696,17 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
                 deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
             )
             clean_elems.append(_elem_to_dict(corrected))
+
+        # 应用附加业务政策（价格覆盖 + 标记 addon_business_ids）
+        clean_elems = _apply_addons_to_elements(session, target_vc.business_id, clean_elems)
+
+        # ============ 记录创建前的最大 ID ============
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_tr_id_before = session.query(func.max(TimeRule.id)).scalar() or 0
+        max_cf_id_before = session.query(func.max(CashFlow.id)).scalar() or 0
+        max_fj_id_before = session.query(func.max(FinancialJournal.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
+
         new_vc = VirtualContract(
             related_vc_id=payload.target_vc_id, business_id=target_vc.business_id,
             supply_chain_id=target_vc.supply_chain_id, type=VCType.RETURN,
@@ -462,6 +725,7 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         )
         session.add(new_vc)
         session.flush()
+        _record_vc_created_log(session, new_vc)
         RuleManager(session).sync_from_parent(TimeRuleRelatedType.VIRTUAL_CONTRACT, new_vc.id)
         if draft_rules:
             for r in draft_rules:
@@ -475,9 +739,71 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
                 ))
         apply_offset_to_vc(session, new_vc)
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {
-            "type": new_vc.type, "business_id": new_vc.business_id, 
+            "type": new_vc.type, "business_id": new_vc.business_id,
             "related_vc_id": new_vc.related_vc_id, "total_refund": payload.total_refund
         })
+        session.flush()
+
+        # ============ 构建 snapshot_after ============
+        from logic.transactions import serialize_model as _sm
+
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        new_rules = session.query(TimeRule).filter(
+            TimeRule.related_id == new_vc.id,
+            TimeRule.related_type == TimeRuleRelatedType.VIRTUAL_CONTRACT,
+            TimeRule.id > max_tr_id_before
+        ).all()
+        for tr in new_rules:
+            snapshot_records.append({"class": "TimeRule", "id": tr.id, "data": _sm(tr)})
+
+        new_cfs = session.query(CashFlow).filter(
+            CashFlow.virtual_contract_id == new_vc.id,
+            CashFlow.id > max_cf_id_before
+        ).all()
+        for cf in new_cfs:
+            snapshot_records.append({"class": "CashFlow", "id": cf.id, "data": _sm(cf)})
+
+        new_fjs = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_vc_id == new_vc.id,
+            FinancialJournal.id > max_fj_id_before
+        ).all()
+        for fj in new_fjs:
+            snapshot_records.append({"class": "FinancialJournal", "id": fj.id, "data": _sm(fj)})
+            if fj.cash_flow_record:
+                snapshot_records.append({"class": "CashFlowLedger", "id": fj.cash_flow_record.id, "data": _sm(fj.cash_flow_record)})
+
+        new_evs = session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == new_vc.id,
+            SystemEvent.aggregate_type == SystemAggregateType.VIRTUAL_CONTRACT,
+            SystemEvent.id > max_ev_id_before
+        ).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        snapshot_files = []
+        for cf in new_cfs:
+            voucher_path = os.path.join(VOUCHER_DIR, f"CashFlow_{cf.id}.json")
+            if os.path.exists(voucher_path):
+                with open(voucher_path, "r", encoding="utf-8") as f:
+                    snapshot_files.append({"path": voucher_path, "content": _json.load(f)})
+
+        snapshot_after = {"records": snapshot_records, "files": snapshot_files}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id] + [tr.id for tr in new_rules] + [cf.id for cf in new_cfs] + [fj.id for fj in new_fjs]
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_return_vc_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before={},
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"退货单 VC-{new_vc.id} 创建成功")
     except Exception as e:
@@ -485,19 +811,45 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         return ActionResult(success=False, error=str(e))
 
 def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
-    """底层 VC 数据修正 Action"""
+    """底层 VC 数据修正 Action（支持回滚）"""
     try:
         vc = session.query(VirtualContract).get(payload.id)
         if not vc: return ActionResult(success=False, error="未找到 VC")
-        
+
+        # snapshot_before：捕获修改前的值（UPDATE 类型）
+        from logic.transactions import serialize_model
+        snapshot_before = {"records": [{"class": "VirtualContract", "id": vc.id, "data": serialize_model(vc)}]}
+
+        session.begin_nested()
+
         if payload.description is not None:
             vc.description = payload.description
         if payload.elements is not None:
             vc.elements = payload.elements
         if payload.deposit_info is not None:
             vc.deposit_info = payload.deposit_info
-        
-        emit_event(session, SystemEventType.VC_UPDATED, SystemAggregateType.VIRTUAL_CONTRACT, vc.id, {"desc": vc.description})
+
+        # emit_event 内部 flush 后 SystemEvent 不在 session.new 中，用返回值引用它
+        system_event = emit_event(session, SystemEventType.VC_UPDATED, SystemAggregateType.VIRTUAL_CONTRACT, vc.id, {"desc": vc.description})
+
+        # snapshot_after：修改后的 VC + SystemEvent（flush 后 session.new 已清，用 serialize_model）
+        from logic.transactions import serialize_model as _sm
+        snapshot_after = {"records": [
+            {"class": "VirtualContract", "id": vc.id, "data": _sm(vc)},
+            {"class": "SystemEvent", "id": system_event.id, "data": _sm(system_event)},
+        ]}
+
+        from logic.transactions import create_operation_record
+        tx_id = create_operation_record(
+            session,
+            action_name="update_vc_action",
+            ref_type="VirtualContract",
+            ref_id=vc.id,
+            ref_vc_id=vc.id,
+            snapshot_before=snapshot_before,
+            involved_ids=[vc.id],
+        )
+
         session.commit()
         return ActionResult(success=True, message="底层数据已更新")
     except Exception as e:
@@ -505,17 +857,45 @@ def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
         return ActionResult(success=False, error=str(e))
 
 def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
-    """物理删除 VC Action (含级联清理)"""
+    """物理删除 VC Action (含级联清理，支持回滚)"""
     try:
+        from models import Logistics
+        from logic.transactions import serialize_model
+
         vc_id = payload.id
         vc = session.query(VirtualContract).get(vc_id)
         if not vc: return ActionResult(success=False, error="未找到 VC")
-        
-        from models import Logistics
+
+        # snapshot_before：捕获 VC + Logistics（删除前的完整状态）
+        snapshot_before = {"records": [
+            {"class": "VirtualContract", "id": vc.id, "data": serialize_model(vc)},
+        ]}
+        logistics_list = session.query(Logistics).filter(Logistics.virtual_contract_id == vc_id).all()
+        for log in logistics_list:
+            snapshot_before["records"].append({"class": "Logistics", "id": log.id, "data": serialize_model(log)})
+
+        session.begin_nested()
+
         session.query(Logistics).filter(Logistics.virtual_contract_id == vc_id).delete()
         session.delete(vc)
-        
-        emit_event(session, SystemEventType.VC_DELETED, SystemAggregateType.VIRTUAL_CONTRACT, vc_id)
+
+        system_event = emit_event(session, SystemEventType.VC_DELETED, SystemAggregateType.VIRTUAL_CONTRACT, vc_id)
+
+        # snapshot_after：空（删除操作无新记录，SystemEvent 已在 snapshot_before 中）
+        snapshot_after = {}
+
+        from logic.transactions import create_operation_record
+        tx_id = create_operation_record(
+            session,
+            action_name="delete_vc_action",
+            ref_type="VirtualContract",
+            ref_id=vc_id,
+            ref_vc_id=vc_id,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after,
+            involved_ids=[vc_id] + [log.id for log in logistics_list],
+        )
+
         session.commit()
         return ActionResult(success=True, message="该虚拟合同已从系统中完全移除")
     except Exception as e:
@@ -523,29 +903,40 @@ def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
         return ActionResult(success=False, error=str(e))
 
 def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcurementVCSchema, draft_rules: list = None) -> ActionResult:
-    """物料采购执行单创建 Action"""
+    """物料采购执行单创建 Action（支持回滚）"""
+    import os
+    import json as _json
+    from logic.finance.engine import VOUCHER_DIR
     try:
         sc = session.query(SupplyChain).get(payload.sc_id)
         if not sc or sc.type != SKUType.MATERIAL:
             return ActionResult(success=False, error="无效的物料供应链协议")
 
+        # ============ 记录创建前的最大 ID ============
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_tr_id_before = session.query(func.max(TimeRule.id)).scalar() or 0
+        max_cf_id_before = session.query(func.max(CashFlow.id)).scalar() or 0
+        max_fj_id_before = session.query(func.max(FinancialJournal.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
+
         # 商业逻辑
         # shipping_point_id = 供应商仓库（由sc.supplier_id确定）
-        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库
+        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库+客户仓库
         sp = _get_supplier_warehouse(session, sc.supplier_id)
         if not sp:
             return ActionResult(success=False, error=f"未找到供应商 {sc.supplier_id} 的仓库配置")
 
         our_wh_ids = _get_our_warehouses(session)
         supplier_wh_ids = _get_supplier_warehouses(session, sc.supplier_id)
-        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids))
+        customer_wh_ids = _get_customer_warehouses(session)
+        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids + customer_wh_ids))
         if not allowed_receiving:
             return ActionResult(success=False, error="没有可用的收货仓库")
 
         clean_elems = []
         for e in payload.elements:
             if e.receiving_point_id not in allowed_receiving:
-                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库）")
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库+客户仓库）")
 
             corrected = VCElementSchema(
                 shipping_point_id=sp,
@@ -569,9 +960,82 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
         )
         session.add(new_vc)
         session.flush()
+        _record_vc_created_log(session, new_vc)
         RuleManager(session).sync_from_parent(TimeRuleRelatedType.VIRTUAL_CONTRACT, new_vc.id)
+        if draft_rules:
+            for r in draft_rules:
+                session.add(TimeRule(
+                    related_id=new_vc.id, related_type=TimeRuleRelatedType.VIRTUAL_CONTRACT,
+                    party=r.get("party"), trigger_event=r.get("trigger_event"),
+                    target_event=r.get("target_event"), offset=r.get("offset"),
+                    unit=r.get("unit"), direction=r.get("direction"),
+                    inherit=r.get("inherit", 0), status=r.get("status", TimeRuleStatus.ACTIVE),
+                    timestamp=datetime.now()
+                ))
         apply_offset_to_vc(session, new_vc)
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "total_amount": payload.total_amt})
+        session.flush()
+
+        # ============ 构建 snapshot_after ============
+        from logic.transactions import serialize_model as _sm
+
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        new_rules = session.query(TimeRule).filter(
+            TimeRule.related_id == new_vc.id,
+            TimeRule.related_type == TimeRuleRelatedType.VIRTUAL_CONTRACT,
+            TimeRule.id > max_tr_id_before
+        ).all()
+        for tr in new_rules:
+            snapshot_records.append({"class": "TimeRule", "id": tr.id, "data": _sm(tr)})
+
+        new_cfs = session.query(CashFlow).filter(
+            CashFlow.virtual_contract_id == new_vc.id,
+            CashFlow.id > max_cf_id_before
+        ).all()
+        for cf in new_cfs:
+            snapshot_records.append({"class": "CashFlow", "id": cf.id, "data": _sm(cf)})
+
+        new_fjs = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_vc_id == new_vc.id,
+            FinancialJournal.id > max_fj_id_before
+        ).all()
+        for fj in new_fjs:
+            snapshot_records.append({"class": "FinancialJournal", "id": fj.id, "data": _sm(fj)})
+            if fj.cash_flow_record:
+                snapshot_records.append({"class": "CashFlowLedger", "id": fj.cash_flow_record.id, "data": _sm(fj.cash_flow_record)})
+
+        new_evs = session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == new_vc.id,
+            SystemEvent.aggregate_type == SystemAggregateType.VIRTUAL_CONTRACT,
+            SystemEvent.id > max_ev_id_before
+        ).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        snapshot_files = []
+        for cf in new_cfs:
+            voucher_path = os.path.join(VOUCHER_DIR, f"CashFlow_{cf.id}.json")
+            if os.path.exists(voucher_path):
+                with open(voucher_path, "r", encoding="utf-8") as f:
+                    snapshot_files.append({"path": voucher_path, "content": _json.load(f)})
+
+        snapshot_after = {"records": snapshot_records, "files": snapshot_files}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id] + [tr.id for tr in new_rules] + [cf.id for cf in new_cfs] + [fj.id for fj in new_fjs]
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_mat_procurement_vc_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before={},
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"物料采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
@@ -579,29 +1043,40 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
         return ActionResult(success=False, error=str(e))
 
 def create_stock_procurement_vc_action(session: Session, payload: CreateStockProcurementVCSchema, draft_rules: list = None) -> ActionResult:
-    """库存采购执行单创建 Action"""
+    """库存采购执行单创建 Action（支持回滚）"""
+    import os
+    import json as _json
+    from logic.finance.engine import VOUCHER_DIR
     try:
         sc = session.query(SupplyChain).get(payload.sc_id)
         if not sc or sc.type != SKUType.EQUIPMENT:
             return ActionResult(success=False, error="无效的设备供应链协议")
 
+        # ============ 记录创建前的最大 ID ============
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_tr_id_before = session.query(func.max(TimeRule.id)).scalar() or 0
+        max_cf_id_before = session.query(func.max(CashFlow.id)).scalar() or 0
+        max_fj_id_before = session.query(func.max(FinancialJournal.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
+
         # 商业逻辑
         # shipping_point_id = 供应商仓库（由sc.supplier_id确定）
-        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库
+        # receiving_point_id = 用户选择，范围=我们仓库+供应商仓库+客户仓库
         sp = _get_supplier_warehouse(session, sc.supplier_id)
         if not sp:
             return ActionResult(success=False, error=f"未找到供应商 {sc.supplier_id} 的仓库配置")
 
         our_wh_ids = _get_our_warehouses(session)
         supplier_wh_ids = _get_supplier_warehouses(session, sc.supplier_id)
-        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids))
+        customer_wh_ids = _get_customer_warehouses(session)
+        allowed_receiving = list(set(our_wh_ids + supplier_wh_ids + customer_wh_ids))
         if not allowed_receiving:
             return ActionResult(success=False, error="没有可用的收货仓库")
 
         clean_elems = []
         for e in payload.elements:
             if e.receiving_point_id not in allowed_receiving:
-                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库）")
+                return ActionResult(success=False, error=f"收货点 {e.receiving_point_id} 不在允许的仓库范围内（我们仓库+供应商仓库+客户仓库）")
 
             corrected = VCElementSchema(
                 shipping_point_id=sp,
@@ -627,18 +1102,93 @@ def create_stock_procurement_vc_action(session: Session, payload: CreateStockPro
         )
         session.add(new_vc)
         session.flush()
+        _record_vc_created_log(session, new_vc)
         RuleManager(session).sync_from_parent(TimeRuleRelatedType.VIRTUAL_CONTRACT, new_vc.id)
+        if draft_rules:
+            for r in draft_rules:
+                session.add(TimeRule(
+                    related_id=new_vc.id, related_type=TimeRuleRelatedType.VIRTUAL_CONTRACT,
+                    party=r.get("party"), trigger_event=r.get("trigger_event"),
+                    target_event=r.get("target_event"), offset=r.get("offset"),
+                    unit=r.get("unit"), direction=r.get("direction"),
+                    inherit=r.get("inherit", 0), status=r.get("status", TimeRuleStatus.ACTIVE),
+                    timestamp=datetime.now()
+                ))
         apply_offset_to_vc(session, new_vc)
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "total_amount": payload.total_amt})
+        session.flush()
+
+        # ============ 构建 snapshot_after ============
+        from logic.transactions import serialize_model as _sm
+
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        new_rules = session.query(TimeRule).filter(
+            TimeRule.related_id == new_vc.id,
+            TimeRule.related_type == TimeRuleRelatedType.VIRTUAL_CONTRACT,
+            TimeRule.id > max_tr_id_before
+        ).all()
+        for tr in new_rules:
+            snapshot_records.append({"class": "TimeRule", "id": tr.id, "data": _sm(tr)})
+
+        new_cfs = session.query(CashFlow).filter(
+            CashFlow.virtual_contract_id == new_vc.id,
+            CashFlow.id > max_cf_id_before
+        ).all()
+        for cf in new_cfs:
+            snapshot_records.append({"class": "CashFlow", "id": cf.id, "data": _sm(cf)})
+
+        new_fjs = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_vc_id == new_vc.id,
+            FinancialJournal.id > max_fj_id_before
+        ).all()
+        for fj in new_fjs:
+            snapshot_records.append({"class": "FinancialJournal", "id": fj.id, "data": _sm(fj)})
+            if fj.cash_flow_record:
+                snapshot_records.append({"class": "CashFlowLedger", "id": fj.cash_flow_record.id, "data": _sm(fj.cash_flow_record)})
+
+        new_evs = session.query(SystemEvent).filter(
+            SystemEvent.aggregate_id == new_vc.id,
+            SystemEvent.aggregate_type == SystemAggregateType.VIRTUAL_CONTRACT,
+            SystemEvent.id > max_ev_id_before
+        ).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        snapshot_files = []
+        for cf in new_cfs:
+            voucher_path = os.path.join(VOUCHER_DIR, f"CashFlow_{cf.id}.json")
+            if os.path.exists(voucher_path):
+                with open(voucher_path, "r", encoding="utf-8") as f:
+                    snapshot_files.append({"path": voucher_path, "content": _json.load(f)})
+
+        snapshot_after = {"records": snapshot_records, "files": snapshot_files}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id] + [tr.id for tr in new_rules] + [cf.id for cf in new_cfs] + [fj.id for fj in new_fjs]
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_stock_procurement_vc_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before={},
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"库存采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
         return ActionResult(success=False, error=str(e))
 
-def allocate_inventory_action(session: Session, payload: AllocateInventorySchema) -> ActionResult:
-    """库存拨付 Action"""
+def create_inventory_allocation_action(session: Session, payload: AllocateInventorySchema) -> ActionResult:
+    """库存拨付 Action（支持回滚）"""
     try:
+        from logic.transactions import serialize_model
+
         biz = session.query(Business).get(payload.business_id)
         if not biz: return ActionResult(success=False, error="未找到关联业务项目")
 
@@ -651,6 +1201,19 @@ def allocate_inventory_action(session: Session, payload: AllocateInventorySchema
         allowed_receiving = _get_customer_points(session, biz.customer_id)
         if not allowed_receiving:
             return ActionResult(success=False, error=f"客户 {biz.customer_id} 没有可用点位，请先配置")
+
+        # 收集所有将被修改的 EquipmentInventory SN 和旧值（snapshot_before）
+        all_sn_list = []
+        for e in payload.elements:
+            for eq_id in e.sn_list:
+                all_sn_list.append(str(eq_id))
+
+        # snapshot_before：所有将被修改的 EquipmentInventory 旧值
+        snapshot_before = {"records": []}
+        if all_sn_list:
+            old_eqs = session.query(EquipmentInventory).filter(EquipmentInventory.sn.in_(all_sn_list)).all()
+            for eq in old_eqs:
+                snapshot_before["records"].append({"class": "EquipmentInventory", "id": eq.id, "data": serialize_model(eq)})
 
         allowed_shipping_by_sku = {}
         for e in payload.elements:
@@ -686,6 +1249,14 @@ def allocate_inventory_action(session: Session, payload: AllocateInventorySchema
                 deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
             )
             clean_elems.append(_elem_to_dict(corrected))
+
+        # 应用附加业务政策（价格覆盖 + 标记 addon_business_ids）
+        clean_elems = _apply_addons_to_elements(session, payload.business_id, clean_elems)
+
+        # ============ 记录创建前的最大 ID ============
+        max_vc_id_before = session.query(func.max(VirtualContract.id)).scalar() or 0
+        max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
+
         new_vc = VirtualContract(
             business_id=payload.business_id,
             type=VCType.INVENTORY_ALLOCATION,
@@ -700,6 +1271,8 @@ def allocate_inventory_action(session: Session, payload: AllocateInventorySchema
         )
         session.add(new_vc)
         session.flush()
+        _record_vc_created_log(session, new_vc)
+
         # 更新设备状态
         for e in payload.elements:
             target_pt = e.receiving_point_id
@@ -710,6 +1283,43 @@ def allocate_inventory_action(session: Session, payload: AllocateInventorySchema
                 eq.virtual_contract_id = new_vc.id
 
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "equipment_count": sum(e.qty for e in payload.elements)})
+        session.flush()
+
+        # ============ 构建 snapshot_after ============
+        from logic.transactions import serialize_model as _sm
+
+        snapshot_records = [{"class": "VirtualContract", "id": new_vc.id, "data": _sm(new_vc)}]
+
+        # EquipmentInventory 新值（重新查询）
+        if all_sn_list:
+            new_eqs = session.query(EquipmentInventory).filter(EquipmentInventory.sn.in_(all_sn_list)).all()
+            for eq in new_eqs:
+                snapshot_records.append({"class": "EquipmentInventory", "id": eq.id, "data": _sm(eq)})
+
+        # SystemEvent
+        new_evs = session.query(SystemEvent).filter(SystemEvent.id > max_ev_id_before).all()
+        for ev in new_evs:
+            snapshot_records.append({"class": "SystemEvent", "id": ev.id, "data": _sm(ev)})
+
+        snapshot_after = {"records": snapshot_records}
+
+        from logic.transactions import create_operation_record
+        involved_ids = [new_vc.id]
+        if all_sn_list:
+            eq_ids = [eq.id for eq in session.query(EquipmentInventory).filter(EquipmentInventory.sn.in_(all_sn_list)).all()]
+            involved_ids += eq_ids
+
+        tx_id = create_operation_record(
+            session,
+            action_name="create_inventory_allocation_action",
+            ref_type="VirtualContract",
+            ref_id=new_vc.id,
+            ref_vc_id=new_vc.id,
+            snapshot_before=snapshot_before,
+            snapshot_after=snapshot_after,
+            involved_ids=involved_ids,
+        )
+
         session.commit()
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"库存拨付完成")
     except Exception as e:

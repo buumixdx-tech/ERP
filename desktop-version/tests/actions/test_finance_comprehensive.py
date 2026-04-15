@@ -10,9 +10,11 @@ from datetime import datetime
 from logic.vc.actions import (
     create_procurement_vc_action,
     create_material_supply_vc_action,
+    create_mat_procurement_vc_action,
 )
 from logic.vc.schemas import (
-    CreateProcurementVCSchema, CreateMaterialSupplyVCSchema, VCElementSchema,
+    CreateProcurementVCSchema, CreateMaterialSupplyVCSchema,
+    CreateMatProcurementVCSchema, VCElementSchema,
 )
 from logic.logistics.actions import create_logistics_plan_action, confirm_inbound_action
 from logic.logistics.schemas import CreateLogisticsPlanSchema, ConfirmInboundSchema
@@ -89,7 +91,7 @@ def _create_supplier(session, id, name, category):
     return s
 
 def _create_sc(session, id, supplier_id, sc_type, pricing):
-    sc = SupplyChain(id=id, supplier_id=supplier_id, supplier_name=f"supplier_{supplier_id}",
+    sc = SupplyChain(id=id, supplier_id=supplier_id,
                      type=sc_type, pricing_config=pricing)
     session.add(sc)
     return sc
@@ -891,3 +893,173 @@ class TestFinancialJournalCreation:
             print(f"✅ 凭证文件: {recent_vouchers[-1]}")
         else:
             print(f"⚠️ 凭证目录不存在: {voucher_dir}，跳过文件验证（仅验证 journal 记录）")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 场景五：process_logistics_finance 物流财务凭证（新增）
+# ─────────────────────────────────────────────────────────────────────────────
+
+from logic.finance.engine import process_logistics_finance
+
+
+class TestProcessLogisticsFinance:
+    """process_logistics_finance 凭证生成测试"""
+
+    def _make_logistics_ready(self, db_session, vc_id, total_amount):
+        """创建物流并设置 FINISH 状态以触发 process_logistics_finance"""
+        from logic.logistics.actions import create_logistics_plan_action
+        from logic.logistics.schemas import CreateLogisticsPlanSchema
+
+        orders = [{
+            "tracking_number": f"LOG-{vc_id}-TEST",
+            "items": [{"sku_id": 17, "sku_name": "冰激凌机-广东中贝-三头两缸", "qty": 1}],
+            "address_info": {
+                "收货方联系电话": "13800138000", "发货方联系电话": "13900139000",
+                "收货点位Id": 14, "收货点位名称": "西村大院店",
+                "发货点位名称": "广东中贝仓", "address": "测试地址",
+            }
+        }]
+        log_result = create_logistics_plan_action(
+            db_session, CreateLogisticsPlanSchema(vc_id=vc_id, orders=orders)
+        )
+        assert log_result.success
+        logistics = db_session.query(Logistics).filter_by(virtual_contract_id=vc_id).first()
+        assert logistics is not None
+
+        # 直接设置状态，跳过状态机（便于单元测试）
+        logistics.status = LogisticsStatus.FINISH
+        logistics.finance_triggered = False
+        vc = db_session.query(VirtualContract).get(vc_id)
+        vc.subject_status = SubjectStatus.FINISH
+        db_session.flush()
+        return logistics
+
+    def test_process_logistics_equipment_procurement(self, db_session, base_data):
+        """✅ 设备采购物流完成 → 生成 借:固定资产 贷:应付账款 凭证"""
+        elems = [
+            VCElementSchema(shipping_point_id=8, receiving_point_id=14, sku_id=17,
+                            qty=2, price=2950, deposit=500, subtotal=5900)
+        ]
+        payload = CreateProcurementVCSchema(
+            business_id=3, sc_id=6, elements=elems, total_amt=5900, total_deposit=1000,
+            payment={"prepayment_ratio": 0, "balance_period": 0, "day_rule": "自然日", "start_trigger": "入库日"},
+        )
+        result = create_procurement_vc_action(db_session, payload)
+        assert result.success
+        vc_id = result.data["vc_id"]
+        db_session.flush()
+
+        logistics = self._make_logistics_ready(db_session, vc_id, 5900)
+
+        # 调用 process_logistics_finance
+        process_logistics_finance(db_session, logistics.id)
+        db_session.flush()
+
+        # 验证凭证
+        journals = db_session.query(FinancialJournal).filter_by(ref_vc_id=vc_id).all()
+        assert len(journals) >= 2, f"设备采购应有至少 2 条分录，实际 {len(journals)}"
+
+        total_debit = sum(j.debit for j in journals)
+        total_credit = sum(j.credit for j in journals)
+        assert abs(total_debit - total_credit) < 0.01, "借贷必相等"
+        assert total_debit == 5900, f"借方合计应为 5900，实际 {total_debit}"
+        print(f"✅ 设备采购物流凭证: {len(journals)} 条, debit={total_debit}, credit={total_credit}")
+
+    def test_process_logistics_material_procurement(self, db_session, base_data):
+        """✅ 物料采购物流完成 → 生成 借:库存商品 贷:应付账款 凭证"""
+        # receiving_point_id 必须在 our_warehouses（自有仓）范围内
+        elems = [
+            VCElementSchema(shipping_point_id=3, receiving_point_id=1, sku_id=2,
+                            qty=100, price=6.5, deposit=0, subtotal=650)
+        ]
+        payload = CreateMatProcurementVCSchema(
+            sc_id=1, elements=elems, total_amt=650,
+            payment={"prepayment_ratio": 0, "balance_period": 0, "day_rule": "自然日", "start_trigger": "入库日"},
+        )
+        result = create_mat_procurement_vc_action(db_session, payload)
+        assert result.success, f"物料采购VC创建失败: {result.error}"
+        vc_id = result.data["vc_id"]
+        db_session.flush()
+
+        logistics = self._make_logistics_ready(db_session, vc_id, 650)
+
+        process_logistics_finance(db_session, logistics.id)
+        db_session.flush()
+
+        journals = db_session.query(FinancialJournal).filter_by(ref_vc_id=vc_id).all()
+        assert len(journals) >= 2, f"物料采购应有至少 2 条分录，实际 {len(journals)}"
+
+        total_debit = sum(j.debit for j in journals)
+        total_credit = sum(j.credit for j in journals)
+        assert abs(total_debit - total_credit) < 0.01, "借贷必相等"
+        print(f"✅ 物料采购物流凭证: {len(journals)} 条")
+
+    def test_process_logistics_material_supply_with_cost(self, db_session, base_data):
+        """✅ 物料供应（含成本结转） → 生成收入分录 + 成本分录"""
+        # 预插物料库存（含 averagePrice）使成本结转生效；发货点=朝旭食养仓(3)
+        mat_inv = MaterialInventory(
+            sku_id=2, total_balance=50.0, average_price=5.0,
+            stock_distribution={"3": 50}
+        )
+        db_session.add(mat_inv)
+        db_session.flush()
+
+        elems = [
+            VCElementSchema(shipping_point_id=3, receiving_point_id=12, sku_id=2,
+                            qty=50, price=10, deposit=0, subtotal=500)
+        ]
+        payload = CreateMaterialSupplyVCSchema(
+            business_id=2, elements=elems, total_amt=500, description="测试供应含成本"
+        )
+        result = create_material_supply_vc_action(db_session, payload)
+        assert result.success, f"物料供应VC创建失败: {result.error}"
+        vc_id = result.data["vc_id"]
+        db_session.flush()
+
+        logistics = self._make_logistics_ready(db_session, vc_id, 500)
+
+        process_logistics_finance(db_session, logistics.id)
+        db_session.flush()
+
+        journals = db_session.query(FinancialJournal).filter_by(ref_vc_id=vc_id).all()
+        # 收入分录(2条) + 成本分录(2条) = 4 条
+        assert len(journals) >= 4, f"物料供应（含成本）应有 4 条分录，实际 {len(journals)}"
+
+        total_debit = sum(j.debit for j in journals)
+        total_credit = sum(j.credit for j in journals)
+        assert abs(total_debit - total_credit) < 0.01, "借贷必相等"
+        print(f"✅ 物料供应（含成本）凭证: {len(journals)} 条")
+
+    def test_process_logistics_duplicate_skip(self, db_session, base_data):
+        """✅ 重复调用 process_logistics_finance 时跳过（is_duplicate）"""
+        elems = [
+            VCElementSchema(shipping_point_id=8, receiving_point_id=14, sku_id=17,
+                            qty=1, price=2950, deposit=0, subtotal=2950)
+        ]
+        payload = CreateProcurementVCSchema(
+            business_id=3, sc_id=6, elements=elems, total_amt=2950, total_deposit=0,
+            payment={"prepayment_ratio": 0, "balance_period": 0, "day_rule": "自然日", "start_trigger": "入库日"},
+        )
+        result = create_procurement_vc_action(db_session, payload)
+        assert result.success
+        vc_id = result.data["vc_id"]
+        db_session.flush()
+
+        logistics = self._make_logistics_ready(db_session, vc_id, 2950)
+
+        # 第一次调用
+        process_logistics_finance(db_session, logistics.id)
+        db_session.flush()
+
+        journals_after_first = db_session.query(FinancialJournal).filter_by(ref_vc_id=vc_id).all()
+        first_count = len(journals_after_first)
+        assert first_count >= 2, f"首次调用应有分录，实际 {first_count}"
+
+        # 第二次调用（duplicate）— finance_triggered 已被设为 True
+        process_logistics_finance(db_session, logistics.id)
+        db_session.flush()
+
+        journals_after_second = db_session.query(FinancialJournal).filter_by(ref_vc_id=vc_id).all()
+        assert len(journals_after_second) == first_count, \
+            f"重复调用不应生成新分录，仍为 {first_count} 条"
+        print(f"✅ 重复调用跳过: 首次 {first_count} 条，再次调用后仍 {len(journals_after_second)} 条")

@@ -113,8 +113,11 @@ class EventHandler:
         """获取业务或供应链关联的合同"""
         if related_type == TimeRuleRelatedType.BUSINESS:
             biz = self.session.query(Business).get(related_id)
-            if biz and biz.contract_id:
-                return self.session.query(Contract).get(biz.contract_id)
+            if biz and biz.details:
+                contracts = biz.details.get("contracts", [])
+                for c in contracts:
+                    if c.get("is_primary"):
+                        return self.session.query(Contract).get(c["id"])
         elif related_type == TimeRuleRelatedType.SUPPLY_CHAIN:
             sc = self.session.query(SupplyChain).get(related_id)
             if sc and sc.contract_id:

@@ -20,6 +20,9 @@ interface MaterialInventoryDao {
     @Query("SELECT * FROM material_inventory WHERE sku_id = :skuId")
     suspend fun getBySkuId(skuId: Long): MaterialInventoryEntity?
 
+    @Query("SELECT * FROM material_inventory WHERE sku_id IN (:skuIds)")
+    suspend fun getBySkuIds(skuIds: List<Long>): List<MaterialInventoryEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(entity: MaterialInventoryEntity): Long
 

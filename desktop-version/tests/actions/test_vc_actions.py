@@ -33,7 +33,7 @@ class TestCreateProcurementVCAction:
         db_session.add(cust_wh)
         db_session.flush()
 
-        sc = SupplyChain(supplier_id=sample_supplier.id, supplier_name=sample_supplier.name, type="设备")
+        sc = SupplyChain(supplier_id=sample_supplier.id, type="设备")
         db_session.add(sc)
         db_session.flush()
 

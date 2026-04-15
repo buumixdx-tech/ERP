@@ -1,6 +1,7 @@
 from typing import List, Dict, Optional, Any
-from models import get_session, Business, ChannelCustomer, VirtualContract
+from models import get_session, Business, ChannelCustomer, VirtualContract, SKU
 from logic.constants import BusinessStatus
+from logic.master import get_partner_relations
 
 def get_business_list(
     status: Optional[str] = None,
@@ -31,7 +32,12 @@ def get_business_list(
                 "status": biz.status,
                 "status_label": _get_status_label(biz.status),
                 "created_at": biz.timestamp.strftime("%Y-%m-%d") if biz.timestamp else "",
-                "details": biz.details or {}
+                "details": biz.details or {},
+                "partners": get_partner_relations(
+                    owner_type="business",
+                    owner_id=biz.id,
+                    active_only=True
+                )
             })
         return result
     finally:
@@ -44,10 +50,13 @@ def get_business_detail(business_id: int) -> Optional[Dict[str, Any]]:
         biz = session.query(Business).get(business_id)
         if not biz:
             return None
-        
+
         customer = session.query(ChannelCustomer).get(biz.customer_id)
         contracts = session.query(VirtualContract).filter(VirtualContract.business_id == business_id).all()
-        
+
+        # pricing key 为 sku_id（数字字符串），直接透传
+        pricing = biz.details.get("pricing", {}) if biz.details else {}
+
         return {
             "id": biz.id,
             "customer_id": customer.id if customer else None,
@@ -59,10 +68,11 @@ def get_business_detail(business_id: int) -> Optional[Dict[str, Any]]:
             },
             "status": biz.status,
             "status_label": _get_status_label(biz.status),
-            "pricing": biz.details.get("pricing", {}) if biz.details else {},
+            "pricing": pricing,
             "payment_terms": biz.details.get("payment_terms", {}) if biz.details else {},
+            "contracts": biz.details.get("contracts", []) if biz.details else [],
             "details": biz.details or {},
-            "contracts": [
+            "vc_list": [
                 {
                     "id": c.id,
                     "type": c.type,
@@ -72,7 +82,12 @@ def get_business_detail(business_id: int) -> Optional[Dict[str, Any]]:
                 for c in contracts
             ],
             "created_at": biz.timestamp.strftime("%Y-%m-%d %H:%M") if biz.timestamp else "",
-            "updated_at": ""
+            "updated_at": "",
+            "partners": get_partner_relations(
+                owner_type="business",
+                owner_id=biz.id,
+                active_only=True
+            )
         }
     finally:
         session.close()

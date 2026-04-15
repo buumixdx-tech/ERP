@@ -1,11 +1,18 @@
 from models import get_session, Logistics, ExpressOrder, VirtualContract, CashFlow, SystemEvent
-from logic.constants import VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection, CashFlowType, LogisticsStatus, OperationalStatus, DeviceStatus, SystemEventType, SystemAggregateType
+from logic.constants import VCType, VCStatus, SubjectStatus, CashStatus, ReturnDirection, CashFlowType, LogisticsStatus, OperationalStatus, DeviceStatus, SystemEventType, SystemAggregateType, EPSILON
 from logic.events.dispatcher import emit_event
+import logging
 
-# 延迟导入finance模块以避免循环导入
-def _get_finance_module():
-    import logic.finance as finance
-    return finance
+logger = logging.getLogger(__name__)
+
+def _emit_event_if_not_exists(session, event_type, aggregate_id, payload):
+    """防重检查 + 事件发送"""
+    exists = session.query(SystemEvent).filter(
+        SystemEvent.event_type == event_type,
+        SystemEvent.aggregate_id == aggregate_id
+    ).first()
+    if not exists:
+        emit_event(session, event_type, SystemAggregateType.VIRTUAL_CONTRACT, aggregate_id, payload)
 
 def logistics_state_machine(logistics_id, express_order_id=None, session=None):
     """物流单状态机：根据快递单状态更新物流单状态，并触发 VC 状态更新"""
@@ -105,32 +112,21 @@ def virtual_contract_state_machine(vc_id, ref_type, ref_id, session=None):
                 deposit_module(cf_id=ref_id, session=session)
 
             # 判定资金状态
-            is_goods_cleared = (paid_goods >= (total_due - 0.01))
-            is_deposit_cleared = (dep_due <= 0 or (paid_deposit - paid_return_deposit) >= (dep_due - 0.01))
-            
+            is_goods_cleared = (paid_goods >= (total_due - EPSILON))
+            is_deposit_cleared = (dep_due <= 0 or (paid_deposit - paid_return_deposit) >= (dep_due - EPSILON))
+
             # --- 关键：发送原子子事件 (货款结清/押金结清) ---
             if is_goods_cleared:
-                # 检查之前是否发过 (通过查询系统事件表防重)
-                exists = session.query(SystemEvent).filter(
-                    SystemEvent.event_type == SystemEventType.VC_GOODS_CLEARED,
-                    SystemEvent.aggregate_id == vc.id
-                ).first()
-                if not exists:
-                    emit_event(session, SystemEventType.VC_GOODS_CLEARED, SystemAggregateType.VIRTUAL_CONTRACT, vc.id, {
-                        "amount": paid_goods,
-                        "type": "refund" if vc.type == VCType.RETURN else "income"
-                    })
-            
-            if is_deposit_cleared and dep_due > 0.01:
-                exists = session.query(SystemEvent).filter(
-                    SystemEvent.event_type == SystemEventType.VC_DEPOSIT_CLEARED,
-                    SystemEvent.aggregate_id == vc.id
-                ).first()
-                if not exists:
-                    emit_event(session, SystemEventType.VC_DEPOSIT_CLEARED, SystemAggregateType.VIRTUAL_CONTRACT, vc.id, {
-                        "amount": (paid_deposit - paid_return_deposit),
-                        "type": "return" if vc.type == VCType.RETURN else "receive"
-                    })
+                _emit_event_if_not_exists(session, SystemEventType.VC_GOODS_CLEARED, vc.id, {
+                    "amount": paid_goods,
+                    "type": "refund" if vc.type == VCType.RETURN else "income"
+                })
+
+            if is_deposit_cleared and dep_due > EPSILON:
+                _emit_event_if_not_exists(session, SystemEventType.VC_DEPOSIT_CLEARED, vc.id, {
+                    "amount": (paid_deposit - paid_return_deposit),
+                    "type": "return" if vc.type == VCType.RETURN else "receive"
+                })
 
             if is_goods_cleared and is_deposit_cleared:
                 if vc.cash_status != CashStatus.FINISH:
@@ -140,7 +136,7 @@ def virtual_contract_state_machine(vc_id, ref_type, ref_id, session=None):
                 payment_terms = vc.elements.get('payment_terms')
                 ratio = payment_terms.get('prepayment_ratio', 0) if payment_terms else 0
                 if ratio > 0 and vc.cash_status == CashStatus.EXE:
-                    if paid_goods >= (total_due * ratio - 0.01):
+                    if paid_goods >= (total_due * ratio - EPSILON):
                         vc.update_cash_status(CashStatus.PREPAID)
 
         # 3. 总体状态 (VC Status)

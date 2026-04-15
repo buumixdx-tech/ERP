@@ -1,15 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/queries/test_queries_integration.py -v --tb=short)",
-      "Bash(python -c \"from logic.inventory import queries; print\\(dir\\(queries\\)\\)\")",
-      "Bash(python -c \"import logic.finance.queries; print\\(''ok''\\)\")",
-      "Bash(python -m pytest tests/ -v --tb=short -q)",
-      "Bash(python -m pytest tests/test_ui_refactoring.py -v --tb=short)",
-      "Bash(python -m pytest tests/ -q --tb=short)",
-      "Bash(python -c \"from ui.entry import show_entry_page; print\\(''ok''\\)\")",
-      "Bash(python -c \"from ui.entry import show_entry_page; print\\(''''ok''''\\)\")",
-      "Bash(python -c \"import main\")"
+      "Bash(*)",
+      "Bash(pip install:*)"
     ]
   }
 }

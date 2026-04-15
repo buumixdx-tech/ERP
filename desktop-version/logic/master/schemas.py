@@ -41,10 +41,20 @@ class PartnerSchema(BaseModel):
     name: str = Field(..., description="合作方名称")
     type: str = Field(..., description="类型")
 
+
+class PartnerRelationSchema(BaseModel):
+    id: Optional[int] = Field(None, description="关联ID")
+    partner_id: int = Field(..., description="合作方ID")
+    owner_type: str = Field(..., description="归属主体类型 (business/supply_chain/ourselves)")
+    owner_id: Optional[int] = Field(None, description="归属主体ID (ourselves时为None)")
+    relation_type: str = Field(..., description="合作模式")
+    remark: Optional[str] = Field(None, description="备注")
+
+
 class BankAccountSchema(BaseModel):
     id: Optional[int] = Field(None, description="账号ID")
     owner_type: str = Field(..., description="所有者类型 (Customer/Supplier/Ourselves/Partner)")
-    owner_id: int = Field(..., description="所有者ID")
+    owner_id: Optional[int] = Field(None, description="所有者ID（Ourselves类型时为NULL）")
     bank_name: str = Field(..., description="开户行")
     account_no: str = Field(..., description="账号")
     is_default: bool = Field(False, description="是否为默认账号")

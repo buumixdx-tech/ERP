@@ -1,6 +1,8 @@
 # CLAUDE.md
 
 本文档为 Claude Code (claude.ai/code) 提供代码库操作指引。
+所有读取markdown和db的操作都要基于UTF8编码
+
 
 ## 项目简介
 
@@ -85,7 +87,7 @@ api/routers/                    # FastAPI 路由
 `create_supply_chain_action` / `delete_supply_chain_action` / `get_supply_chains` / `get_supply_chain_detail`
 
 **虚拟合同**（`logic/vc/`）：
-`create_procurement_vc_action` / `create_material_supply_vc_action` / `create_stock_procurement_vc_action` / `create_mat_procurement_vc_action` / `create_return_vc_action` / `update_vc_action` / `delete_vc_action` / `allocate_inventory_action` / `get_vc_list` / `get_vc_detail` / `get_time_rules_for_vc` / `get_returnable_vcs` / `get_vc_status_logs` / `get_vc_cash_flows`
+`create_procurement_vc_action` / `create_material_supply_vc_action` / `create_stock_procurement_vc_action` / `create_mat_procurement_vc_action` / `create_return_vc_action` / `update_vc_action` / `delete_vc_action` / `create_inventory_allocation_action` / `get_vc_list` / `get_vc_detail` / `get_time_rules_for_vc` / `get_returnable_vcs` / `get_vc_status_logs` / `get_vc_cash_flows`
 
 **物流**（`logic/logistics/`）：
 `create_logistics_plan_action` / `confirm_inbound_action` / `update_express_order_action` / `update_express_order_status_action` / `bulk_progress_express_orders_action` / `get_logistics_list` / `get_logistics_detail` / `get_logistics_dashboard_summary`
@@ -148,6 +150,7 @@ Android 已实现桌面端约 85-90% 的资金流逻辑。已知差异：
 - **桌面端优先**：先在 `desktop-version/` 实现和测试业务逻辑，再移植 Android
 - **移植到 Android**：逐行对比 `logic/` 文件与 `usecase/` 目录，确保状态机/押金/核销逻辑一致
 - **数据库**：桌面端 SQLite 在 `desktop-version/data/*.db`，严禁提交 `*.db`、`*-wal`、`*-shm`
+- **编码**：所有数据库操作（SQLAlchemy/SQLite）和 Excel 导入导出均须使用 UTF-8 编码，中文数据才能正确存储和读取
 - **财务凭证**：`data/finance/finance-voucher/*.json` 已在 `.gitignore` 中忽略
 
 ---

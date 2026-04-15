@@ -7,7 +7,7 @@ from models import VirtualContract, VirtualContractStatusLog, Logistics, CashFlo
 from logic.vc import (
     create_procurement_vc_action, create_material_supply_vc_action,
     create_return_vc_action, create_mat_procurement_vc_action,
-    create_stock_procurement_vc_action, allocate_inventory_action,
+    create_stock_procurement_vc_action, create_inventory_allocation_action,
     update_vc_action, delete_vc_action,
     CreateProcurementVCSchema, CreateMaterialSupplyVCSchema, CreateReturnVCSchema,
     CreateMatProcurementVCSchema, CreateStockProcurementVCSchema, AllocateInventorySchema,
@@ -80,7 +80,7 @@ def create_stock_procurement_vc(req: CreateStockProcurementVCRequest, session: S
 @router.post("/allocate-inventory", summary="库存拨付")
 def allocate_inventory(payload: AllocateInventorySchema, session: Session = Depends(get_db)):
     """将自有仓库存设备分配到客户业务点位。支持多点位分配。"""
-    return allocate_inventory_action(session, payload).model_dump()
+    return create_inventory_allocation_action(session, payload).model_dump()
 
 
 @router.post("/update", summary="更新虚拟合同")
