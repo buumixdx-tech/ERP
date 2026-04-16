@@ -11,7 +11,7 @@
 | `id` | Integer | 主键 |
 | `customer_id` | Integer | 关联渠道客户 |
 | `status` | String | 当前阶段状态 |
-| `details` | JSON | 包含 history（状态变迁记录）、pricing（客户协议价格配置）等 |
+| `details` | JSON | 包含 history（状态变迁记录）、pricing（客户协议价格配置，**key 为 sku_id**）等 |
 
 ## 状态流转（6阶段）
 
@@ -57,6 +57,7 @@ TERMINATED（终止）/ FINISHED（完成）
 - **→ Point**：客户的所有点位（运营点位、客户仓）归属于 Business
 - **→ TimeRule**：Business 阶段推进时生成模板规则，向下传播到 VC 和 Logistics
 - **→ ChannelCustomer**：通过 `customer_id` 关联
+- **→ AddonBusiness**：Business 可挂多个附加业务政策（PRICE_ADJUST / NEW_SKU），在 ACTIVE 阶段生效
 
 ## 事件发布
 
@@ -66,6 +67,9 @@ TERMINATED（终止）/ FINISHED（完成）
 | `BUSINESS_STATUS_CHANGED` | 状态变更 |
 | `BUSINESS_STAGE_ADVANCED` | 阶段推进 |
 | `BUSINESS_DELETED` | 删除业务 |
+| `ADDON_CREATED` | 附加业务创建（由 `addon_business` 模块发布） |
+| `ADDON_UPDATED` | 附加业务更新 |
+| `ADDON_DEACTIVATED` | 附加业务失效 |
 
 ## 开发注意事项
 

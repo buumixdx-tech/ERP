@@ -62,9 +62,16 @@ logic/
 ├── time_rules/                 # 规则引擎：rule_manager + 三层继承链 + 告警等级
 ├── events/                     # 事件派发（emit → dispatch → listener 链）
 ├── inventory.py                 # 设备 SN + 物料库存变动
-└── file_mgmt.py               # Excel 导入导出 / 合同附件
+├── file_mgmt.py               # Excel 导入导出 / 合同附件
+├── addon_business/            # 附加业务政策（原子化：有效期促销/新增SKU/付款条款）
+│   ├── actions.py             # 创建/更新/失效附加业务
+│   ├── queries.py             # 生效addon查询/日期重叠检查/原价获取
+│   └── schemas.py             # Pydantic Schema
+├── transactions.py             # 操作回滚/撤销回滚（快照序列化 + OperationTransaction）
 ui/                             # Streamlit 页面
 api/routers/                    # FastAPI 路由
+scripts/                        # 数据迁移脚本
+docs/rollback/                  # Action 回滚文档（16个 action 的快照结构说明）
 ```
 
 ### 核心设计模式
@@ -75,6 +82,22 @@ api/routers/                    # FastAPI 路由
 
 **复式记账：** `process_cash_flow_finance()` 和 `process_logistics_finance()` 生成 `FinancialJournal` 双录，押金按 SKU 运营设备数重算 `should_receive`。
 
+**回滚支持：** 每个 Action 在 `operation_transactions` 表记录 `snapshot_before`/`snapshot_after`，通过 `rollback_operation()` / `redo_operation()` 实现回滚/撤销回滚。
+
+### Business details 数据结构
+
+`business.details` JSON 结构：
+```json
+{
+  "history": [{"from", "to", "time", "comment"}],
+  "pricing": {"<sku_id>": {"price": 11.5, "deposit": 300}},
+  "payment_terms": {"prepayment_ratio": 0.3, "balance_period": 30, "day_rule": "自然日", "start_trigger": "入库日"},
+  "contract_id": 1
+}
+```
+- `pricing` 的 key 为 **sku_id**（字符串），非 sku 名称
+- `pricing` / `payment_terms` 在 LANDING → ACTIVE 推进时写入，之前仅有 `history`
+
 ### Action API 参考
 
 **主数据**（`logic/master/`）：
@@ -82,6 +105,10 @@ api/routers/                    # FastAPI 路由
 
 **业务流**（`logic/business/`）：
 `create_business_action` / `update_business_status_action` / `delete_business_action` / `advance_business_stage_action` / `get_business_list` / `get_business_detail` / `get_businesses_for_execution`
+
+**附加业务**（`logic/addon_business/`）：
+`create_addon_business_action` / `update_addon_business_action` / `deactivate_addon_business_action`
+`get_active_addons` / `get_active_addons_by_type` / `get_addon_detail` / `get_business_addons` / `check_addon_overlap` / `can_add_addon` / `sku_exists_in_business` / `get_original_price_and_deposit`
 
 **供应链**（`logic/supply_chain/`）：
 `create_supply_chain_action` / `delete_supply_chain_action` / `get_supply_chains` / `get_supply_chain_detail`
@@ -104,6 +131,9 @@ api/routers/                    # FastAPI 路由
 `calculate_cashflow_progress` / `get_returnable_items` / `format_vc_items_for_display` / `get_counterpart_info` / `get_suggested_cashflow_parties` / `get_account_balance` / `get_logistics_finance_context` / `get_cashflow_finance_context`
 
 **文件与库存**：`generate_master_data_excel` / `process_master_data_excel` / `save_contract_files` / `get_contract_files` / `get_equipment_inventory` / `get_material_inventory` / `get_inventory_stats` / `validate_inventory_availability`
+
+**回滚**（`logic/transactions.py`）：
+`create_operation_record` / `rollback_operation` / `redo_operation` / `update_report` / `void_report`
 
 ---
 
@@ -152,6 +182,8 @@ Android 已实现桌面端约 85-90% 的资金流逻辑。已知差异：
 - **数据库**：桌面端 SQLite 在 `desktop-version/data/*.db`，严禁提交 `*.db`、`*-wal`、`*-shm`
 - **编码**：所有数据库操作（SQLAlchemy/SQLite）和 Excel 导入导出均须使用 UTF-8 编码，中文数据才能正确存储和读取
 - **财务凭证**：`data/finance/finance-voucher/*.json` 已在 `.gitignore` 中忽略
+- **JSON 序列化**：推荐安装 `orjson`（`pip install orjson`），SQLAlchemy 2.0 会自动使用它进行 JSON 字段序列化，避免中文被转义为 `\uXXXX`
+- **回滚文档**：Action 回滚快照结构详见 `docs/rollback/` 目录，每个文件对应一个 Action 的 `snapshot_before`/`snapshot_after` 说明
 
 ---
 
@@ -164,3 +196,4 @@ Android 已实现桌面端约 85-90% 的资金流逻辑。已知差异：
 | Action API 手册 | `Docs/desktop_docs/API/api_manual.md` |
 | 数据库结构 | `Docs/desktop_docs/database.md` / `Docs/Android_docs/database.md` |
 | 业务流程 | `Docs/desktop_docs/workflow.md` |
+| Action 回滚文档 | `docs/rollback/` |

@@ -10,7 +10,8 @@
 - [一、信息录入](#一信息录入)
 - [二、业务管理](#二业务管理)
   - [2.1 客户导入流程（Business 状态机）](#21-客户导入流程business-状态机)
-  - [2.2 供应链管理](#22-供应链管理)
+  - [2.2 附加业务政策](#22-附加业务政策addon-business)
+  - [2.3 供应链管理](#23-供应链管理)
 - [三、业务开展](#三业务开展)
   - [3.1 设备采购](#31-设备采购)
   - [3.2 物料供应](#32-物料供应)
@@ -28,6 +29,7 @@
   - [6.4 库存管理模块](#64-库存管理模块)
   - [6.5 押金管理模块](#65-押金管理模块)
   - [6.6 事件系统](#66-事件系统)
+  - [6.7 操作事务与回滚](#67-操作事务与回滚)
 - [七、VC 三状态机详解](#七vc-三状态机详解)
 
 ---
@@ -100,9 +102,22 @@ flowchart TD
 > 2. 调用 `RuleManager.generate_rules_from_payment_terms()` 生成时间规则模板
 > 3. 所有状态变更写入 `business.details.history`
 
+### 2.2 附加业务政策（Addon Business）
+
+业务进入 ACTIVE 阶段后，可对特定 SKU 添加附加业务政策（原子化）：
+
+| addon_type | 说明 | 约束 |
+|------------|------|------|
+| `PRICE_ADJUST` | 价格调整 | SKU 已存在于业务定价配置中 |
+| `NEW_SKU` | 新增 SKU 到业务 | SKU 尚不存在于业务中 |
+
+- 有效期可设置（开始/结束时间），支持永久有效（end_date=NULL）
+- 同业务 + 同 SKU 下不允许时间重叠
+- 附加业务通过 `addon_business` 模块管理，创建/更新/失效均有对应 Action
+
 ---
 
-### 2.2 供应链管理
+### 2.3 供应链管理
 
 #### 2.2.1 建立供应链关系
 
@@ -502,6 +517,30 @@ flowchart TD
 
     Action -.->|注意：不控制事务| Commit[调用方 commit/rollback]
 ```
+
+---
+
+### 6.7 操作事务与回滚
+
+所有 Action 在执行成功后会创建 `operation_transactions` 记录，存储 `snapshot_before`（修改前快照）和 `snapshot_after`（修改后快照），支持幂等回滚/撤销回滚。
+
+```mermaid
+flowchart TB
+    Action[Action 函数] --> Record[创建 operation_transactions<br/>snapshot_before / snapshot_after]
+    Record --> Commit[session.commit]
+
+    Rollback[rollback_operation] --> Restore[用 snapshot_before<br/>恢复所有记录的旧值]
+    Restore --> Del[删除 snapshot_after<br/>中的新建记录]
+    Restore --> DeleteFiles[删除快照文件]
+
+    Redo[redo_operation] --> Reapply[用 snapshot_after<br/>重建所有记录]
+    Reapply --> RecreateFiles[重建快照文件]
+```
+
+**约束：**
+- FINISH 状态的 VC 禁止回滚
+- 已 failed 的操作不允许回滚
+- 已 rolled_back 的操作不允许重复回滚
 
 ---
 

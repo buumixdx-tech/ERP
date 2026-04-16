@@ -64,6 +64,7 @@ Docs/desktop_docs/
 | 模块 | 文件 | 核心概念 |
 |------|------|----------|
 | 业务项目 | [business.md](models/business.md) | 6阶段状态机、`advance_business_stage_action` 落地时自动创建 Contract + 生成时间规则 |
+| 附加业务 | [addon_business.md](models/addon_business.md) | 原子化有效期促销政策（PRICE_ADJUST/NEW_SKU）、日期重叠检查、原价获取 |
 | 供应链 | [supply_chain.md](models/supply_chain.md) | 供应链协议、pricing_config、payment_terms、模板规则下发 |
 | 虚拟合同 | [vc.md](models/vc.md) | VC 类型（6种）、三状态机（status/subject/cash）、`elements` JSON 结构、退货逻辑 |
 | 物流 | [logistics.md](models/logistics.md) | 入库确认三联动（库存变动 + 状态机 + 财务记账）、SN 校验、物流状态机 |
@@ -72,8 +73,9 @@ Docs/desktop_docs/
 | 库存 | [inventory.md](models/inventory.md) | 设备 SN 管理、物料 `stock_distribution`（key 为点位名称）、平均价计算、退货入库处理 |
 | 押金 | [deposit.md](models/deposit.md) | 应收押金动态重算（运营中设备数 × 单台押金）、分摊比例、退货穿透逻辑 |
 | 主数据 | [master_data.md](models/master_data.md) | 6类主数据 CRUD、删除前引用校验规则 |
-| 事件系统 | [events.md](models/events.md) | `emit_event` → `dispatch` → `listener` 全链路、2个内置响应器、SystemEvent 表 |
+| 事件系统 | [events.md](models/events.md) | `emit_event` → `dispatch` → `listener` 全链路、2个内置响应器、SystemEvent 表、ADDON_BUSINESS 聚合根 |
 | 跨模块服务 | [services.md](models/services.md) | `get_counterpart_info` 穿透退货VC、`calculate_cashflow_progress` 冲抵池方向、库存充足性校验 |
+| 操作事务 | [transactions.md](models/transactions.md) | `snapshot_before/after` 快照结构、`rollback_operation`/`redo_operation` 回滚/撤销回滚、幂等凭证管理 |
 
 ---
 

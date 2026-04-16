@@ -4,7 +4,7 @@
 """
 from models import (
     get_session, VirtualContract, EquipmentInventory, MaterialInventory,
-    SKU, Point, SupplyChain, Business, PartnerRelation
+    SKU, Point, SupplyChain, Business, PartnerRelation, ExternalPartner
 )
 from sqlalchemy.orm import joinedload
 from logic.constants import (
@@ -224,7 +224,7 @@ def get_sku_agreement_price(session, sc_id, business_id, sku_name):
     if biz and isinstance(biz, dict):
         biz_agreement = biz.get("details", {}).get("pricing", {})
     else:
-        biz_agreement = biz.details.get("pricing", {}) if (biz and hasattr(biz, 'details')) else {}
+        biz_agreement = (biz.details or {}).get("pricing", {}) if biz else {}
 
     sku_config = {}
     if sku_id:
@@ -341,8 +341,23 @@ def _get_biz_procurement_partner(session, biz_id):
         PartnerRelation.ended_at == None
     ).all()
     if len(items) == 1:
-        return items[0].partner_id, None
+        partner = session.query(ExternalPartner).get(items[0].partner_id)
+        return (items[0].partner_id, partner.name if partner else None)
     return None, None
+
+
+def _get_biz_procurement_partner_name(session, biz_id):
+    """查询 Business 关联的合作方名称，仅返回一个（多于一则返回 None）。"""
+    items = session.query(PartnerRelation).filter(
+        PartnerRelation.owner_type == "business",
+        PartnerRelation.owner_id == biz_id,
+        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
+        PartnerRelation.ended_at == None
+    ).all()
+    if len(items) == 1:
+        partner = session.query(ExternalPartner).get(items[0].partner_id)
+        return partner.name if partner else None
+    return None
 
 
 def get_suggested_cashflow_parties(session, vc, cf_type: str = None) -> tuple:

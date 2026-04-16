@@ -48,7 +48,7 @@ def create_cash_flow_action(session: Session, payload: CreateCashFlowSchema) -> 
         snapshot_before["records"].append({"class": "VirtualContract", "id": vc.id, "data": serialize_model(vc)})
 
         # EquipmentInventory 押金重算旧值（DEPOSIT / RETURN_DEPOSIT 时）
-        if payload.type in ["押金", "退还押金"]:
+        if payload.type in [CashFlowType.DEPOSIT, CashFlowType.RETURN_DEPOSIT]:
             from models import EquipmentInventory
             eq_list = session.query(EquipmentInventory).filter(EquipmentInventory.virtual_contract_id == payload.vc_id).all()
             for eq in eq_list:
@@ -89,7 +89,7 @@ def create_cash_flow_action(session: Session, payload: CreateCashFlowSchema) -> 
         ]
 
         # EquipmentInventory 押金更新后
-        if payload.type in ["押金", "退还押金"]:
+        if payload.type in [CashFlowType.DEPOSIT, CashFlowType.RETURN_DEPOSIT]:
             eq_list_after = session.query(EquipmentInventory).filter(EquipmentInventory.virtual_contract_id == vc.id).all()
             for eq in eq_list_after:
                 snapshot_after_records.append({"class": "EquipmentInventory", "id": eq.id, "data": serialize_model(eq)})
@@ -120,7 +120,7 @@ def create_cash_flow_action(session: Session, payload: CreateCashFlowSchema) -> 
 
         from logic.transactions import create_operation_record
         involved_ids = [vc.id, cf_ref.id]
-        if payload.type in ["押金", "退还押金"]:
+        if payload.type in [CashFlowType.DEPOSIT, CashFlowType.RETURN_DEPOSIT]:
             involved_ids += [eq.id for eq in eq_list_after]
 
         tx_id = create_operation_record(
@@ -164,10 +164,11 @@ def internal_transfer_action(session: Session, payload: InternalTransferSchema) 
         # record_entries 内部 flush，所有新记录已在 session.new 中且 ID 已分配
         record_entries(session, v_no, None, "InternalTransfer", 0, entries, payload.transaction_date)
         new_records_ids = [o.id for o in session.new]
+        actual_ref_id = new_records_ids[0] if new_records_ids else 0
 
         # emit_event 之前：序列化 FinancialJournal + CashFlowLedger，并读取已保存的 JSON 文件
         snapshot_records = serialize_objs(list(session.new))
-        voucher_path = os.path.join(VOUCHER_DIR, f"InternalTransfer_0.json")
+        voucher_path = os.path.join(VOUCHER_DIR, f"InternalTransfer_{actual_ref_id}.json")
         voucher_content = None
         if os.path.exists(voucher_path):
             with open(voucher_path, "r", encoding="utf-8") as f:
@@ -226,10 +227,11 @@ def external_fund_action(session: Session, payload: ExternalFundSchema) -> Actio
         # record_entries 内部 flush，所有新记录已在 session.new 中且 ID 已分配
         record_entries(session, v_no, None, "ExternalTransfer", 0, entries, payload.transaction_date)
         new_records_ids = [o.id for o in session.new]
+        actual_ref_id = new_records_ids[0] if new_records_ids else 0
 
         # emit_event 之前：序列化记录，并读取已保存的 JSON 文件
         snapshot_records = serialize_objs(list(session.new))
-        voucher_path = os.path.join(VOUCHER_DIR, f"ExternalTransfer_0.json")
+        voucher_path = os.path.join(VOUCHER_DIR, f"ExternalTransfer_{actual_ref_id}.json")
         voucher_content = None
         if os.path.exists(voucher_path):
             with open(voucher_path, "r", encoding="utf-8") as f:

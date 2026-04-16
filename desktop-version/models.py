@@ -348,25 +348,26 @@ class SupplyChain(Base):
     # elements = Column(JSON)      # 新版：存储 pricing_config, payment_terms 等
 
     supplier = relationship("Supplier")
-    # items = relationship("SupplyChainItem", back_populates="supply_chain", cascade="all, delete-orphan")
+    items = relationship("SupplyChainItem", back_populates="supply_chain", cascade="all, delete-orphan")
 
     def get_pricing_dict(self):
-        """统一获取定价配置：优先级 中间表 > JSON配置"""
-        # 暂时只返回 JSON 配置，因为数据库没有 items 表
+        """统一获取定价配置：优先使用 SupplyChainItem 中间表，备选 JSON 配置"""
+        if self.items:
+            return {str(item.sku_id): {"price": item.price, "is_floating": item.is_floating} for item in self.items}
         return self.pricing_config or {}
 
 class SupplyChainItem(Base):
-    """新增：21. 供应链协议明细: 规范化存储每个 SKU 的价格约定"""
+    """21. 供应链协议明细: 规范化存储每个 SKU 的价格约定"""
     __tablename__ = 'supply_chain_items'
     __table_args__ = {'extend_existing': True}
     id = Column(Integer, primary_key=True)
     supply_chain_id = Column(Integer, ForeignKey('supply_chains.id'))
     sku_id = Column(Integer, ForeignKey('skus.id'))
-    price = Column(Float) # 协议单价
-    is_floating = Column(Boolean, default=False) # 是否为浮动价格
-    
-    # supply_chain = relationship("SupplyChain", back_populates="items")
-    # sku = relationship("SKU")
+    price = Column(Float)  # 协议单价
+    is_floating = Column(Boolean, default=False)  # 是否为浮动价格
+
+    supply_chain = relationship("SupplyChain", back_populates="items")
+    sku = relationship("SKU")
 
 class Logistics(Base):
     """行动-1. 物流"""

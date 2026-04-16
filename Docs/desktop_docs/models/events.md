@@ -87,6 +87,11 @@ Action 函数执行状态变更
 ### 预警事件
 - `INVENTORY_LOW_STOCK_WARNING`
 
+### 附加业务事件
+- `ADDON_CREATED` — 附加业务创建
+- `ADDON_UPDATED` — 附加业务更新
+- `ADDON_DEACTIVATED` — 附加业务失效
+
 ### 主数据事件
 - `MASTER_CREATED`
 
@@ -161,6 +166,7 @@ confirm_inbound_action()
 | `SKU` | SKU |
 | `ExternalPartner` | 合作伙伴 |
 | `BankAccount` | 银行账户 |
+| `AddonBusiness` | 附加业务政策 |
 
 ## 开发注意事项
 

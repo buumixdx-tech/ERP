@@ -3,6 +3,10 @@ from logic.constants import CashFlowType, AccountOwnerType, VCType, AccountLevel
 from sqlalchemy import func
 from datetime import datetime
 
+# 最小冲抵金额阈值（单位：元），小于此值则忽略以避免浮点取整损失
+# 注意：大量分笔交易此阈值以下的余额会累积成实际资金损失
+MIN_OFFSET_THRESHOLD = 0.01
+
 def check_and_split_excess(session, cf):
     """
     此方法在‘预收预付方案’下已被简化。
@@ -70,7 +74,7 @@ def apply_offset_to_vc(session, vc):
     
     balance = (credit_sum - debit_sum) if account_level1 == AccountLevel1.PRE_COLLECTION else (debit_sum - credit_sum)
     
-    if balance > 0.01:
+    if balance > MIN_OFFSET_THRESHOLD:
         # 尝试冲抵当前 VC
         target_amount = float((vc.elements or {}).get('total_amount', 0))
         if target_amount <= 0: return
@@ -97,13 +101,18 @@ def apply_offset_to_vc(session, vc):
         )
         session.add(new_cf)
         session.flush()
-        
-        # 触发财务模组记录 (它会生成 预收/预付 -> 应收/应付 的对冲分录)
-        from logic.finance import finance_module
-        finance_module(cash_flow_id=new_cf.id, session=session)
-        
-        # 触发 VC 状态机更新
-        from logic.state_machine import virtual_contract_state_machine
-        virtual_contract_state_machine(vc.id, 'cash_flow', new_cf.id, session=session)
+
+        try:
+            # 触发财务模组记录 (它会生成 预收/预付 -> 应收/应付 的对冲分录)
+            from logic.finance import finance_module
+            finance_module(cash_flow_id=new_cf.id, session=session)
+
+            # 触发 VC 状态机更新
+            from logic.state_machine import virtual_contract_state_machine
+            virtual_contract_state_machine(vc.id, 'cash_flow', new_cf.id, session=session)
+        except Exception:
+            session.delete(new_cf)
+            session.flush()
+            raise
         
         print(f"DEBUG: Applied accounting offset {use_amount} for party {party_id} to VC {vc.id}")

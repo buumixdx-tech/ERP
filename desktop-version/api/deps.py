@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime
 from fastapi import Header, HTTPException
 from sqlalchemy.orm import Session
@@ -15,8 +16,11 @@ def get_db():
 
 
 def verify_api_key(x_api_key: str = Header(...)):
-    valid_keys = os.environ.get("SHANYIN_API_KEYS", "dev-key").split(",")
-    if x_api_key not in valid_keys:
+    valid_keys_str = os.environ.get("SHANYIN_API_KEYS")
+    if not valid_keys_str:
+        raise RuntimeError("SHANYIN_API_KEYS environment variable is not set")
+    valid_keys = valid_keys_str.split(",")
+    if not any(secrets.compare_digest(x_api_key, key) for key in valid_keys):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 

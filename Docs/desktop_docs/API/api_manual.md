@@ -1,9 +1,9 @@
-# 闪饮 ERP 系统 API 手册 (v5.0)
+# 闪饮 ERP 系统 API 手册
 
 > [!IMPORTANT]
 > 本文档包含 ShanYin ERP 系统 `logic` 层的所有公开 API 函数。本文档旨在实现 100% 的功能覆盖，确保所有 UI 操作均可通过对应的 API 逻辑实现。
 >
-> **版本说明：** v5.0 对应 commit `5c0c817`（VC elements 结构重构）。`VCElementSchema` 替代旧版 `VCItemSchema`，VC 创建接口的 `items` 参数改为 `elements`。
+> **版本说明：** 包含 v5.0 VC elements 重构、addon_business 附加业务模块、operation_transactions 回滚事务模块。
 
 ## 导入路径速查
 
@@ -15,6 +15,8 @@ from logic.finance import create_cash_flow_action, get_cash_flow_list, get_dashb
 from logic.logistics import create_logistics_plan_action, confirm_inbound_action
 from logic.supply_chain import create_supply_chain_action
 from logic.services import calculate_cashflow_progress, get_returnable_items
+from logic.addon_business import create_addon_business_action, get_active_addons
+from logic.transactions import rollback_operation, redo_operation
 ```
 
 ---
@@ -80,7 +82,30 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 3. 虚拟合同 (Virtual Contracts) API
+## 3. 附加业务 (Addon Business) API
+
+**模块路径：** `logic/addon_business/`
+
+> 附加业务政策（原子化）：在 Business ACTIVE 阶段，可对特定 SKU 添加有效期促销/新增价格协议。
+
+### Actions
+- **`create_addon_business_action(session, payload)`**: 创建附加业务政策（PRICE_ADJUST / NEW_SKU）。使用 `CreateAddonSchema`。
+- **`update_addon_business_action(session, payload)`**: 更新附加业务（仅可修改日期、覆盖值、status、remark）。使用 `UpdateAddonSchema`。
+- **`deactivate_addon_business_action(session, addon_id)`**: 软删除/失效附加业务。
+
+### 查询
+- **`get_active_addons(session, business_id, dt=None)`**: 获取业务下当前生效的所有 addon。
+- **`get_active_addons_by_type(session, business_id, addon_type, dt=None)`**: 获取业务下指定类型的生效 addon。
+- **`get_addon_detail(session, addon_id)`**: 获取单个 addon 详情。
+- **`get_business_addons(session, business_id, include_expired=False)`**: 获取业务下所有 addon（可含过期）。
+- **`can_add_addon(session, business_id)`**: 检查业务是否允许添加 addon（前提：ACTIVE 阶段）。
+- **`sku_exists_in_business(session, business_id, sku_id)`**: 判断 SKU 是否已在业务定价配置中存在。
+- **`get_original_price_and_deposit(session, business_id, sku_id)`**: 获取 SKU 在业务中的原价和原押金。
+- **`check_addon_overlap(session, business_id, sku_id, start_date, end_date, exclude_id=None)`**: 检查日期重叠。
+
+---
+
+## 4. 虚拟合同 (Virtual Contracts) API
 
 **模块路径：** `logic/vc/`
 
@@ -114,7 +139,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 4. 供应链 (Supply Chain) API
+## 5. 供应链 (Supply Chain) API
 
 **模块路径：** `logic/supply_chain/`
 
@@ -125,7 +150,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 5. 物流管理 (Logistics) API
+## 6. 物流管理 (Logistics) API
 
 **模块路径：** `logic/logistics/`
 
@@ -144,7 +169,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 6. 财务与资金流 (Finance) API
+## 7. 财务与资金流 (Finance) API
 
 **模块路径：** `logic/finance/`
 
@@ -178,7 +203,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 7. 时间规则 (Time Rules) API
+## 8. 时间规则 (Time Rules) API
 
 **模块路径：** `logic/time_rules/`
 
@@ -189,7 +214,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 8. 库存管理 (Inventory) API
+## 9. 库存管理 (Inventory) API
 
 **模块路径：** `logic/inventory/`
 
@@ -203,7 +228,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 9. 文件管理与批量操作 API
+## 10. 文件管理与批量操作 API
 
 **模块路径：** `logic/file_mgmt.py`
 
@@ -214,7 +239,7 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 
 ---
 
-## 10. 押金与池核销 API
+## 11. 押金与池核销 API
 
 **模块路径：** `logic/deposit.py`、`logic/offset_manager.py`
 
@@ -222,6 +247,23 @@ from logic.services import calculate_cashflow_progress, get_returnable_items
 - **`process_cf_deposit(session, cf_id)`**: 处理单笔押金资金流（处理退货 VC 押金重定向到原合同）。
 - **`process_vc_deposit(session, vc_id)`**: 重算 VC 应收押金（`should_receive`），按 SKU 级别运营设备数量重新分配押金，触发自动完结。
 - **`apply_offset_to_vc(session, vc_id)`**: 将预收/预付池余额自动核销到指定 VC。
+
+---
+
+## 12. 操作事务与回滚 (Transactions) API
+
+**模块路径：** `logic/transactions.py`
+
+> 所有 Action 在执行成功后会创建 `OperationTransaction` 记录，存储 `snapshot_before`/`snapshot_after` 快照，支持回滚和撤销回滚。
+
+### 事务操作
+- **`create_operation_record(session, action_name, ref_type, ref_id, ref_vc_id, snapshot_before, snapshot_after, involved_ids)`**: 创建事务记录。
+- **`rollback_operation(session, tx_id, reason)`**: 执行回滚，用 snapshot_before 恢复所有表。
+- **`redo_operation(session, tx_id)`**: 撤销回滚，用 snapshot_after 重新应用。
+
+### 凭证文件操作
+- **`update_report(voucher, report_dir=None)`**: 幂等追加凭证到 report.json（按 voucher_no 去重）。
+- **`void_report(ref_type, ref_id, transaction_date, report_dir=None)`**: 从 report.json 中移除指定凭证条目（幂等）。
 
 ---
 

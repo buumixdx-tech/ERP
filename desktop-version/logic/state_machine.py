@@ -133,7 +133,7 @@ def virtual_contract_state_machine(vc_id, ref_type, ref_id, session=None):
                     vc.update_cash_status(CashStatus.FINISH)
             else:
                 # 检查预付
-                payment_terms = vc.elements.get('payment_terms')
+                payment_terms = (vc.elements or {}).get('payment_terms')
                 ratio = payment_terms.get('prepayment_ratio', 0) if payment_terms else 0
                 if ratio > 0 and vc.cash_status == CashStatus.EXE:
                     if paid_goods >= (total_due * ratio - EPSILON):

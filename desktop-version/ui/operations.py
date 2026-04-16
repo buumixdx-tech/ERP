@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 from models import get_session, SKU
 import pandas as pd
@@ -334,7 +335,7 @@ def _save_mat_procurement_vc(_session, sc_id, data):
         
         return result.data["vc_id"]
     else:
-        st.session_state[f"supply_error_{business_id}"] = result.error
+        st.session_state[f"supply_error_{sc_id}"] = result.error
         return None
 
 @st.dialog("确认物料采购执行单", width="large")
@@ -436,7 +437,7 @@ def _save_return_vc(_session, target_vc_id, data):
         
         return result.data["vc_id"]
     else:
-        st.session_state[f"supply_error_{business_id}"] = result.error
+        st.session_state[f"supply_error_{target_vc_id}"] = result.error
         return None
 @st.dialog("确认退货执行单召回", width="large")
 def confirm_return_dialog(session, target_vc_id):
@@ -1014,7 +1015,9 @@ def show_supply_chain_list():
             
             if sc:
                 st.divider()
-                st.markdown(f"#### <i class='bi bi-search'></i> 协议详情: {sc['supplier']['name'] if sc['supplier'] else '未知'} ({sc['type']})", unsafe_allow_html=True)
+                supplier_display = html.escape(sc['supplier']['name'] if sc['supplier'] else '未知')
+                type_display = html.escape(sc['type'])
+                st.markdown(f"#### <i class='bi bi-search'></i> 协议详情: {supplier_display} ({type_display})", unsafe_allow_html=True)
                 
                 sel_det_tab = sac.tabs([
                     sac.TabsItem('价格协议明细', icon='tag'),
@@ -1287,20 +1290,11 @@ def show_inventory_dashboard_component():
     
     sc1, sc2, sc3 = st.columns(3)
     with sc1:
-        st.markdown(f'''<div class="stat-card">
-            <div class="stat-label">总在册设备</div>
-            <div class="stat-value">{summary['total_count']} <span style="font-size:14px; font-weight:normal;">台</span></div>
-        </div>''', unsafe_allow_html=True)
+        st.markdown(f"**总在册设备**: {html.escape(str(summary['total_count']))} 台", unsafe_allow_html=False)
     with sc2:
-        st.markdown(f'''<div class="stat-card">
-            <div class="stat-label">在库物料品类</div>
-            <div class="stat-value">{mat_summary['total_skus']} <span style="font-size:14px; font-weight:normal;">项</span></div>
-        </div>''', unsafe_allow_html=True)
+        st.markdown(f"**在库物料品类**: {html.escape(str(mat_summary['total_skus']))} 项", unsafe_allow_html=False)
     with sc3:
-        st.markdown(f'''<div class="stat-card">
-            <div class="stat-label">物料库存总量</div>
-            <div class="stat-value">{mat_summary['total_quantity']:,.0f} <span style="font-size:14px; font-weight:normal;">件</span></div>
-        </div>''', unsafe_allow_html=True)
+        st.markdown(f"**物料库存总量**: {html.escape(str(mat_summary['total_quantity']))} 件", unsafe_allow_html=False)
 
     # 检查 session_state 中的值是否有效，防止旧值导致 ValueError
     _valid_tabs = ['设备库存', '物料库存']
@@ -1363,14 +1357,14 @@ def show_inventory_dashboard_component():
                 for wh, qty in dist.items():
                     pct = qty / total * 100 if total > 0 else 0
                     warning = " ⚠️" if qty < 10 else ""
-                    dist_items.append(f"**{wh}{warning}**：{qty} 件（{pct:.0f}%）")
+                    dist_items.append(f"**{html.escape(wh)}{warning}**：{qty} 件（{pct:.0f}%）")
                 dist_html = "<br>".join(dist_items)
 
                 with st.container():
                     st.markdown("---")
                     col1, col2 = st.columns([1, 1])
                     with col1:
-                        st.markdown(f"**<span style='font-size:16px;'>{sku_name}</span>**", unsafe_allow_html=True)
+                        st.markdown(f"**物料名称**: {html.escape(str(sku_name))}", unsafe_allow_html=False)
                     with col2:
                         st.markdown(f"**<span style='font-size:16px;color:#1976D2;'>总库存：{total}</span>**", unsafe_allow_html=True)
                     st.markdown(dist_html, unsafe_allow_html=True)

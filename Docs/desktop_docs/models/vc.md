@@ -43,7 +43,7 @@ EXE（执行）→ PREPAID（预付）→ FINISH（结清）
 
 ## elements JSON 结构（核心数据结构）
 
-VC 的业务明细存储在 `elements` JSON 字段中，结构因类型而异：
+VC 的业务明细存储在 `elements` JSON 字段中，结构因类型而异。
 
 ### 采购类（EQUIPMENT_PROCUREMENT / STOCK_PROCUREMENT / MATERIAL_PROCUREMENT）
 
@@ -51,52 +51,74 @@ VC 的业务明细存储在 `elements` JSON 字段中，结构因类型而异：
 {
   "elements": [
     {
-      "sku_id": 1,
-      "sku_name": "设备A",
-      "qty": 10,
-      "price": 1000.0,
-      "subtotal": 10000.0,
-      "shipping_point_id": 2,
-      "receiving_point_id": 3,
-      "sn_list": ["SN001", "SN002"]
+      "id": "sp3_rp1_sku2",
+      "shipping_point_id": 3,
+      "receiving_point_id": 1,
+      "sku_id": 2,
+      "qty": 500.0,
+      "price": 6.5,
+      "deposit": 0.0,
+      "subtotal": 3250.0,
+      "sn_list": []
     }
   ],
-  "total_amount": 10000.0,
-  "payment_terms": {...}
+  "total_amount": 7400.0,
+  "payment_terms": {
+    "prepayment_ratio": 0.3,
+    "balance_period": 0,
+    "day_rule": "自然日",
+    "start_trigger": "入库日"
+  }
 }
 ```
 
-### 供应类（MATERIAL_SUPPLY）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | STRING | 唯一标识（格式：`sp{shipping}_rp{receiving}_sku{id}`） |
+| `shipping_point_id` | INTEGER | 发货点位 ID |
+| `receiving_point_id` | INTEGER | 收货点位 ID |
+| `sku_id` | INTEGER | SKU ID |
+| `qty` | FLOAT | 数量 |
+| `price` | FLOAT | 单价 |
+| `deposit` | FLOAT | 单台押金 |
+| `subtotal` | FLOAT | 小计金额 |
+| `sn_list` | ARRAY | 设备序列号列表（采购时为空） |
 
-供应类同时存在新旧两种结构（兼容历史数据）：
+### 供应类（MATERIAL_SUPPLY）
 
 ```json
 {
   "elements": [
     {
-      "sku_id": 1,
-      "sku_name": "物料A",
-      "qty": 100,
-      "price": 50.0,
-      "receiving_point_id": 5,
-      "point_name": "客户点位A"
+      "id": "sp3_rp12_sku2",
+      "shipping_point_id": 3,
+      "receiving_point_id": 12,
+      "sku_id": 2,
+      "qty": 200.0,
+      "price": 11.7,
+      "deposit": 0.0,
+      "subtotal": 2340.0,
+      "sn_list": []
     }
   ],
-  "points": [
-    {
-      "pointName": "客户点位A",
-      "items": [...]
-    }
-  ]
+  "total_amount": 5320.0,
+  "payment_terms": {
+    "prepayment_ratio": 1.0,
+    "balance_period": 0,
+    "day_rule": "自然日",
+    "start_trigger": "入库日"
+  }
 }
 ```
+
+结构与采购类相似，但 `price` 为对客户的供应单价（高于采购价）。
 
 ### 退货类（RETURN）
 
 ```json
 {
-  "elements": {...},
-  "return_direction": "客户向我们退回 / 我们向供应商退货",
+  "elements": [...],
+  "return_direction": "CUSTOMER_TO_US / US_TO_SUPPLIER",
   "total_refund": 5000.0,
   "deposit_amount": 2000.0
 }

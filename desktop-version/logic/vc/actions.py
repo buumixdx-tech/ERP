@@ -624,8 +624,8 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         # 商业逻辑：确定退货收货点 + 校验收货点/发货点范围
         # -------------------------------------------------------
         target_type = target_vc.type
-        is_equipment_target = target_type in (VCType.EQUIPMENT_PROCUREMENT,)
-        is_mat_or_stock_target = target_type in (VCType.MATERIAL_PROCUREMENT, VCType.STOCK_PROCUREMENT)
+        is_equipment_target = target_type in (VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT)
+        is_mat_or_stock_target = target_type in (VCType.MATERIAL_PROCUREMENT,)
 
         # 4.2/4.3: 获取target_vc的供应链供应商仓库（退货目的地）
         rp_supplier = None
@@ -859,12 +859,28 @@ def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
 def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
     """物理删除 VC Action (含级联清理，支持回滚)"""
     try:
-        from models import Logistics
+        from models import Logistics, CashFlow, FinancialJournal, TimeRule, EquipmentInventory
         from logic.transactions import serialize_model
 
         vc_id = payload.id
         vc = session.query(VirtualContract).get(vc_id)
         if not vc: return ActionResult(success=False, error="未找到 VC")
+
+        # FK 完整性检查：检查是否有下游引用阻止删除
+        cf_count = session.query(CashFlow).filter(CashFlow.virtual_contract_id == vc_id).count()
+        if cf_count > 0:
+            return ActionResult(success=False, error=f"该合同存在 {cf_count} 条资金流水，无法直接删除，请先删除关联资金流水")
+
+        fj_count = session.query(FinancialJournal).filter(
+            FinancialJournal.ref_type == "VirtualContract",
+            FinancialJournal.ref_id == vc_id
+        ).count()
+        if fj_count > 0:
+            return ActionResult(success=False, error=f"该合同存在 {fj_count} 条财务凭证，无法直接删除")
+
+        ei_count = session.query(EquipmentInventory).filter(EquipmentInventory.virtual_contract_id == vc_id).count()
+        if ei_count > 0:
+            return ActionResult(success=False, error=f"该合同关联了 {ei_count} 条设备库存记录，无法直接删除")
 
         # snapshot_before：捕获 VC + Logistics（删除前的完整状态）
         snapshot_before = {"records": [
@@ -1273,14 +1289,17 @@ def create_inventory_allocation_action(session: Session, payload: AllocateInvent
         session.flush()
         _record_vc_created_log(session, new_vc)
 
-        # 更新设备状态
+        # 更新设备状态（批量查询避免 N+1）
+        all_sn_ids = [eq_id for e in payload.elements for eq_id in e.sn_list]
+        eq_map = {str(eq.sn): eq for eq in session.query(EquipmentInventory).filter(EquipmentInventory.sn.in_(all_sn_ids)).all()}
         for e in payload.elements:
             target_pt = e.receiving_point_id
             for eq_id in e.sn_list:
-                eq = session.query(EquipmentInventory).filter(EquipmentInventory.sn == str(eq_id)).first()
-                eq.operational_status = OperationalStatus.OPERATING
-                eq.point_id = target_pt
-                eq.virtual_contract_id = new_vc.id
+                eq = eq_map.get(str(eq_id))
+                if eq:
+                    eq.operational_status = OperationalStatus.OPERATING
+                    eq.point_id = target_pt
+                    eq.virtual_contract_id = new_vc.id
 
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {"type": new_vc.type, "equipment_count": sum(e.qty for e in payload.elements)})
         session.flush()

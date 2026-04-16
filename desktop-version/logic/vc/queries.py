@@ -477,7 +477,8 @@ def get_valid_shipping_points_for_return_equipment(session, target_vc_id: int) -
     cust_point_ids = [p.id for p in cust_pts]
     if not cust_point_ids:
         return []
-    sku_ids = [e["sku_id"] for e in target_vc.elements.get("elements", [])]
+    elements = target_vc.elements or {}
+    sku_ids = [e["sku_id"] for e in elements.get("elements", [])]
     if not sku_ids:
         return []
     eqs = session.query(EquipmentInventory).filter(

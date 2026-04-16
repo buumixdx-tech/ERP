@@ -64,19 +64,6 @@ def finance_module(logistics_id=None, cash_flow_id=None, session=None):
         if not ext_session:
             session.close()
 
-def _get_biz_procurement_partner(session, biz_id):
-    """查询 Business 是否关联恰好一个"采购执行"类型的有效合作方，返回 (partner_name) 或 (None,)"""
-    rels = session.query(PartnerRelation).filter(
-        PartnerRelation.owner_type == "business",
-        PartnerRelation.owner_id == biz_id,
-        PartnerRelation.relation_type == PartnerRelationType.PROCUREMENT,
-        PartnerRelation.ended_at == None
-    ).all()
-    if len(rels) == 1:
-        partner = session.query(ExternalPartner).get(rels[0].partner_id)
-        return (partner.name,) if partner else (None,)
-    return (None,)
-
 def get_or_create_account(session, level1_name, counterpart_type=None, counterpart_id=None, business_id=None):
     config = ACCOUNT_CONFIG.get(level1_name, {"category": "其他", "direction": "Debit"})
     level2_name = None
@@ -84,7 +71,9 @@ def get_or_create_account(session, level1_name, counterpart_type=None, counterpa
         if counterpart_type == CounterpartType.CUSTOMER:
             obj = session.query(ChannelCustomer).get(counterpart_id)
             if obj:
-                partner_name, = _get_biz_procurement_partner(session, business_id) if business_id else (None,)
+                # 从 services 获取合作方名称（延迟导入避免循环依赖）
+                from logic.services import _get_biz_procurement_partner_name
+                partner_name = _get_biz_procurement_partner_name(session, business_id) if business_id else None
                 if partner_name:
                     level2_name = f"{level1_name} - {obj.name} - {partner_name}"
                 else:
@@ -129,9 +118,15 @@ def record_entries(session, voucher_no, ref_vc_id, ref_type, ref_id, entries, tr
         if vc and vc.business_id:
             business_id = vc.business_id
     db_entries = []
+    # 缓存已解析的账户，避免同一 batch 中重复查询
+    # key: (level1, cp_type, cp_id, business_id), value: FinanceAccount
+    _acc_cache = {}
     for entry in entries:
-        acc = get_or_create_account(session, entry["level1"], entry.get("cp_type"), entry.get("cp_id"),
-                                    business_id=business_id)
+        cache_key = (entry["level1"], entry.get("cp_type"), entry.get("cp_id"), business_id)
+        if cache_key not in _acc_cache:
+            _acc_cache[cache_key] = get_or_create_account(
+                session, entry["level1"], entry.get("cp_type"), entry.get("cp_id"), business_id=business_id)
+        acc = _acc_cache[cache_key]
         journal = FinancialJournal(
             voucher_no=voucher_no, account_id=acc.id,
             debit=entry.get("debit", 0.0), credit=entry.get("credit", 0.0),
@@ -348,7 +343,9 @@ def process_cash_flow_finance(session, cash_flow_id):
 def save_voucher(data, filename):
     if not os.path.exists(VOUCHER_DIR): os.makedirs(VOUCHER_DIR)
     path = os.path.join(VOUCHER_DIR, f"{filename}.json")
-    with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path = os.path.join(VOUCHER_DIR, f".{filename}.tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 def update_report(voucher):
     report_path = os.path.join(REPORT_DIR, "report.json")
@@ -399,12 +396,24 @@ def update_report(voucher):
                 s["营业外净损益"] += val
     s["月度净利润"] = s[AccountLevel1.REVENUE] - s[AccountLevel1.COST] - s[AccountLevel1.EXPENSE] + s["营业外净损益"]
     if not os.path.exists(REPORT_DIR): os.makedirs(REPORT_DIR)
-    with open(report_path, 'w', encoding='utf-8') as f: json.dump(report, f, ensure_ascii=False, indent=2)
+    tmp_path = os.path.join(REPORT_DIR, ".report.tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f: json.dump(report, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, report_path)
 
-def rebuild_report():
+def rebuild_report(start_date=None, end_date=None, limit=100000):
+    """
+    从 FinancialJournal 重建 report.json。
+    - start_date/end_date: 可选的时间范围过滤（datetime 对象）
+    - limit: 每次最多加载的凭证数量，防止无界内存消耗
+    """
     session = get_session()
     try:
-        journals = session.query(FinancialJournal).order_by(FinancialJournal.transaction_date.desc()).all()
+        q = session.query(FinancialJournal).order_by(FinancialJournal.transaction_date.desc())
+        if start_date:
+            q = q.filter(FinancialJournal.transaction_date >= start_date)
+        if end_date:
+            q = q.filter(FinancialJournal.transaction_date <= end_date)
+        journals = q.limit(limit).all()
         report = {}
         for j in journals:
             dt = j.transaction_date; month = dt.strftime("%Y-%m")
@@ -442,6 +451,8 @@ def rebuild_report():
             s["月度净利润"] = s[AccountLevel1.REVENUE] - s[AccountLevel1.COST] - s[AccountLevel1.EXPENSE] + s["营业外净损益"]
             report[month]["vouchers"] = list(report[month]["vouchers"].values())
         if not os.path.exists(REPORT_DIR): os.makedirs(REPORT_DIR)
-        with open(os.path.join(REPORT_DIR, "report.json"), 'w', encoding='utf-8') as f:
+        tmp_path = os.path.join(REPORT_DIR, ".report.tmp")
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, os.path.join(REPORT_DIR, "report.json"))
     finally: session.close()

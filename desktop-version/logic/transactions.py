@@ -241,7 +241,7 @@ def rollback_operation(session: Session, tx_id: int, reason: str = None) -> "Act
 
     # FINISH 状态 VC 禁止回滚
     if tx.ref_type == "VirtualContract":
-        vc = session.query(VirtualContract).get(tx.ref_id)
+        vc = session.query(VirtualContract).filter(VirtualContract.id == tx.ref_id).with_for_update().first()
         if vc and vc.status == "完成":
             return ActionResult(success=False, error="已完成合同不允许回滚")
 

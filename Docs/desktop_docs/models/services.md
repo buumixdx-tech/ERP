@@ -60,8 +60,8 @@ get_sku_agreement_price(session, sc_id, business_id, sku_name) -> (unit_price, d
 ```
 
 **优先级：**
-1. `Business.details.pricing[sku_name].price`（客户约定价）
-2. `SupplyChain.pricing_config[sku_name]`（供应链协议价）
+1. `Business.details.pricing[str(sku_id)].price`（客户约定价，key 为 sku_id）
+2. `SupplyChain.pricing_config[sku_name]`（供应链协议价，key 为 SKU 名称）
 3. 默认 0.0
 
 ---

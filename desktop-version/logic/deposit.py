@@ -186,8 +186,8 @@ def process_vc_deposit(session, vc_id):
                 sku_to_agreed_deposit[sid] = float(item.get("deposit", 0.0))
     
     # 计算分摊比例（实收/应收）
-    # 如果应收为0或负数，则比例为1（全额分摊）
-    ratio = (total_deposit / should_receive) if should_receive > EPSILON else 1.0
+    # 如果应收为0或负数，则比例为0（无需分摊）
+    ratio = (total_deposit / should_receive) if should_receive > EPSILON else 0.0
     
     # 按 SKU 约定押金 × 比例 分摊到每台设备
     for inv in inventories:

@@ -166,7 +166,7 @@ SQLite 数据库文件路径：`desktop-version/data/business_system.db`
 | 键名 | 类型 | 说明 |
 |------|------|------|
 | `history` | ARRAY | 状态变迁记录 |
-| `pricing` | OBJECT | SKU 定价配置，key 为 SKU 名称 |
+| `pricing` | OBJECT | SKU 定价配置，**key 为 sku_id**（字符串） |
 | `payment_terms` | OBJECT | 付款条款配置 |
 | `contract_id` | INTEGER | 关联合同 ID |
 
@@ -185,11 +185,11 @@ SQLite 数据库文件路径：`desktop-version/data/business_system.db`
 |------|------|------|
 | `{SKU名称}` | OBJECT | 单个 SKU 的定价配置 |
 
-**单个 SKU pricing 示例：**
+**单个 SKU pricing 示例（key 为 sku_id）：**
 ```json
 {
-  "price": 31.0,
-  "deposit": 0
+  "17": {"price": 31.0, "deposit": 0},
+  "18": {"price": 28.0, "deposit": 300}
 }
 ```
 
@@ -210,8 +210,8 @@ SQLite 数据库文件路径：`desktop-version/data/business_system.db`
     {"from": "合作落地", "to": "业务开展", "time": "2026-03-10T10:11:28.177157", "comment": ""}
   ],
   "pricing": {
-    "冰激凌机-湖北广腊-单头双冷": {"price": 31.0, "deposit": 0},
-    "草莓冰激凌-合肥佳合": {"price": 31.0, "deposit": 0}
+    "17": {"price": 31.0, "deposit": 0},
+    "18": {"price": 28.0, "deposit": 300}
   },
   "payment_terms": {
     "prepayment_ratio": 0.0,
@@ -237,6 +237,31 @@ SQLite 数据库文件路径：`desktop-version/data/business_system.db`
 
 ---
 
+### 2.3 addon_business（附加业务政策）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | INTEGER | 主键 |
+| `business_id` | INTEGER | 关联业务 FK |
+| `addon_type` | VARCHAR(50) | 类型：PRICE_ADJUST / NEW_SKU |
+| `status` | VARCHAR(20) | 状态：生效 / 失效 / 过期 |
+| `sku_id` | INTEGER | SKU ID（PRICE_ADJUST / NEW_SKU 必填） |
+| `override_price` | FLOAT | 覆盖单价（可为 NULL） |
+| `override_deposit` | FLOAT | 覆盖押金（可为 NULL） |
+| `start_date` | DATETIME | 有效期开始时间 |
+| `end_date` | DATETIME | 有效期结束时间（NULL=永久有效） |
+| `remark` | TEXT | 备注 |
+
+**addon_type 枚举值：**
+| 类型 | 说明 |
+|------|------|
+| `PRICE_ADJUST` | 价格调整（SKU 已存在于业务中） |
+| `NEW_SKU` | 新增 SKU（SKU 尚不存在于业务中） |
+
+**索引：** `(business_id)`、`(addon_type, sku_id)`
+
+---
+
 ## 3. 供应链表（Supply Chain）
 
 ### 3.1 supply_chains（供应链协议）
@@ -252,7 +277,7 @@ SQLite 数据库文件路径：`desktop-version/data/business_system.db`
 | `payment_terms` | JSON | 付款条款配置 |
 
 **`pricing_config` JSON 结构：**
-key 为 SKU 名称，value 为单价（数字）。
+key 为 SKU 名称（字符串），value 为单价（数字）。
 
 ```json
 {
@@ -759,11 +784,47 @@ payload 内容随 event_type 不同而变化。
 
 ---
 
-## 10. 表关系总图
+## 10. 操作事务表（Operation Transactions）
+
+### 10.1 operation_transactions（操作事务记录）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | INTEGER | 主键 |
+| `action_name` | VARCHAR(50) | 操作名称（如 `create_procurement_vc_action`） |
+| `ref_type` | VARCHAR(50) | 聚合根类型（VirtualContract / CashFlow / Logistics 等） |
+| `ref_id` | INTEGER | 关联记录 ID（主记录） |
+| `ref_vc_id` | INTEGER | 关联 VC ID（可空） |
+| `snapshot_before` | JSON | 回滚恢复依据（修改前的数据快照） |
+| `snapshot_after` | JSON | redo 恢复依据（修改后的数据快照） |
+| `involved_ids` | JSON | 相关记录 ID 列表 |
+| `status` | VARCHAR(20) | 状态：committed / rolled_back / failed |
+| `reason` | TEXT | 回滚原因（仅回滚时填写） |
+| `created_by` | VARCHAR(100) | 创建人 |
+| `created_at` | DATETIME | 创建时间 |
+| `rolled_back_at` | DATETIME | 回滚时间 |
+
+**snapshot_before / snapshot_after 结构：**
+```json
+{
+  "records": [
+    {"class": "VirtualContract", "id": 5, "data": {...}},
+    {"class": "CashFlow", "id": 10, "data": {...}}
+  ],
+  "files": [
+    {"path": "data/finance/finance-voucher/2026/03/TRF-001.json", "content": {...}}
+  ]
+}
+```
+
+---
+
+## 11. 表关系总图
 
 ```
 channel_customers (1)───(N) business
                           │
+                          ├──(N) addon_business        ← 附加业务政策（依附 Business）
                           └───(N) virtual_contracts (1)───(N) logistics (1)───(N) express_orders
                                   │                           │
                                   │                           ├── finance_triggered
@@ -794,11 +855,13 @@ bank_accounts (1)───(N) cash_flows (payer/payee)
 external_partners ──(独立)───(N) bank_accounts (owner)
 
 finance_accounts (1)───(N) financial_journal
+
+operation_transactions (独立)  ← 操作事务记录（全系统）
 ```
 
 ---
 
-## 11. 索引汇总
+## 12. 索引汇总
 
 | 表名 | 索引字段 |
 |------|----------|
