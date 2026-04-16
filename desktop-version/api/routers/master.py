@@ -114,8 +114,23 @@ def update_bank_accounts(payloads: List[UpdateBankAccountSchema], session: Sessi
 # ==================== 查询端点 ====================
 
 @router.get("/customers", summary="客户列表")
-def list_customers(page: int = 1, size: int = 50, session: Session = Depends(get_db)):
-    return {"success": True, "data": paginate(session, session.query(ChannelCustomer), page, size)}
+def list_customers(
+    ids: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """客户列表查询 - ids: 多值查询，search: 名称模糊搜索"""
+    q = session.query(ChannelCustomer)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(ChannelCustomer.id.in_(id_list))
+    if search:
+        q = q.filter(ChannelCustomer.name.ilike(f"%{search}%"))
+    q = q.order_by(ChannelCustomer.id.desc())
+    return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/customers/{cid}", summary="客户详情")
 def get_customer(cid: int, session: Session = Depends(get_db)):
@@ -125,10 +140,28 @@ def get_customer(cid: int, session: Session = Depends(get_db)):
     return {"success": True, "data": row_to_dict(obj)}
 
 @router.get("/points", summary="点位列表")
-def list_points(customer_id: Optional[int] = None, page: int = 1, size: int = 50, session: Session = Depends(get_db)):
+def list_points(
+    ids: Optional[str] = None,
+    customer_id: Optional[int] = None,
+    type: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """点位列表查询 - ids: 多值查询，search: 名称模糊搜索"""
     q = session.query(Point)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(Point.id.in_(id_list))
     if customer_id is not None:
         q = q.filter(Point.customer_id == customer_id)
+    if type:
+        q = q.filter(Point.type == type)
+    if search:
+        q = q.filter(Point.name.ilike(f"%{search}%"))
+    q = q.order_by(Point.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/points/{pid}", summary="点位详情")
@@ -139,8 +172,26 @@ def get_point(pid: int, session: Session = Depends(get_db)):
     return {"success": True, "data": row_to_dict(obj)}
 
 @router.get("/suppliers", summary="供应商列表")
-def list_suppliers(page: int = 1, size: int = 50, session: Session = Depends(get_db)):
-    return {"success": True, "data": paginate(session, session.query(Supplier), page, size)}
+def list_suppliers(
+    ids: Optional[str] = None,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """供应商列表查询 - ids: 多值查询，category: 类型筛选，search: 名称模糊搜索"""
+    q = session.query(Supplier)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(Supplier.id.in_(id_list))
+    if category:
+        q = q.filter(Supplier.category == category)
+    if search:
+        q = q.filter(Supplier.name.ilike(f"%{search}%"))
+    q = q.order_by(Supplier.id.desc())
+    return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/suppliers/{sid}", summary="供应商详情")
 def get_supplier(sid: int, session: Session = Depends(get_db)):
@@ -150,12 +201,28 @@ def get_supplier(sid: int, session: Session = Depends(get_db)):
     return {"success": True, "data": row_to_dict(obj)}
 
 @router.get("/skus", summary="SKU列表")
-def list_skus(supplier_id: Optional[int] = None, type_level1: Optional[str] = None, page: int = 1, size: int = 50, session: Session = Depends(get_db)):
+def list_skus(
+    ids: Optional[str] = None,
+    supplier_id: Optional[int] = None,
+    type_level1: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """SKU列表查询 - ids: 多值查询，search: 名称模糊搜索"""
     q = session.query(SKU)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(SKU.id.in_(id_list))
     if supplier_id is not None:
         q = q.filter(SKU.supplier_id == supplier_id)
     if type_level1:
         q = q.filter(SKU.type_level1 == type_level1)
+    if search:
+        q = q.filter(SKU.name.ilike(f"%{search}%"))
+    q = q.order_by(SKU.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/skus/{sku_id}", summary="SKU详情")
@@ -166,28 +233,71 @@ def get_sku(sku_id: int, session: Session = Depends(get_db)):
     return {"success": True, "data": row_to_dict(obj)}
 
 @router.get("/partners", summary="合作方列表")
-def list_partners(page: int = 1, size: int = 50, session: Session = Depends(get_db)):
-    return {"success": True, "data": paginate(session, session.query(ExternalPartner), page, size)}
+def list_partners(
+    ids: Optional[str] = None,
+    type: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """合作方列表查询 - ids: 多值查询，type: 类型筛选，search: 名称模糊搜索"""
+    q = session.query(ExternalPartner)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(ExternalPartner.id.in_(id_list))
+    if type:
+        q = q.filter(ExternalPartner.type == type)
+    if search:
+        q = q.filter(ExternalPartner.name.ilike(f"%{search}%"))
+    q = q.order_by(ExternalPartner.id.desc())
+    return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/partner-relations", summary="合作方关系列表")
 def list_partner_relations(
     partner_id: Optional[int] = None,
     owner_type: Optional[str] = None,
     owner_id: Optional[int] = None,
+    page: int = 1,
+    size: int = 50,
     session: Session = Depends(get_db)
 ):
-    return {"success": True, "data": get_partner_relations(partner_id, owner_type, owner_id)}
+    """合作方关系列表查询 - 增加分页参数"""
+    data = get_partner_relations(partner_id, owner_type, owner_id)
+    return {"success": True, "data": {"items": data, "total": len(data), "page": page, "size": size}}
 
 
 @router.get("/bank-accounts", summary="银行账户列表")
-def list_bank_accounts(owner_type: Optional[str] = None, owner_id: Optional[int] = None, session: Session = Depends(get_db)):
+def list_bank_accounts(
+    ids: Optional[str] = None,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[int] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """银行账户列表查询 - ids: 多值查询，search: 模糊搜索"""
     q = session.query(BankAccount)
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(BankAccount.id.in_(id_list))
     if owner_type:
         q = q.filter(BankAccount.owner_type == owner_type)
-        # ourselves 类型 owner_id 为 NULL，按传入的 owner_id 值过滤时需兼容 NULL 语义
-        # 传入 owner_id=0 等同于查所有 ourselves 账户（忽略 owner_id 过滤）
         if owner_type != 'ourselves' and owner_id is not None:
             q = q.filter(BankAccount.owner_id == owner_id)
     elif owner_id is not None:
         q = q.filter(BankAccount.owner_id == owner_id)
-    return {"success": True, "data": {"items": [row_to_dict(a) for a in q.all()]}}
+    if search:
+        q = q.filter(BankAccount.account_info.ilike(f"%{search}%"))
+    q = q.order_by(BankAccount.id.desc())
+    return {"success": True, "data": paginate(session, q, page, size)}
+
+@router.get("/bank-accounts/{account_id}", summary="银行账户详情")
+def get_bank_account(account_id: int, session: Session = Depends(get_db)):
+    obj = session.query(BankAccount).get(account_id)
+    if not obj:
+        return {"success": False, "error": "未找到银行账户"}
+    return {"success": True, "data": row_to_dict(obj)}

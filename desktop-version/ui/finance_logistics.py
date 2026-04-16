@@ -1005,6 +1005,8 @@ def show_cash_flow_page():
     if sel_tab == '资金流录入':
         st.subheader("资金流列表")
         vcs = get_vc_list_for_overview(status_list=[VCStatus.EXE])
+        # 排除 cash_status=FINISH 的VC（货款已结清，不需要再录入资金流）
+        vcs = [v for v in vcs if v['cash_status'] != CashStatus.FINISH]
         if vcs:
             vc_options = {f"[{v['type']}] {v['description']} (ID:{v['id']})": v['id'] for v in vcs}
             selected_vc_desc = st.selectbox("1. 选择关联虚拟合同", list(vc_options.keys()))

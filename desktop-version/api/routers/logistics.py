@@ -53,10 +53,48 @@ def bulk_progress_express_orders(req: BulkProgressRequest, session: Session = De
 # ==================== 查询端点 ====================
 
 @router.get("/list", summary="物流列表")
-def list_logistics(vc_id: Optional[int] = None, page: int = 1, size: int = 50, session: Session = Depends(get_db)):
+def list_logistics(
+    ids: Optional[str] = None,
+    vc_id: Optional[int] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tracking_number: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """物流列表查询
+    - ids: 多值查询，如 "1,2,3"
+    - status: 物流状态筛选
+    - date_from/date_to: 创建时间范围，格式 "YYYY-MM-DD"
+    - tracking_number: 快递单号模糊搜索
+    """
     q = session.query(Logistics)
+
+    # 多值查询
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(Logistics.id.in_(id_list))
+
+    # 精确过滤
     if vc_id is not None:
         q = q.filter(Logistics.virtual_contract_id == vc_id)
+    if status:
+        q = q.filter(Logistics.status == status)
+
+    # 时间范围
+    if date_from:
+        q = q.filter(Logistics.created_at >= date_from)
+    if date_to:
+        q = q.filter(Logistics.created_at <= date_to)
+
+    # 快递单号搜索（通过关联 ExpressOrder）
+    if tracking_number:
+        q = q.join(ExpressOrder).filter(ExpressOrder.tracking_number.ilike(f"%{tracking_number}%"))
+
+    q = q.order_by(Logistics.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/{log_id}", summary="物流详情")

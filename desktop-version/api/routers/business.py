@@ -43,12 +43,56 @@ def advance_business_stage(payload: AdvanceBusinessStageSchema, session: Session
 # ==================== 查询端点 ====================
 
 @router.get("/list", summary="业务列表")
-def list_businesses(customer_id: Optional[int] = None, status: Optional[str] = None, page: int = 1, size: int = 50, session: Session = Depends(get_db)):
+def list_businesses(
+    ids: Optional[str] = None,
+    customer_id: Optional[int] = None,
+    customer_ids: Optional[str] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """业务列表查询
+    - ids: 多值查询，如 "1,2,3"
+    - customer_ids: 多客户查询，如 "1,2,3"
+    - date_from/date_to: 创建时间范围，格式 "YYYY-MM-DD"
+    - search: 按业务描述模糊搜索
+    """
     q = session.query(Business)
+
+    # 多值查询
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(Business.id.in_(id_list))
+
+    # 精确过滤
     if customer_id is not None:
         q = q.filter(Business.customer_id == customer_id)
+    if customer_ids:
+        c_list = [int(x.strip()) for x in customer_ids.split(",") if x.strip().isdigit()]
+        if c_list:
+            q = q.filter(Business.customer_id.in_(c_list))
     if status:
         q = q.filter(Business.status == status)
+
+    # 时间范围
+    if date_from:
+        q = q.filter(Business.timestamp >= date_from)
+    if date_to:
+        q = q.filter(Business.timestamp <= date_to)
+
+    # 模糊搜索（需要关联 ChannelCustomer 查询名称）
+    if search:
+        from models import ChannelCustomer
+        q = q.join(ChannelCustomer, Business.customer_id == ChannelCustomer.id).filter(
+            ChannelCustomer.name.ilike(f"%{search}%")
+        )
+
+    q = q.order_by(Business.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/{bid}", summary="业务详情")

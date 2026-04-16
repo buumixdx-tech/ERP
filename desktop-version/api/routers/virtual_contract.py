@@ -101,14 +101,56 @@ def delete_vc(req: DeleteVCRequest, session: Session = Depends(get_db)):
 # ==================== 查询端点 ====================
 
 @router.get("/list", summary="虚拟合同列表")
-def list_vcs(business_id: Optional[int] = None, type: Optional[str] = None, status: Optional[str] = None, page: int = 1, size: int = 50, session: Session = Depends(get_db)):
+def list_vcs(
+    ids: Optional[str] = None,
+    business_id: Optional[int] = None,
+    type: Optional[str] = None,
+    status: Optional[str] = None,
+    cash_status: Optional[str] = None,
+    subject_status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """虚拟合同列表查询
+    - ids: 多值查询，如 "1,2,3"
+    - date_from/date_to: 创建时间范围，格式 "YYYY-MM-DD"
+    - search: 按描述模糊搜索
+    """
     q = session.query(VirtualContract)
+
+    # 多值查询
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(VirtualContract.id.in_(id_list))
+
+    # 精确过滤
     if business_id is not None:
         q = q.filter(VirtualContract.business_id == business_id)
     if type:
         q = q.filter(VirtualContract.type == type)
     if status:
         q = q.filter(VirtualContract.status == status)
+    if cash_status:
+        q = q.filter(VirtualContract.cash_status == cash_status)
+    if subject_status:
+        q = q.filter(VirtualContract.subject_status == subject_status)
+
+    # 时间范围
+    if date_from:
+        q = q.filter(VirtualContract.created_at >= date_from)
+    if date_to:
+        q = q.filter(VirtualContract.created_at <= date_to)
+
+    # 模糊搜索
+    if search:
+        q = q.filter(VirtualContract.description.ilike(f"%{search}%"))
+
+    q = q.order_by(VirtualContract.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
 @router.get("/{vc_id}", summary="虚拟合同详情")

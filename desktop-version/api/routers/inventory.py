@@ -20,6 +20,32 @@ def list_equipment(vc_id: Optional[int] = None, point_id: Optional[int] = None, 
 
 
 @router.get("/material", summary="物料库存列表")
-def list_material(session: Session = Depends(get_db)):
-    items = session.query(MaterialInventory).all()
-    return {"success": True, "data": {"items": [row_to_dict(m) for m in items]}}
+def list_material(
+    ids: Optional[str] = None,
+    sku_id: Optional[int] = None,
+    warehouse_point_id: Optional[int] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    """物料库存列表查询
+    - ids: 多值查询，如 "1,2,3"
+    - sku_id: 按SKU过滤
+    - warehouse_point_id: 按仓库点位过滤
+    """
+    q = session.query(MaterialInventory)
+
+    # 多值查询
+    if ids:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+        if id_list:
+            q = q.filter(MaterialInventory.id.in_(id_list))
+
+    # 精确过滤
+    if sku_id is not None:
+        q = q.filter(MaterialInventory.sku_id == sku_id)
+    if warehouse_point_id is not None:
+        q = q.filter(MaterialInventory.warehouse_point_id == warehouse_point_id)
+
+    q = q.order_by(MaterialInventory.id.desc())
+    return {"success": True, "data": paginate(session, q, page, size)}
