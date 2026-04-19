@@ -1,7 +1,21 @@
 # CLAUDE.md
 
 本文档为 Claude Code (claude.ai/code) 提供代码库操作指引。
-所有读取markdown和db的操作都要基于UTF8编码
+
+## 终端编码配置
+
+**Windows 默认编码为 GBK，执行 bash 命令时统一使用 UTF-8**：
+
+在 Claude Code 的 bash 环境中执行命令前，自动设置：
+
+```bash
+# Windows 中文环境
+export PYTHONIOENCODING=utf-8
+export LANG=zh_CN.UTF-8
+chcp.com 65001 > /dev/null 2>&1
+```
+
+> Claude Code 的 Bash 工具默认已使用 UTF-8，此配置确保 Python 输出中文不乱码。
 
 
 ## 项目简介
