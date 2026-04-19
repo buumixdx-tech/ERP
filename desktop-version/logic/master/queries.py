@@ -1029,6 +1029,7 @@ def get_partner_relations(
     partner_id: Optional[int] = None,
     owner_type: Optional[str] = None,
     owner_id: Optional[int] = None,
+    relation_type: Optional[str] = None,
     active_only: bool = True
 ) -> List[Dict[str, Any]]:
     """
@@ -1038,6 +1039,7 @@ def get_partner_relations(
         partner_id: 合作方ID
         owner_type: 归属主体类型 (customer/supplier/ourselves)
         owner_id: 归属主体ID
+        relation_type: 合作模式
         active_only: 是否仅查询有效关系（ended_at IS NULL）
     """
     session = get_session()
@@ -1050,6 +1052,8 @@ def get_partner_relations(
             query = query.filter(PartnerRelation.owner_type == owner_type)
         if owner_id is not None:
             query = query.filter(PartnerRelation.owner_id == owner_id)
+        if relation_type is not None:
+            query = query.filter(PartnerRelation.relation_type == relation_type)
         if active_only:
             query = query.filter(PartnerRelation.ended_at.is_(None))
 

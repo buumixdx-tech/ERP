@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import func, and_
 from api.deps import get_db, verify_api_key, row_to_dict, paginate
 from models import VirtualContract, VirtualContractStatusLog, Logistics, CashFlow
 from logic.vc import (
@@ -13,6 +14,7 @@ from logic.vc import (
     CreateMatProcurementVCSchema, CreateStockProcurementVCSchema, AllocateInventorySchema,
     TimeRuleSchema,
 )
+from logic.constants import VCStatus
 
 router = APIRouter(prefix="/api/v1/vc", tags=["虚拟合同"], dependencies=[Depends(verify_api_key)])
 
@@ -140,11 +142,23 @@ def list_vcs(
     if subject_status:
         q = q.filter(VirtualContract.subject_status == subject_status)
 
-    # 时间范围
-    if date_from:
-        q = q.filter(VirtualContract.created_at >= date_from)
-    if date_to:
-        q = q.filter(VirtualContract.created_at <= date_to)
+    # 时间范围：通过 vc_status_logs 中 category="status" 且 status_name="执行" 的条目确定 VC 创建时间
+    if date_from or date_to:
+        # 子查询：找到每个 VC 的创建时间（category="status" 且 status_name=执行 的第一条日志）
+        created_log = session.query(
+            VirtualContractStatusLog.vc_id,
+            func.min(VirtualContractStatusLog.timestamp).label('created_time')
+        ).filter(
+            VirtualContractStatusLog.category == 'status',
+            VirtualContractStatusLog.status_name == VCStatus.EXE
+        ).group_by(VirtualContractStatusLog.vc_id).subquery()
+
+        q = q.join(created_log, VirtualContract.id == created_log.c.vc_id)
+
+        if date_from:
+            q = q.filter(func.date(created_log.c.created_time) >= date_from)
+        if date_to:
+            q = q.filter(func.date(created_log.c.created_time) <= date_to)
 
     # 模糊搜索
     if search:

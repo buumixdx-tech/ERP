@@ -39,8 +39,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    from api.routers import system, master, business, supply_chain, virtual_contract, logistics, finance, rules, query, inventory, events, addon_business, raw_query
-    for mod in [system, master, business, supply_chain, virtual_contract, logistics, finance, rules, query, inventory, events, addon_business, raw_query]:
+    from api.routers import system, master, business, supply_chain, virtual_contract, logistics, finance, rules, query, inventory, events, partner_relations, raw_query
+    for mod in [system, master, business, supply_chain, virtual_contract, logistics, finance, rules, query, inventory, events, partner_relations, raw_query]:
         app.include_router(mod.router)
 
     return app

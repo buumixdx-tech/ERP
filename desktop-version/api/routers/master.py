@@ -9,13 +9,11 @@ from logic.master import (
     create_supplier_action, update_suppliers_action, delete_suppliers_action,
     create_sku_action, update_skus_action, delete_skus_action,
     create_partner_action, update_partners_action, delete_partners_action,
-    create_partner_relation_action, delete_partner_relations_action,
     CustomerSchema, PointSchema, SupplierSchema, SKUSchema, PartnerSchema,
-    DeleteMasterDataSchema, PartnerRelationSchema,
-    get_partner_relations,
+    DeleteMasterDataSchema,
 )
 from logic.finance import (
-    create_bank_account_action, update_bank_accounts_action,
+    create_bank_account_action, update_bank_accounts_action, delete_bank_accounts_action,
     CreateBankAccountSchema, UpdateBankAccountSchema,
 )
 
@@ -91,15 +89,6 @@ def update_partners(payloads: List[PartnerSchema], session: Session = Depends(ge
 def delete_partners(payloads: List[DeleteMasterDataSchema], session: Session = Depends(get_db)):
     return delete_partners_action(session, payloads).model_dump()
 
-# --- Partner Relation ---
-@router.post("/create-partner-relation", summary="创建合作方关系")
-def create_partner_relation(payload: PartnerRelationSchema, session: Session = Depends(get_db)):
-    return create_partner_relation_action(session, payload).model_dump()
-
-@router.post("/delete-partner-relations", summary="批量删除合作方关系")
-def delete_partner_relations(payloads: List[DeleteMasterDataSchema], session: Session = Depends(get_db)):
-    return delete_partner_relations_action(session, payloads).model_dump()
-
 # --- Bank Account ---
 @router.post("/create-bank-account", summary="创建银行账户")
 def create_bank_account(payload: CreateBankAccountSchema, session: Session = Depends(get_db)):
@@ -109,6 +98,10 @@ def create_bank_account(payload: CreateBankAccountSchema, session: Session = Dep
 @router.post("/update-bank-accounts", summary="批量更新银行账户")
 def update_bank_accounts(payloads: List[UpdateBankAccountSchema], session: Session = Depends(get_db)):
     return update_bank_accounts_action(session, payloads).model_dump()
+
+@router.post("/delete-bank-accounts", summary="批量删除银行账户")
+def delete_bank_accounts(payloads: List[DeleteMasterDataSchema], session: Session = Depends(get_db)):
+    return delete_bank_accounts_action(session, payloads).model_dump()
 
 
 # ==================== 查询端点 ====================
@@ -132,6 +125,30 @@ def list_customers(
     q = q.order_by(ChannelCustomer.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
+@router.get("/customers/suggest", summary="客户名称自动补全")
+def suggest_customers(
+    q: str,
+    limit: int = 10,
+    session: Session = Depends(get_db)
+):
+    """客户名称自动补全
+    - q: 搜索关键字（至少1个字符）
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
+
+    customers = session.query(ChannelCustomer).filter(
+        ChannelCustomer.name.ilike(f"%{q}%")
+    ).order_by(ChannelCustomer.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [{"id": c.id, "name": c.name} for c in customers]
+        }
+    }
+
 @router.get("/customers/{cid}", summary="客户详情")
 def get_customer(cid: int, session: Session = Depends(get_db)):
     obj = session.query(ChannelCustomer).get(cid)
@@ -143,13 +160,14 @@ def get_customer(cid: int, session: Session = Depends(get_db)):
 def list_points(
     ids: Optional[str] = None,
     customer_id: Optional[int] = None,
+    supplier_id: Optional[int] = None,
     type: Optional[str] = None,
     search: Optional[str] = None,
     page: int = 1,
     size: int = 50,
     session: Session = Depends(get_db)
 ):
-    """点位列表查询 - ids: 多值查询，search: 名称模糊搜索"""
+    """点位列表查询 - ids: 多值查询，supplier_id: 供应商ID筛选，search: 名称模糊搜索"""
     q = session.query(Point)
     if ids:
         id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
@@ -157,12 +175,40 @@ def list_points(
             q = q.filter(Point.id.in_(id_list))
     if customer_id is not None:
         q = q.filter(Point.customer_id == customer_id)
+    if supplier_id is not None:
+        q = q.filter(Point.supplier_id == supplier_id)
     if type:
         q = q.filter(Point.type == type)
     if search:
-        q = q.filter(Point.name.ilike(f"%{search}%"))
+        q = q.filter(
+            (Point.name.ilike(f"%{search}%")) | (Point.address.ilike(f"%{search}%"))
+        )
     q = q.order_by(Point.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
+
+@router.get("/points/suggest", summary="点位名称自动补全")
+def suggest_points(
+    q: str,
+    limit: int = 10,
+    session: Session = Depends(get_db)
+):
+    """点位名称自动补全
+    - q: 搜索关键字（至少1个字符）
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
+
+    points = session.query(Point).filter(
+        Point.name.ilike(f"%{q}%")
+    ).order_by(Point.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [{"id": p.id, "name": p.name, "type": p.type} for p in points]
+        }
+    }
 
 @router.get("/points/{pid}", summary="点位详情")
 def get_point(pid: int, session: Session = Depends(get_db)):
@@ -189,9 +235,41 @@ def list_suppliers(
     if category:
         q = q.filter(Supplier.category == category)
     if search:
-        q = q.filter(Supplier.name.ilike(f"%{search}%"))
+        q = q.filter(
+            (Supplier.name.ilike(f"%{search}%")) | (Supplier.address.ilike(f"%{search}%"))
+        )
     q = q.order_by(Supplier.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
+
+@router.get("/suppliers/suggest", summary="供应商名称自动补全")
+def suggest_suppliers(
+    q: str,
+    category: Optional[str] = None,
+    limit: int = 10,
+    session: Session = Depends(get_db)
+):
+    """供应商名称自动补全
+    - q: 搜索关键字（至少1个字符）
+    - category: 可选，按类型过滤（设备/物料/兼备）
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
+
+    suppliers = session.query(Supplier).filter(
+        (Supplier.name.ilike(f"%{q}%")) | (Supplier.address.ilike(f"%{q}%"))
+    )
+    if category:
+        suppliers = suppliers.filter(Supplier.category == category)
+
+    suppliers = suppliers.order_by(Supplier.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [{"id": s.id, "name": s.name, "category": s.category} for s in suppliers]
+        }
+    }
 
 @router.get("/suppliers/{sid}", summary="供应商详情")
 def get_supplier(sid: int, session: Session = Depends(get_db)):
@@ -225,6 +303,36 @@ def list_skus(
     q = q.order_by(SKU.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
+@router.get("/skus/suggest", summary="SKU名称自动补全")
+def suggest_skus(
+    q: str,
+    type_level1: Optional[str] = None,
+    limit: int = 10,
+    session: Session = Depends(get_db)
+):
+    """SKU名称自动补全
+    - q: 搜索关键字（至少1个字符）
+    - type_level1: 可选，按类型过滤（设备/物料）
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
+
+    skus = session.query(SKU).filter(
+        SKU.name.ilike(f"%{q}%")
+    )
+    if type_level1:
+        skus = skus.filter(SKU.type_level1 == type_level1)
+
+    skus = skus.order_by(SKU.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [{"id": s.id, "name": s.name, "type_level1": s.type_level1} for s in skus]
+        }
+    }
+
 @router.get("/skus/{sku_id}", summary="SKU详情")
 def get_sku(sku_id: int, session: Session = Depends(get_db)):
     obj = session.query(SKU).get(sku_id)
@@ -250,23 +358,48 @@ def list_partners(
     if type:
         q = q.filter(ExternalPartner.type == type)
     if search:
-        q = q.filter(ExternalPartner.name.ilike(f"%{search}%"))
+        q = q.filter(
+            (ExternalPartner.name.ilike(f"%{search}%")) | (ExternalPartner.address.ilike(f"%{search}%"))
+        )
     q = q.order_by(ExternalPartner.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
 
-@router.get("/partner-relations", summary="合作方关系列表")
-def list_partner_relations(
-    partner_id: Optional[int] = None,
-    owner_type: Optional[str] = None,
-    owner_id: Optional[int] = None,
-    page: int = 1,
-    size: int = 50,
+@router.get("/partners/suggest", summary="合作方名称自动补全")
+def suggest_partners(
+    q: str,
+    type: Optional[str] = None,
+    limit: int = 10,
     session: Session = Depends(get_db)
 ):
-    """合作方关系列表查询 - 增加分页参数"""
-    data = get_partner_relations(partner_id, owner_type, owner_id)
-    return {"success": True, "data": {"items": data, "total": len(data), "page": page, "size": size}}
+    """合作方名称自动补全
+    - q: 搜索关键字（至少1个字符）
+    - type: 可选，按类型过滤
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
 
+    partners = session.query(ExternalPartner).filter(
+        (ExternalPartner.name.ilike(f"%{q}%")) | (ExternalPartner.address.ilike(f"%{q}%"))
+    )
+    if type:
+        partners = partners.filter(ExternalPartner.type == type)
+
+    partners = partners.order_by(ExternalPartner.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [{"id": p.id, "name": p.name, "type": p.type} for p in partners]
+        }
+    }
+
+@router.get("/partners/{pid}", summary="合作方详情")
+def get_partner(pid: int, session: Session = Depends(get_db)):
+    obj = session.query(ExternalPartner).get(pid)
+    if not obj:
+        return {"success": False, "error": "未找到合作方"}
+    return {"success": True, "data": row_to_dict(obj)}
 
 @router.get("/bank-accounts", summary="银行账户列表")
 def list_bank_accounts(
@@ -294,6 +427,43 @@ def list_bank_accounts(
         q = q.filter(BankAccount.account_info.ilike(f"%{search}%"))
     q = q.order_by(BankAccount.id.desc())
     return {"success": True, "data": paginate(session, q, page, size)}
+
+@router.get("/bank-accounts/suggest", summary="银行账户自动补全")
+def suggest_bank_accounts(
+    q: str,
+    owner_type: Optional[str] = None,
+    owner_id: Optional[int] = None,
+    limit: int = 10,
+    session: Session = Depends(get_db)
+):
+    """银行账户自动补全
+    - q: 搜索关键字（至少1个字符）
+    - owner_type: 可选，按账户所有者类型过滤
+    - owner_id: 可选，按账户所有者ID过滤
+    - limit: 返回数量，默认10
+    """
+    if not q or len(q) < 1:
+        return {"success": True, "data": {"suggestions": []}}
+
+    accounts = session.query(BankAccount).filter(
+        BankAccount.account_info.ilike(f"%{q}%")
+    )
+    if owner_type:
+        accounts = accounts.filter(BankAccount.owner_type == owner_type)
+    if owner_id is not None:
+        accounts = accounts.filter(BankAccount.owner_id == owner_id)
+
+    accounts = accounts.order_by(BankAccount.id.desc()).limit(limit).all()
+
+    return {
+        "success": True,
+        "data": {
+            "suggestions": [
+                {"id": a.id, "account_info": a.account_info, "owner_type": a.owner_type, "owner_id": a.owner_id}
+                for a in accounts
+            ]
+        }
+    }
 
 @router.get("/bank-accounts/{account_id}", summary="银行账户详情")
 def get_bank_account(account_id: int, session: Session = Depends(get_db)):

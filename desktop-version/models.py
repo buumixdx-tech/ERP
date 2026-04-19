@@ -84,7 +84,7 @@ class MaterialInventory(Base):
     __tablename__ = 'material_inventory'
     id = Column(Integer, primary_key=True)
     sku_id = Column(Integer, ForeignKey('skus.id'), unique=True)
-    stock_distribution = Column(JSON) # 库存分布 JSON: {"仓库名称": 数量}
+    stock_distribution = Column(JSON) # 库存分布 JSON: {"str(point_id)": 数量}
     average_price = Column(Float, default=0.0)
     total_balance = Column(Float, default=0.0)
 

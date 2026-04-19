@@ -2,12 +2,14 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from api.deps import get_db, verify_api_key, row_to_dict, paginate
-from models import SupplyChain, SupplyChainItem
+from models import SupplyChain, SupplyChainItem, SystemEvent
 from logic.supply_chain import (
     create_supply_chain_action, update_supply_chain_action, delete_supply_chain_action,
     CreateSupplyChainSchema, UpdateSupplyChainSchema, DeleteSupplyChainSchema,
 )
+from logic.constants import SystemEventType, SystemAggregateType
 
 router = APIRouter(prefix="/api/v1/supply-chain", tags=["供应链"], dependencies=[Depends(verify_api_key)])
 
@@ -81,11 +83,22 @@ def list_supply_chains(
     if type:
         q = q.filter(SupplyChain.type == type)
 
-    # 时间范围
-    if date_from:
-        q = q.filter(SupplyChain.created_at >= date_from)
-    if date_to:
-        q = q.filter(SupplyChain.created_at <= date_to)
+    # 时间范围：通过 system_events 中 SUPPLY_CHAIN_CREATED 事件确定创建时间
+    if date_from or date_to:
+        created_event = session.query(
+            SystemEvent.aggregate_id,
+            func.min(SystemEvent.created_at).label('created_time')
+        ).filter(
+            SystemEvent.event_type == SystemEventType.SUPPLY_CHAIN_CREATED,
+            SystemEvent.aggregate_type == SystemAggregateType.SUPPLY_CHAIN
+        ).group_by(SystemEvent.aggregate_id).subquery()
+
+        q = q.join(created_event, SupplyChain.id == created_event.c.aggregate_id)
+
+        if date_from:
+            q = q.filter(func.date(created_event.c.created_time) >= date_from)
+        if date_to:
+            q = q.filter(func.date(created_event.c.created_time) <= date_to)
 
     # 模糊搜索（需要关联 Supplier 查询名称）
     if search:

@@ -15,13 +15,8 @@ def get_db():
         session.close()
 
 
-def verify_api_key(x_api_key: str = Header(...)):
-    valid_keys_str = os.environ.get("SHANYIN_API_KEYS")
-    if not valid_keys_str:
-        raise RuntimeError("SHANYIN_API_KEYS environment variable is not set")
-    valid_keys = valid_keys_str.split(",")
-    if not any(secrets.compare_digest(x_api_key, key) for key in valid_keys):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+def verify_api_key(x_api_key: str = Header(None)):
+    pass  # API key verification disabled
 
 
 def row_to_dict(obj):

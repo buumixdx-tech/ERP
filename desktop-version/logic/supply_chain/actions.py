@@ -25,6 +25,9 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
             existing_sc.payment_terms = payload.payment_terms
             sc_id = existing_sc.id
             msg = f"已更新供应商 {payload.supplier_name} 的 {payload.type} 协议"
+            emit_event(session, SystemEventType.SUPPLY_CHAIN_UPDATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
+                "supplier_id": payload.supplier_id, "type": payload.type
+            })
         else:
             new_sc = SupplyChain(
                 supplier_id=payload.supplier_id,
@@ -36,6 +39,9 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
             session.flush()
             sc_id = new_sc.id
             msg = f"已为供应商 {payload.supplier_name} 创建新的 {payload.type} 协议"
+            emit_event(session, SystemEventType.SUPPLY_CHAIN_CREATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
+                "supplier_id": payload.supplier_id, "type": payload.type
+            })
 
         # 生成付款条款时间规则
         if payload.payment_terms:
@@ -54,9 +60,6 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
                 rules=template_rules
             )
 
-        emit_event(session, SystemEventType.SUPPLY_CHAIN_CREATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
-            "supplier_id": payload.supplier_id, "type": payload.type
-        })
         session.commit()
         return ActionResult(success=True, data={"sc_id": sc_id}, message=msg)
     except Exception as e:

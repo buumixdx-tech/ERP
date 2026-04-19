@@ -308,3 +308,18 @@ def _clear_default_bank_account(session: Session, owner_type: str, owner_id: int
         q = q.filter(BankAccount.owner_id.is_(None))
     for acc in q.all():
         acc.is_default = False
+
+def delete_bank_accounts_action(session: Session, payloads: list) -> ActionResult:
+    from models import BankAccount
+    try:
+        deleted_count = 0
+        for p in payloads:
+            obj = session.query(BankAccount).get(p.id)
+            if obj:
+                session.delete(obj)
+                deleted_count += 1
+        session.commit()
+        return ActionResult(success=True, message=f"成功删除 {deleted_count} 个账户")
+    except Exception as e:
+        session.rollback()
+        return ActionResult(success=False, error=str(e))
