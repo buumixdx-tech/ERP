@@ -198,6 +198,7 @@ def _save_material_supply_vc(_session, business_id, data):
             shipping_point_id=int(norm.get('shipping_point_id') or 0),
             receiving_point_id=int(norm.get('receiving_point_id') or 0),
             sku_id=int(norm.get('sku_id') or 0),
+            batch_no=norm.get('batch_no') or None,
             qty=qty,
             price=price,
             deposit=0.0,
@@ -265,6 +266,7 @@ def confirm_material_supply_dialog(session, business_id):
         flat_items.append({
             "收货点位": ni.get("receiving_point_name") or SystemConstants.UNKNOWN,
             "物料名称": ni["sku_name"],
+            "批次号": ni.get("batch_no") or "-",
             "数量": ni["qty"],
             "单价": ni["price"],
             "金额": ni["qty"] * ni["price"],
@@ -282,11 +284,16 @@ def confirm_material_supply_dialog(session, business_id):
             if vc_id:
                 st.success("服务核算单已成功下达！")
                 st.session_state[f"show_supply_confirm_{business_id}"] = False
+                # 重置提交状态，下次可正常新建
+                submitted_key = f"supply_row_{business_id}_submitted"
+                if submitted_key in st.session_state:
+                    st.session_state[submitted_key] = False
                 st.rerun()
 
     with c_sub2:
         if st.button("返回修改", use_container_width=True):
             st.session_state[f"show_supply_confirm_{business_id}"] = False
+            st.session_state[f"supply_row_{business_id}_submitted"] = False
             st.rerun()
 
 def _save_mat_procurement_vc(_session, sc_id, data):
@@ -466,16 +473,17 @@ def confirm_return_dialog(session, target_vc_id):
     df_ret = pd.DataFrame(data['return_items'])
     # 映射列名以便预览
     df_preview = df_ret.rename(columns={
-        "sku_name": "物品名称",
+        "sku_name": "SKU",
         "sn": "SN码",
+        "batch_no": "批次",
         "qty": "数量",
-        "price": "单价",
+        "price": "执行单价",
         "deposit": "押金",
         "point_name": "当前所在位置",
         "target_warehouse": "退回目的地"  # 字段 key 不变，兼容已有数据
     })
-    
-    cols_to_show = ["物品名称", "SN码", "数量", "当前所在位置", "退回目的地"]
+
+    cols_to_show = ["SKU", "SN码", "批次", "数量", "当前所在位置", "退回目的地"]
     if is_deposit_only: cols_to_show.append("押金")
     else: cols_to_show.append("单价")
     
@@ -1324,51 +1332,115 @@ def show_inventory_dashboard_component():
         if col2.button("刷新数据", key="refresh_mat_inv"):
             st.rerun()
 
-        mat_data = get_material_inventory_list()
-        if not mat_data:
+        # 全局视角切换
+        view_mode = sac.tabs([
+            sac.TabsItem("按仓库", icon="geo-alt"),
+            sac.TabsItem("按批次", icon="collection"),
+        ], align="start", variant="pill", key="mat_inv_view_mode")
+
+        # 使用完整批次明细数据构建两套视图
+        all_rows = get_material_inventory_all()
+        if not all_rows:
             st.info("目前没有物料库存记录")
         else:
+            # 收集 sku 均价
+            _s = get_session()
+            sku_avg_map = {}
+            sku_name_map = {}
+            sku_ids_in_use = list({r["sku_id"] for r in all_rows})
+            if sku_ids_in_use:
+                sku_objs = _s.query(SKU).filter(SKU.id.in_(sku_ids_in_use)).all()
+                for s in sku_objs:
+                    sku_name_map[s.id] = s.name
+                    sku_avg_map[s.id] = float(s.params.get("average_price", 0.0) or 0) if s.params else 0.0
+            _s.close()
+
+            by_sku = {}
+            for r in all_rows:
+                sid = r["sku_id"]
+                if sid not in by_sku:
+                    by_sku[sid] = {"sku_name": r["sku_name"], "batches": []}
+                by_sku[sid]["batches"].append(r)
+
             # 仓库颜色映射
             WH_COLOR_MAP = {
-                "成都仓": "#4CAF50",
-                "天津仓": "#2196F3",
-                "深圳仓": "#FF9800",
-                "廊坊仓": "#9C27B0",
-                "北京仓": "#F44336",
-                "上海仓": "#00BCD4",
-                "广州仓": "#FF5722",
-                "武汉仓": "#795548",
-                "西安仓": "#607D8B",
+                "成都仓": "#4CAF50", "天津仓": "#2196F3", "深圳仓": "#FF9800",
+                "廊坊仓": "#9C27B0", "北京仓": "#F44336", "上海仓": "#00BCD4",
+                "广州仓": "#FF5722", "武汉仓": "#795548", "西安仓": "#607D8B",
                 "重庆仓": "#F06292",
             }
-            DEFAULT_COLOR = "#90a4ae"
 
-            for item in mat_data:
-                dist: dict = item.get("库存分布") or {}
-                if not dist:
-                    continue
-
-                total = item.get("总余额") or 0
-                sku_name = item.get("物料名称") or "未知物料"
-                sku_id = item.get("物料ID")
-
-                # 仓库分布文字
-                dist_items = []
-                for wh, qty in dist.items():
-                    pct = qty / total * 100 if total > 0 else 0
-                    warning = " ⚠️" if qty < 10 else ""
-                    dist_items.append(f"**{html.escape(wh)}{warning}**：{qty} 件（{pct:.0f}%）")
-                dist_html = "<br>".join(dist_items)
+            for sku_id, sku_data in by_sku.items():
+                sku_name = sku_name_map.get(sku_id, sku_data["sku_name"])
+                batches = sku_data["batches"]
+                total = sum(b["qty"] for b in batches)
+                avg_price = sku_avg_map.get(sku_id, 0.0)
 
                 with st.container():
                     st.markdown("---")
-                    col1, col2 = st.columns([1, 1])
-                    with col1:
-                        st.markdown(f"**物料名称**: {html.escape(str(sku_name))}", unsafe_allow_html=False)
-                    with col2:
-                        st.markdown(f"**<span style='font-size:16px;color:#1976D2;'>总库存：{total}</span>**", unsafe_allow_html=True)
-                    st.markdown(dist_html, unsafe_allow_html=True)
-                    with st.expander("查看入库/出库时间线"):
+                    hdr_col1, hdr_col2, hdr_col3 = st.columns([1, 1, 1])
+                    with hdr_col1:
+                        st.markdown(f"**{html.escape(sku_name)}**")
+                    with hdr_col2:
+                        st.markdown(f"总库存：**<span style='color:#1976D2;font-size:15px;'>{int(total)}</span>** 件", unsafe_allow_html=True)
+                    with hdr_col3:
+                        if avg_price > 0:
+                            st.markdown(f"均价：**<span style='color:#888;font-size:13px;'>¥{avg_price:.2f}</span>**", unsafe_allow_html=True)
+
+                    # ── 按仓库视图 ──────────────────────────────────────
+                    if view_mode == "按仓库":
+                        # point -> [batch_rows]
+                        pt_batches = {}
+                        for b in batches:
+                            pt = b["point_name"]
+                            pt_batches.setdefault(pt, []).append(b)
+
+                        for pt_name, pt_rows in sorted(pt_batches.items()):
+                            pt_total = sum(r["qty"] for r in pt_rows)
+                            pct = pt_total / total * 100 if total > 0 else 0
+                            color = WH_COLOR_MAP.get(pt_name, "#90a4ae")
+                            st.markdown(
+                                f"<span style='color:{color};font-weight:600;'>●</span> "
+                                f"<b>{html.escape(pt_name)}</b>  "
+                                f"<span style='color:#555;font-size:13px;'>{int(pt_total)} 件（{pct:.0f}%）</span>",
+                                unsafe_allow_html=True,
+                            )
+                            # 批次缩进
+                            for r in sorted(pt_rows, key=lambda x: x["batch_no"]):
+                                batch_pct = r["qty"] / total * 100 if total > 0 else 0
+                                st.markdown(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:#aaa;font-size:12px;'>▸ {html.escape(r['batch_no'])}</span> "
+                                    f"<span style='color:#777;font-size:12px;'>{int(r['qty'])} 件（{batch_pct:.0f}%）</span>",
+                                    unsafe_allow_html=True,
+                                )
+
+                    # ── 按批次视图 ─────────────────────────────────────
+                    elif view_mode == "按批次":
+                        # batch_no -> [point_rows]
+                        batch_pts = {}
+                        for b in batches:
+                            bn = b["batch_no"]
+                            batch_pts.setdefault(bn, []).append(b)
+
+                        for bn, bn_rows in sorted(batch_pts.items()):
+                            bn_total = sum(r["qty"] for r in bn_rows)
+                            pct = bn_total / total * 100 if total > 0 else 0
+                            st.markdown(
+                                f"<b>{html.escape(bn)}</b> "
+                                f"<span style='color:#555;font-size:13px;'>{int(bn_total)} 件（{pct:.0f}%）</span>",
+                                unsafe_allow_html=True,
+                            )
+                            # 仓库缩进
+                            for r in sorted(bn_rows, key=lambda x: x["point_name"]):
+                                pt_pct = r["qty"] / total * 100 if total > 0 else 0
+                                color = WH_COLOR_MAP.get(r["point_name"], "#90a4ae")
+                                st.markdown(
+                                    f"&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:{color};font-size:12px;'>●</span> "
+                                    f"<span style='color:#777;font-size:12px;'>{html.escape(r['point_name'])} — {int(r['qty'])} 件（{pt_pct:.0f}%）</span>",
+                                    unsafe_allow_html=True,
+                                )
+
+                    with st.expander("查看出入库时间线"):
                         movements = get_material_movement_timeline(sku_id=sku_id)
                         if not movements:
                             st.info("暂无出入库记录")
@@ -1757,15 +1829,16 @@ def show_business_execution():
                     init_data = []
                     for i, item in enumerate(origin_items):
                         row = {
-                            "商品名称": item["sku_name"],
+                            "SKU": item["sku_name"],
                             "SN码": item.get("sn", "-"),
+                            "批次": item.get("batch_no") or "-",
                             "目前位置": item["point_name"],
                         }
                         if target_vc['type'] == VCType.EQUIPMENT_PROCUREMENT and return_direction == ReturnDirection.CUSTOMER_TO_US:
                             row["单台押金"] = item["deposit"]
                         else:
-                            row["原单价"] = item["price"]
-                        
+                            row["执行单价"] = item["price"]
+
                         row.update({
                             "可退数量": item["qty"],
                             "本次退货": 0,
@@ -1777,16 +1850,17 @@ def show_business_execution():
                 
                 # 配置列
                 col_config = {
-                    "商品名称": st.column_config.TextColumn(disabled=True),
+                    "SKU": st.column_config.TextColumn(disabled=True),
                     "SN码": st.column_config.TextColumn(disabled=True),
+                    "批次": st.column_config.TextColumn(disabled=True),
                     "目前位置": st.column_config.TextColumn(disabled=True),
                     "可退数量": st.column_config.NumberColumn(disabled=True),
                     "本次退货": st.column_config.NumberColumn(min_value=0, max_value=None if target_vc['type'] != VCType.EQUIPMENT_PROCUREMENT else 1, step=1),
                     "退货目的地": st.column_config.SelectboxColumn("退货目的地", options=point_options),
                     "_raw_idx": None # 明确隐藏内部列
                 }
-                if "原单价" in st.session_state[r_key].columns:
-                    col_config["原单价"] = st.column_config.NumberColumn(format="%.2f", disabled=True)
+                if "执行单价" in st.session_state[r_key].columns:
+                    col_config["执行单价"] = st.column_config.NumberColumn(format="%.2f", disabled=True)
                 if "单台押金" in st.session_state[r_key].columns:
                     col_config["单台押金"] = st.column_config.NumberColumn(format="%.2f", disabled=True)
 
@@ -1804,7 +1878,7 @@ def show_business_execution():
                 for _, row in edited_return.iterrows():
                     qty = row["本次退货"]
                     if qty > 0:
-                        val = row.get("单台押金", row.get("原单价", 0.0))
+                        val = row.get("单台押金", row.get("执行单价", 0.0))
                         calc_total += qty * val
                         
                         raw = origin_items[int(row["_raw_idx"])]
@@ -2349,25 +2423,42 @@ def show_procurement_form(session, business):
 def show_supply_form(session, business):
     st.markdown("### <i class='bi bi-box-seam-fill'></i> 高级物料供应录入", unsafe_allow_html=True)
     
-    # 1. 准备库存数据
-    inventory_items = get_material_inventory_all()
-    # 仅保留有库存余额的物料
-    sku_stock_map = {m['sku_name']: m['total_balance'] for m in inventory_items if m['total_balance'] > 0}
-    sku_list = list(sku_stock_map.keys())
-    
-    # 构建 ID 映射
-    mats = get_skus_by_names(sku_list)
-    sku_id_map = {s['name']: s['id'] for s in mats}
-    
-    if not sku_list:
+    # 1. 准备批次级库存数据
+    batch_rows = get_material_inventory_all()
+    if not batch_rows:
         st.warning("当前物料库存全部为空，无法进行供应。请先执行【物料采购】入库。")
         return
 
+    # 构建 SKU 维度数据（汇总 + 列表）
+    sku_name_to_id = {}
+    for r in batch_rows:
+        sn = r["sku_name"]
+        sku_name_to_id[sn] = r["sku_id"]
+    sku_list = sorted(sku_name_to_id.keys())
+
+    # 构建批次级下拉选项
+    # batch_options_by_sku: sku_name -> [batch_no, ...]
+    batch_options_by_sku = {}
+    # point_options_by_sku_batch: (sku_name, batch_no) -> [(point_name, qty), ...]
+    point_options_by_sku_batch = {}
+    for r in batch_rows:
+        sn = r["sku_name"]
+        bn = r["batch_no"]
+        pt = r["point_name"]
+        qty = r["qty"]
+        if bn not in batch_options_by_sku.get(sn, []):
+            batch_options_by_sku.setdefault(sn, []).append(bn)
+        batch_options_by_sku[sn] = sorted(batch_options_by_sku[sn])
+        point_options_by_sku_batch.setdefault((sn, bn), []).append((pt, qty))
+
+    # 所有批次选项（用于 data_editor 列配置）
+    all_batch_options = sorted(set(r["batch_no"] for r in batch_rows))
+    # 所有点位选项
+    all_point_options = sorted(set(r["point_name"] for r in batch_rows))
+
     # --- 环境准备 ---
     df_key = f"supply_df_{business['id']}"
-    version_key = f"supply_ver_{business['id']}"
-    if version_key not in st.session_state: st.session_state[version_key] = 0
-    editor_key = f"editor_{business['id']}_{st.session_state[version_key]}"
+    editor_key = f"supply_editor_{business['id']}"
 
     st.markdown(f"""
     <div style='background-color: rgba(109, 40, 217, 0.1); padding: 1rem; border-radius: 10px; border-left: 5px solid #6D28D9; margin-bottom: 1rem;'>
@@ -2375,122 +2466,100 @@ def show_supply_form(session, business):
     </div>
     """, unsafe_allow_html=True)
 
-    # 2. 准备点位数据（收货点 = 客户所有点位，不限类型）
+    # 2. 准备收货点位（客户点位，用于"配送点位"列）
     c_points = get_valid_receiving_points_for_material_supply(session, business['id'])
-    point_list = sorted([f"{p['name']} ({p['type']})" for p in c_points])
-    point_detail_map = {f"{p['name']} ({p['type']})": {"id": p['id'], "address": p.get('address', '')} for p in c_points}
+    recv_point_list = sorted([f"{p['name']} ({p['type']})" for p in c_points])
+    recv_point_detail_map = {f"{p['name']} ({p['type']})": {"id": p['id'], "address": p.get('address', '')} for p in c_points}
 
     # 3. 初始化/获取数据状态
     if df_key not in st.session_state:
-        st.session_state[df_key] = pd.DataFrame(columns=["点位", "物料", "数量", "单价", "发货点位"])
+        st.session_state[df_key] = pd.DataFrame(
+            columns=["配送点位", "选择库存物料", "物料批次", "发货仓库", "供应数量", "执行单价"]
+        )
 
     # 获取价格协议
     pricing_config = business.get('details', {}).get("pricing", {})
     payment = business.get('details', {}).get("payment_terms", {})
-    
-    # 准备发货点位选项（基于 SKU 库存分布，从 query 函数获取）
-    point_options_map = {}   # sku_name -> [显示名称]
-    point_id_map = {}       # 显示名称 -> point_id （用于按 SKU 索引）
-    all_points_set = set()
-    for sku_name in sku_list:
-        sku_id = sku_id_map.get(sku_name)
-        if sku_id:
-            pts = [p for p in (get_valid_shipping_points_for_material_supply(session, sku_id) or []) if p.get('qty', 0) > 0]
-            names = [f"{sku_name} - {p['name']} ({p['type']}) - {int(p['qty'])}件" for p in pts] if pts else [SystemConstants.DEFAULT_POINT]
-        else:
-            names = [SystemConstants.DEFAULT_POINT]
-        point_options_map[sku_name] = names
-        for p in (pts or []):
-            key = f"{sku_name} - {p['name']} ({p['type']}) - {int(p['qty'])}件"
-            point_id_map[key] = p['id']
-        all_points_set.update(names)
-    all_points = sorted(list(all_points_set)) if all_points_set else [SystemConstants.DEFAULT_POINT]
 
-    # --- 核心交互逻辑：捕获变动并实时联动 ---
-    if editor_key in st.session_state:
-        state = st.session_state[editor_key]
-        if state.get("edited_rows") or state.get("added_rows") or state.get("deleted_rows"):
-            df = st.session_state[df_key].copy()
-            
-            # 1. 处理删除
-            if state.get("deleted_rows"):
-                df = df.drop(index=state["deleted_rows"]).reset_index(drop=True)
-            
-            # 2. 处理修改
-            for idx_str, change in state.get("edited_rows", {}).items():
-                idx = int(idx_str)
-                if idx < len(df):
-                    for col, val in change.items():
-                        df.at[idx, col] = val
-                        # 联动逻辑：选择物料后自动带出单价和首选仓库
-                        if col == "物料":
-                            # 使用统一服务获取价格
-                            u_price, _, _ = get_sku_agreement_price(session, None, business, val)
-                            df.at[idx, "单价"] = u_price
-                            pt_list = point_options_map.get(val, [SystemConstants.DEFAULT_POINT])
-                            df.at[idx, "发货点位"] = pt_list[0]
-                        # 联动逻辑：选择发货点位后自动带出对应 SKU
-                        if col == "发货点位" and val:
-                            parts = str(val).split(" - ", 1)
-                            if len(parts) >= 1:
-                                parsed_sku = parts[0].strip()
-                                if parsed_sku and parsed_sku in sku_id_map:
-                                    df.at[idx, "物料"] = parsed_sku
-                                    u_price, _, _ = get_sku_agreement_price(session, None, business, parsed_sku)
-                                    df.at[idx, "单价"] = u_price
+    def _default_point_for(sku, batch):
+        opts = point_options_by_sku_batch.get((sku, batch), [])
+        return opts[0][0] if opts else SystemConstants.DEFAULT_POINT
 
-            # 3. 处理新增
-            for row_data in state.get("added_rows", []):
-                if "物料" in row_data:
-                    sku = row_data["物料"]
-                    u_price, _, _ = get_sku_agreement_price(session, None, business, sku)
-                    row_data["单价"] = u_price
-                    pt_list = point_options_map.get(sku, [SystemConstants.DEFAULT_POINT])
-                    row_data["发货点位"] = pt_list[0]
+    def _default_batch_for(sku):
+        return batch_options_by_sku.get(sku, [None])[0]
 
-                if "数量" not in row_data: row_data["数量"] = 1
-                if "点位" not in row_data and point_list: row_data["点位"] = point_list[0]
-                if "发货点位" not in row_data: row_data["发货点位"] = all_points[0]
-                
-                df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
+    # ── 快速录入区（自定义表单）───────────────────────────────────────────
+    st.markdown("##### **快速添加批次明细**")
 
-            # 更新并 Rerun
-            st.session_state[df_key] = df
-            st.session_state[version_key] += 1
-            
-            # 关键修复：清理残留触发态
-            for k in list(st.session_state.keys()):
-                if k.startswith("trigger_rule_mgr_"):
-                    del st.session_state[k]
+    # 统一行高 CSS
+    st.markdown("""
+    <style>
+    .add-row-btn > button { height: 34px; line-height: 34px; padding-top: 0; padding-bottom: 0; font-size: 14px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    add_cols = st.columns([2, 2, 2, 2, 1, 1])
+    with add_cols[0]:
+        add_recv = st.selectbox("配送点位", recv_point_list, index=0, label_visibility="collapsed", key="add_recv")
+    with add_cols[1]:
+        sku_idx = sku_list.index(st.session_state.get("add_sku", sku_list[0] if sku_list else "")) if st.session_state.get("add_sku", "") in sku_list else 0
+        add_sku = st.selectbox("选择库存物料", sku_list, index=sku_idx, label_visibility="collapsed", key="add_sku")
+    with add_cols[2]:
+        batch_opts = batch_options_by_sku.get(add_sku, [])
+        add_batch = st.selectbox("物料批次", batch_opts, index=0, label_visibility="collapsed", key="add_batch")
+    with add_cols[3]:
+        pt_opts = [pt for pt, _ in point_options_by_sku_batch.get((add_sku, add_batch), [])] if add_batch else []
+        add_pt = st.selectbox("发货仓库", pt_opts, index=0, label_visibility="collapsed", key="add_pt")
+    with add_cols[4]:
+        add_qty = st.number_input("数量", value=1, min_value=1, step=1, label_visibility="collapsed", key="add_qty")
+    with add_cols[5]:
+        if st.button("➕", key="add_row_btn", help="添加一行"):
+            auto_price, _, _ = get_sku_agreement_price(session, None, business, add_sku) if add_sku else 0.0
+            existing = st.session_state.get(df_key, pd.DataFrame())
+            new_row = pd.DataFrame([{
+                "配送点位": add_recv,
+                "选择库存物料": add_sku,
+                "物料批次": add_batch,
+                "发货仓库": add_pt,
+                "供应数量": add_qty,
+                "执行单价": auto_price,
+            }])
+            st.session_state[df_key] = pd.concat([existing, new_row], ignore_index=True)
             st.rerun()
 
+    st.markdown("---")
+
+    # ── 已有明细表格（data_editor）────────────────────────────────────────
     edited_df = st.data_editor(
-        st.session_state[df_key].reset_index(drop=True),
+        st.session_state.get(df_key, pd.DataFrame(
+            columns=["配送点位", "选择库存物料", "物料批次", "发货仓库", "供应数量", "执行单价"]
+        )),
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "点位": st.column_config.SelectboxColumn("配送点位", options=point_list),
-            "物料": st.column_config.SelectboxColumn("选择库存物料", options=sku_list),
-            "数量": st.column_config.NumberColumn("供应数量", min_value=1, step=1),
-            "单价": st.column_config.NumberColumn("执行单价 (元)", format="%.2f"),
-            "发货点位": st.column_config.SelectboxColumn("发货点位", options=all_points, required=True, help="选择从哪个点位发货")
+            "配送点位": st.column_config.SelectboxColumn("配送点位", options=recv_point_list),
+            "选择库存物料": st.column_config.SelectboxColumn("选择库存物料", options=sku_list),
+            "物料批次": st.column_config.SelectboxColumn("物料批次", options=all_batch_options),
+            "发货仓库": st.column_config.SelectboxColumn("发货仓库", options=all_point_options),
+            "供应数量": st.column_config.NumberColumn("供应数量", min_value=1, step=1),
+            "执行单价": st.column_config.NumberColumn("执行单价", format="%.2f"),
         },
         hide_index=True,
         key=editor_key
     )
-    
     st.session_state[df_key] = edited_df
 
     # --- 实时总金额预览 ---
     preview_total = 0.0
     for _, row in edited_df.iterrows():
         try:
-            q = float(row["数量"]) if not pd.isna(row["数量"]) else 0.0
-            p = float(row["单价"]) if not pd.isna(row["单价"]) else 0.0
+            q = float(row["供应数量"]) if not pd.isna(row["供应数量"]) else 0.0
+            p = float(row["执行单价"]) if not pd.isna(row["执行单价"]) else 0.0
             preview_total += q * p
         except:
             pass
-    
+    st.info(f"💰 当前明细总金额：**¥{preview_total:,.2f}**")
+
     # === [新] 时间规则配置前移 ===
     st.divider()
     st.markdown("#### <i class='bi bi-clock-history'></i> 时间规则与结算配置", unsafe_allow_html=True)
@@ -2513,8 +2582,8 @@ def show_supply_form(session, business):
         # A. 调用 Service 层进行库存充足性校验
         check_items = []
         for _, row in edited_df.iterrows():
-            check_items.append((row["物料"], row["发货点位"], row["数量"]))
-            
+            check_items.append((row["选择库存物料"], row["发货仓库"], row["供应数量"]))
+
         is_ok, over_stock = validate_inventory_availability(session, check_items)
         
         if not is_ok:
@@ -2541,13 +2610,19 @@ def show_supply_form(session, business):
 
             sku_sums = {}
 
+            # 构建发货仓库名 -> point_id 映射
+            wh_name_to_id = {}
+            for r in batch_rows:
+                wh_name_to_id[r["point_name"]] = r["point_id"]
+
             for _, row in edited_df.iterrows():
-                p_name = row["物料"]
-                p_id = point_detail_map[row["点位"]]["id"]
-                sku_id = sku_id_map[p_name]
-                qty = int(row["数量"])
-                price = float(row["单价"])
-                src_wh = row["发货点位"]
+                p_name = row["选择库存物料"]
+                p_id = recv_point_detail_map[row["配送点位"]]["id"]
+                sku_id = sku_name_to_id[p_name]
+                qty = int(row["供应数量"])
+                price = float(row["执行单价"])
+                src_wh = row["发货仓库"]
+                batch_no = row.get("物料批次") or ""
 
                 # 汇总
                 sku_sums[p_name] = sku_sums.get(p_name, 0) + qty
@@ -2558,13 +2633,14 @@ def show_supply_form(session, business):
                 supply_order["items"].append({
                     "sku_id": sku_id,
                     "sku_name": p_name,
+                    "batch_no": batch_no,
                     "qty": qty,
                     "price": price,
                     "shipping_point_name": src_wh,
-                    "shipping_point_id": point_id_map.get(src_wh, 0),
+                    "shipping_point_id": wh_name_to_id.get(src_wh, 0),
                     "receiving_point_id": p_id,
-                    "receiving_point_name": row["点位"],
-                    "receiving_point_address": point_detail_map[row["点位"]]["address"],
+                    "receiving_point_name": row["配送点位"],
+                    "receiving_point_address": recv_point_detail_map[row["配送点位"]]["address"],
                 })
 
             supply_order["summary"]["total_skus"] = len(sku_sums)
@@ -2581,6 +2657,7 @@ def show_supply_form(session, business):
                     "description": f"物料供应: {len(sku_sums)}项物料, 总计{supply_order['summary']['total_qty']}件"
                 }
                 st.session_state[f"show_supply_confirm_{business['id']}"] = True
+                st.session_state[f"{wk}_submitted"] = True
                 st.rerun()
 
     from ui.rule_components import get_draft_rules_count, draft_rule_manager_dialog
@@ -2670,7 +2747,11 @@ def show_material_procurement_form(session):
         initial_sku_id = sku_name_to_id.get(initial_sku)
         if initial_sku_id and initial_sku_id in pricing_config:
             p_val = pricing_config[initial_sku_id]
-            initial_price = float(p_val) if p_val != "浮动" else 0.0
+            # get_pricing_dict() 返回 {sku_id: {"price": x}} 格式；旧格式直接是价格值
+            if isinstance(p_val, dict):
+                initial_price = float(p_val.get("price") or 0)
+            else:
+                initial_price = float(p_val) if p_val != "浮动" else 0.0
 
         st.session_state["mat_proc_df"] = pd.DataFrame([
             {"物料": initial_sku, "数量": 0, "单价": initial_price, "存放点位": point_options[0] if point_options else SystemConstants.DEFAULT_POINT}
@@ -2779,7 +2860,7 @@ def show_material_procurement_form(session):
             w_name = row.get("存放点位", SystemConstants.DEFAULT_POINT)
             w_point_id = point_map.get(w_name)  # 从映射表获取 Point ID
             valid_items.append({
-                "sku_id": sku_id_map.get(row["物料"]),
+                "sku_id": sku_name_to_id.get(row["物料"]),
                 "sku_name": row["物料"],
                 "qty": row["数量"],
                 "price": item_price,
@@ -2879,7 +2960,11 @@ def show_stock_procurement_form(session):
         initial_sku_id = sku_name_to_id.get(initial_sku)
         if initial_sku_id and initial_sku_id in pricing_config:
             p_val = pricing_config[initial_sku_id]
-            initial_price = float(p_val) if p_val != "浮动" else 0.0
+            # get_pricing_dict() 返回 {sku_id: {"price": x}} 格式；旧格式直接是价格值
+            if isinstance(p_val, dict):
+                initial_price = float(p_val.get("price") or 0)
+            else:
+                initial_price = float(p_val) if p_val != "浮动" else 0.0
 
         st.session_state["stock_proc_df"] = pd.DataFrame([
             {"设备/配件": initial_sku, "数量": 0, "单价": initial_price, "入库位置": point_options[0]}

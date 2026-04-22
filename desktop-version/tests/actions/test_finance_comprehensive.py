@@ -563,9 +563,8 @@ class TestOffsetFullLifecycle:
 
     def test_offset_in_increases_pool(self, db_session, base_data):
         """✅ 收款增加预收池（OFFSET_IN）"""
-        # 前置：预置物料库存（朝旭食养仓 sp=3 有 sku 2 的库存）
-        mat_inv = MaterialInventory(sku_id=2, total_balance=500.0, average_price=6.5,
-                                   stock_distribution={"3": 500.0})
+        # 前置：预置物料库存批次（朝旭食养仓 sp=3 有 sku 2 的库存）
+        mat_inv = MaterialInventory(sku_id=2, batch_no="20260420-YUANWEI", point_id=3, qty=500.0)
         db_session.add(mat_inv)
         db_session.flush()
 
@@ -996,10 +995,11 @@ class TestProcessLogisticsFinance:
 
     def test_process_logistics_material_supply_with_cost(self, db_session, base_data):
         """✅ 物料供应（含成本结转） → 生成收入分录 + 成本分录"""
-        # 预插物料库存（含 averagePrice）使成本结转生效；发货点=朝旭食养仓(3)
+        # 预插物料库存批次（含 averagePrice）使成本结转生效；发货点=朝旭食养仓(3)
+        sku2 = db_session.query(SKU).get(2)
+        sku2.params = {"average_price": 5.0}
         mat_inv = MaterialInventory(
-            sku_id=2, total_balance=50.0, average_price=5.0,
-            stock_distribution={"3": 50}
+            sku_id=2, batch_no="20260420-YUANWEI", point_id=3, qty=50.0
         )
         db_session.add(mat_inv)
         db_session.flush()

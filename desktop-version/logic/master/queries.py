@@ -337,11 +337,12 @@ def get_material_inventory_summary() -> Dict[str, Any]:
     """获取物料库存汇总数据"""
     session = get_session()
     try:
-        total_skus = session.query(func.count(MaterialInventory.id)).filter(MaterialInventory.total_balance > 0).scalar() or 0
-        total_quantity = session.query(func.sum(MaterialInventory.total_balance)).scalar() or 0
+        # 新结构：按sku_id分组统计
+        total_skus = session.query(func.count(func.distinct(MaterialInventory.sku_id))).filter(MaterialInventory.qty > 0).scalar() or 0
+        total_quantity = session.query(func.sum(MaterialInventory.qty)).filter(MaterialInventory.qty > 0).scalar() or 0
         return {
             "total_skus": total_skus,
-            "total_quantity": total_quantity
+            "total_quantity": total_quantity or 0
         }
     finally:
         session.close()
@@ -374,48 +375,64 @@ def get_material_inventory_list() -> List[Dict[str, Any]]:
     session = get_session()
     try:
         from sqlalchemy.orm import joinedload
-        invs = session.query(MaterialInventory).options(joinedload(MaterialInventory.sku)).all()
+        # 按sku_id分组，汇总各SKU的批次库存
+        invs = session.query(
+            MaterialInventory.sku_id,
+            func.sum(MaterialInventory.qty).label("total_qty")
+        ).group_by(MaterialInventory.sku_id).having(func.sum(MaterialInventory.qty) > 0).all()
 
-        # 收集所有需要的点位ID并批量查询
-        all_point_ids = set()
-        for inv in invs:
-            if inv.stock_distribution:
-                for k in inv.stock_distribution.keys():
-                    try:
-                        all_point_ids.add(int(k))
-                    except (ValueError, TypeError):
-                        pass  # 跳过非数字 key 如 'default'
+        # 收集所有sku_id并批量查询
+        sku_ids = [inv.sku_id for inv in invs]
+        skus_map = {}
+        if sku_ids:
+            skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+            skus_map = {s.id: s for s in skus}
+
+        # 收集所有批次行用于分仓统计
+        all_rows = session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id.in_(sku_ids),
+            MaterialInventory.qty > 0
+        ).all()
+
+        # 收集所有需要的点位ID
+        all_point_ids = set(br.point_id for br in all_rows if br.point_id)
         point_map = {}
         if all_point_ids:
             pts = session.query(Point).filter(Point.id.in_(all_point_ids)).all()
             point_map = {p.id: p.name for p in pts}
 
-        # 转换库存分布：point_id -> "点位名称: 数量"，只显示有库存的
-        def format_dist(dist):
-            if not dist:
-                return {}
-            result = {}
-            for pid, qty in dist.items():
-                # 过滤掉 None、null 字符串、0 和负数
-                if qty is None or qty == "null" or (isinstance(qty, (int, float)) and qty <= 0):
-                    continue
-                try:
-                    name = point_map.get(int(pid), f"点位{pid}")
-                except (ValueError, TypeError):
-                    name = f"点位{pid}"
-                result[name] = qty
-            return result
+        # 按sku_id分组批次行
+        batches_by_sku = {}
+        for br in all_rows:
+            if br.sku_id not in batches_by_sku:
+                batches_by_sku[br.sku_id] = []
+            batches_by_sku[br.sku_id].append(br)
 
-        return [
-            {
-                "物料ID": i.sku_id,
-                "物料名称": i.sku.name if i.sku else "未知",
-                "总余额": i.total_balance,
-                "平均单价": i.average_price or 0.0,
-                "库存分布": format_dist(i.stock_distribution or {})
-            }
-            for i in invs
-        ]
+        result = []
+        for inv in invs:
+            sku = skus_map.get(inv.sku_id)
+            batches = batches_by_sku.get(inv.sku_id, [])
+
+            # 转换库存分布：point_id -> "点位名称: 数量"
+            dist = {}
+            for br in batches:
+                pt_name = point_map.get(br.point_id, f"点位{br.point_id}")
+                dist[pt_name] = dist.get(pt_name, 0) + br.qty
+
+            # 从sku.params获取average_price
+            avg_price = 0.0
+            if sku and sku.params:
+                avg_price = float(sku.params.get("average_price", 0.0) or 0)
+
+            result.append({
+                "物料ID": inv.sku_id,
+                "物料名称": sku.name if sku else "未知",
+                "总余额": inv.total_qty,
+                "平均单价": avg_price,
+                "库存分布": dist
+            })
+
+        return result
     finally:
         session.close()
 
@@ -813,51 +830,76 @@ def get_material_stock_for_supply(
 ) -> List[Dict[str, Any]]:
     """
     获取可用于物料供应的库存物料列表
-    
+
     Args:
-        min_balance: 最小库存余额过滤
+        min_balance: 最小库存余额过滤（已废弃，保留参数兼容）
         limit: 返回数量限制
-    
+
     Returns:
         格式化的物料库存列表，包含可供应数量、仓库分布
     """
     session = get_session()
     try:
-        materials = session.query(MaterialInventory).filter(
-            MaterialInventory.total_balance >= min_balance
-        ).limit(limit).all()
+        # 新结构：按sku_id分组统计
+        materials = session.query(
+            MaterialInventory.sku_id,
+            func.sum(MaterialInventory.qty).label("total_qty")
+        ).group_by(MaterialInventory.sku_id).having(func.sum(MaterialInventory.qty) >= min_balance).limit(limit).all()
 
-        # 收集所有需要的点位ID并批量查询
-        all_point_ids = set()
-        for mat in materials:
-            if mat.stock_distribution:
-                all_point_ids.update(int(k) for k in mat.stock_distribution.keys() if str(k).isdigit())
+        if not materials:
+            return []
+
+        sku_ids = [m.sku_id for m in materials]
+        skus_map = {}
+        if sku_ids:
+            skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+            skus_map = {s.id: s for s in skus}
+
+        # 查询所有相关批次行用于分仓
+        all_rows = session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id.in_(sku_ids),
+            MaterialInventory.qty > 0
+        ).all()
+
+        # 收集点位
+        all_point_ids = set(br.point_id for br in all_rows if br.point_id)
         point_map = {}
         if all_point_ids:
             pts = session.query(Point).filter(Point.id.in_(all_point_ids)).all()
             point_map = {p.id: p.name for p in pts}
 
+        # 按sku_id分组批次行
+        batches_by_sku = {}
+        for br in all_rows:
+            if br.sku_id not in batches_by_sku:
+                batches_by_sku[br.sku_id] = []
+            batches_by_sku[br.sku_id].append(br)
+
         result = []
         for mat in materials:
-            sku = session.query(SKU).get(mat.sku_id) if mat.sku_id else None
+            sku = skus_map.get(mat.sku_id)
+            batches = batches_by_sku.get(mat.sku_id, [])
 
-            # 解析库存分布，获取有库存的仓库（key 已改为 point_id，需转换为名称）
-            stock_dist = mat.stock_distribution or {}
+            # 从sku.params获取average_price
+            avg_price = 0.0
+            if sku and sku.params:
+                avg_price = float(sku.params.get("average_price", 0.0) or 0)
+
+            # 分仓统计
+            stock_dist = {}
             available_warehouses = []
-            for wh_key, qty in stock_dist.items():
-                if qty > 0:
-                    pt_id = int(wh_key) if str(wh_key).isdigit() else None
-                    wh_name = point_map.get(pt_id, wh_key) if pt_id else wh_key
-                    available_warehouses.append({"warehouse": wh_name, "qty": qty, "point_id": pt_id})
+            for br in batches:
+                pt_name = point_map.get(br.point_id, f"点位{br.point_id}")
+                stock_dist[pt_name] = stock_dist.get(pt_name, 0) + br.qty
+                available_warehouses.append({"warehouse": pt_name, "qty": br.qty, "point_id": br.point_id})
 
             result.append({
-                "id": mat.id,
+                "id": sku.id if sku else mat.sku_id,
                 "sku_id": mat.sku_id,
                 "sku_name": sku.name if sku else "未知物料",
                 "sku_model": sku.model if sku else "",
-                "sku_unit": sku.unit if sku else "件",
-                "total_balance": mat.total_balance,
-                "average_price": mat.average_price or 0.0,
+                "total_balance": mat.total_qty,
+                "average_price": avg_price,
                 "stock_distribution": stock_dist,
                 "available_warehouses": available_warehouses,
             })
@@ -924,17 +966,25 @@ def get_skus_by_names(sku_names: List[str], supplier_id: Optional[int] = None) -
         session.close()
 
 def get_material_inventory_all() -> List[Dict[str, Any]]:
-    """获取所有物料库存信息"""
+    """获取所有物料库存信息（新批次结构）"""
     session = get_session()
     try:
         from sqlalchemy.orm import joinedload
-        invs = session.query(MaterialInventory).options(joinedload(MaterialInventory.sku)).all()
+        # 新结构：查询所有批次行
+        invs = session.query(MaterialInventory).options(
+            joinedload(MaterialInventory.sku),
+            joinedload(MaterialInventory.point)
+        ).filter(MaterialInventory.qty > 0).all()
+
         return [
             {
                 "sku_id": i.sku_id,
                 "sku_name": i.sku.name if i.sku else "未知",
-                "total_balance": i.total_balance,
-                "stock_distribution": i.stock_distribution or {}
+                "batch_no": i.batch_no,
+                "point_id": i.point_id,
+                "point_name": i.point.name if i.point else f"点位{i.point_id}",
+                "qty": i.qty,
+                "latest_purchase_vc_id": i.latest_purchase_vc_id
             }
             for i in invs
         ]

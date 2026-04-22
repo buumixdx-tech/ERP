@@ -98,14 +98,16 @@ def _get_customer_points(session: Session, customer_id: int) -> list[int]:
 def _get_warehouses_with_sku_stock(session: Session, sku_id: int) -> list[int]:
     """
     物料供应/库存拨付专用：查询所有存有该SKU物料库存的仓库ID
-    从 MaterialInventory.stock_distribution 的 key（str(point_id)）匹配 Point.id
+    从 MaterialInventory 批次行查询有库存的点位
     返回匹配到的 Point.id 列表
     """
-    mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).first()
-    if not mat_inv or not mat_inv.stock_distribution:
+    mat_invs = session.query(MaterialInventory).filter(
+        MaterialInventory.sku_id == sku_id,
+        MaterialInventory.qty > 0
+    ).all()
+    if not mat_invs:
         return []
-    # stock_distribution 的 key 是 str(point_id)，如 "3" 表示 point_id=3
-    wh_ids = [int(k) for k in mat_inv.stock_distribution.keys()]
+    wh_ids = list({m.point_id for m in mat_invs if m.point_id})
     pts = session.query(Point).filter(Point.id.in_(wh_ids)).all()
     return [pt.id for pt in pts]
 
@@ -158,7 +160,7 @@ def _get_our_points_with_sku(session: Session, sku_id: int) -> list[int]:
 
 def _elem_to_dict(elem: VCElementSchema) -> dict:
     """将 VCElementSchema 转为字典，用于存入 elements JSON"""
-    return {
+    d = {
         "id": elem.id,
         "shipping_point_id": elem.shipping_point_id,
         "receiving_point_id": elem.receiving_point_id,
@@ -168,8 +170,10 @@ def _elem_to_dict(elem: VCElementSchema) -> dict:
         "deposit": elem.deposit,
         "subtotal": elem.subtotal,
         "sn_list": elem.sn_list,
-        "addon_business_ids": elem.addon_business_ids
+        "addon_business_ids": elem.addon_business_ids,
+        "batch_no": elem.batch_no,
     }
+    return d
 
 
 def _apply_addons_to_elements(session: Session, business_id: int, elements: list) -> list:
@@ -482,7 +486,8 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
                 shipping_point_id=e.shipping_point_id,
                 receiving_point_id=e.receiving_point_id,
                 sku_id=e.sku_id, qty=e.qty, price=e.price,
-                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list,
+                batch_no=e.batch_no
             )
             clean_elems.append(_elem_to_dict(corrected))
             check_items.append((_get_sku_name(session, e.sku_id), _get_point_name(session, e.shipping_point_id), e.qty))
@@ -958,7 +963,8 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
                 shipping_point_id=sp,
                 receiving_point_id=e.receiving_point_id,
                 sku_id=e.sku_id, qty=e.qty, price=e.price,
-                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list,
+                batch_no=e.batch_no
             )
             clean_elems.append(_elem_to_dict(corrected))
         new_vc = VirtualContract(
@@ -1262,7 +1268,8 @@ def create_inventory_allocation_action(session: Session, payload: AllocateInvent
                 shipping_point_id=e.shipping_point_id,
                 receiving_point_id=e.receiving_point_id,
                 sku_id=e.sku_id, qty=e.qty, price=e.price,
-                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list,
+                batch_no=e.batch_no
             )
             clean_elems.append(_elem_to_dict(corrected))
 

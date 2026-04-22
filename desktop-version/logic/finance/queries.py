@@ -483,11 +483,18 @@ def get_dashboard_stats() -> Dict[str, Any]:
     # 2. 库存资产估算
     # 设备资产 (按押金估算，若无则为0)
     total_equip_val = session.query(func.sum(EquipmentInventory.deposit_amount)).scalar() or 0.0
-    # 物料资产 (余额 * 均价)
+    # 物料资产 (余额 * 均价)：新结构按批次统计
     total_mat_val = 0.0
-    mats = session.query(MaterialInventory).all()
-    for m in mats:
-        total_mat_val += (m.total_balance or 0) * (m.average_price or 0)
+    batches = session.query(MaterialInventory).filter(MaterialInventory.qty > 0).all()
+    sku_ids = set(b.sku_id for b in batches if b.sku_id)
+    sku_avg_prices = {}
+    if sku_ids:
+        skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+        for s in skus:
+            sku_avg_prices[s.id] = float(s.params.get("average_price", 0.0) or 0) if s.params else 0
+    for b in batches:
+        avg_price = sku_avg_prices.get(b.sku_id, 0)
+        total_mat_val += (b.qty or 0) * avg_price
     
     total_inventory_val = total_equip_val + total_mat_val
     

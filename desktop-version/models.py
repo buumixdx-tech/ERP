@@ -80,15 +80,20 @@ class EquipmentInventory(Base):
     point = relationship("Point")
 
 class MaterialInventory(Base):
-    """6. 物料库存: 记录所有已购入物料的全局信息 (每个 SKU 唯一)"""
+    """6. 物料库存: 记录物料批次库存 (SKU + 批次 + 仓库 唯一)"""
     __tablename__ = 'material_inventory'
+    __table_args__ = (
+        UniqueConstraint('sku_id', 'batch_no', 'point_id', name='uq_sku_batch_point'),
+    )
     id = Column(Integer, primary_key=True)
-    sku_id = Column(Integer, ForeignKey('skus.id'), unique=True)
-    stock_distribution = Column(JSON) # 库存分布 JSON: {"str(point_id)": 数量}
-    average_price = Column(Float, default=0.0)
-    total_balance = Column(Float, default=0.0)
+    sku_id = Column(Integer, ForeignKey('skus.id'))
+    batch_no = Column(String(100))             # 批次号: YYYYMMDD-sku.model
+    latest_purchase_vc_id = Column(Integer)    # 创建该批次行的采购VC ID
+    point_id = Column(Integer, ForeignKey('points.id'))  # 存储位置
+    qty = Column(Float, default=0.0)           # 该批次在该点的数量
 
     sku = relationship("SKU")
+    point = relationship("Point")
 
 class Contract(Base):
     """7. 合同: 记录所有业务相关正式合同"""

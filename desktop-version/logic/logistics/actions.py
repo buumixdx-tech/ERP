@@ -123,6 +123,13 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
         if payload.sn_list and len(payload.sn_list) != len(set(payload.sn_list)):
             return ActionResult(success=False, error="序列号列表中包含重复项")
 
+        # 物料采购入库：batch_items 必填
+        if vc and vc.type == VCType.MATERIAL_PROCUREMENT:
+            if not payload.batch_items:
+                return ActionResult(success=False, error="物料采购入库必须提供批次信息（batch_items）")
+            if log.status == LogisticsStatus.FINISH:
+                return ActionResult(success=False, error="该物流单已完成入库，请勿重复操作")
+
         if log.status == LogisticsStatus.FINISH:
             return ActionResult(success=False, error="该物流单已完成入库，请勿重复操作")
 
@@ -162,6 +169,17 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
                         if mi:
                             snapshot_before["records"].append({"class": "MaterialInventory", "id": mi.id, "data": serialize_model(mi)})
 
+        # MaterialInventory 旧值（MATERIAL_PROCUREMENT 批次行）
+        if vc and vc.type == VCType.MATERIAL_PROCUREMENT and payload.batch_items:
+            affected_skus = {bi.sku_id for bi in payload.batch_items}
+            for sid in affected_skus:
+                rows = session.query(MaterialInventory).filter(
+                    MaterialInventory.sku_id == sid,
+                    MaterialInventory.point_id.in_({bi.receiving_point_id for bi in payload.batch_items if bi.sku_id == sid})
+                ).all()
+                for row in rows:
+                    snapshot_before["records"].append({"class": "MaterialInventory", "id": row.id, "data": serialize_model(row)})
+
         # SKU 旧值（MATERIAL_PROCUREMENT 价格更新）
         if vc and vc.type == VCType.MATERIAL_PROCUREMENT:
             for item in (vc.elements or {}).get("elements", []):
@@ -183,7 +201,7 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
         old_status = log.status
         log.status = LogisticsStatus.FINISH
 
-        inventory_module(log.id, equipment_sn_json=payload.sn_list, session=session)
+        inventory_module(log.id, equipment_sn_json=payload.sn_list, batch_items=payload.batch_items, session=session)
         logistics_state_machine(log.id, session=session)
         finance_module(logistics_id=log.id, session=session)
 
@@ -230,6 +248,14 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
             orig_vc_ref = session.query(VirtualContract).get(vc.related_vc_id)
             if orig_vc_ref:
                 snapshot_after_records.append({"class": "VirtualContract", "id": orig_vc_ref.id, "data": _sm(orig_vc_ref)})
+
+        # MaterialInventory 批次行（MATERIAL_PROCUREMENT 新批次）
+        if vc_ref and vc_ref.type == VCType.MATERIAL_PROCUREMENT and payload.batch_items:
+            new_mi_rows = session.query(MaterialInventory).filter(
+                MaterialInventory.latest_purchase_vc_id == vc_ref.id
+            ).all()
+            for row in new_mi_rows:
+                snapshot_after_records.append({"class": "MaterialInventory", "id": row.id, "data": _sm(row)})
 
         # FinancialJournal 和 CashFlowLedger（finance_module 创建）
         from models import FinancialJournal

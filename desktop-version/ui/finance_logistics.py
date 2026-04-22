@@ -20,8 +20,10 @@ from logic.logistics import (
     update_express_order_action, update_express_order_status_action,
     bulk_progress_express_orders_action,
     CreateLogisticsPlanSchema, ConfirmInboundSchema,
-    UpdateExpressOrderSchema, ExpressOrderStatusSchema
+    UpdateExpressOrderSchema, ExpressOrderStatusSchema,
+    BatchItemSchema,
 )
+from logic.file_mgmt import save_batch_certificate
 from logic.finance import create_cash_flow_action, CreateCashFlowSchema
 from logic.vc.queries import get_vc_by_id, get_vc_list_for_overview
 from logic.logistics.queries import (
@@ -113,7 +115,7 @@ def confirm_inbound_dialog(session, log_id, sn_list):
         return
 
     st.write("即将完成物流终结操作。系统将同步更新库存位置、资产状态并生成财务应付/应收凭证。")
-    
+
     # 汇总所有快递单的物品
     orders = get_express_orders_by_logistics(log_id)
     all_items = []
@@ -127,13 +129,14 @@ def confirm_inbound_dialog(session, log_id, sn_list):
                 "货品名称": ni["sku_name"],
                 "数量": ni["qty"]
             })
-    
+
     st.markdown("#### <i class='bi bi-list-check'></i> 待确认收货明细汇总", unsafe_allow_html=True)
     if all_items:
         st.table(pd.DataFrame(all_items))
     else:
         st.warning("未检测到具体货品明细，建议检查快递单配置。")
 
+    # ============ 设备/库存采购：SN 录入 ============
     if vc['type'] in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
         st.markdown("#### <i class='bi bi-upc-scan'></i> 资产SN码核对", unsafe_allow_html=True)
         if sn_list:
@@ -141,24 +144,270 @@ def confirm_inbound_dialog(session, log_id, sn_list):
         else:
             st.error("设备采购必须录入SN码")
 
-    st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("准予结单并同步系统", type="primary", use_container_width=True):
-            payload = ConfirmInboundSchema(log_id=log_id, sn_list=sn_list)
-            result = confirm_inbound_action(session, payload)
-            
-            if result.success:
-                st.session_state[f"show_inbound_confirm_{log_id}"] = False
-                st.session_state[f"temp_sn_list_{log_id}"] = []
-                st.success("系统状态与账务已成功同步！")
-                st.rerun()
-            else:
-                st.error(f"操作失败: {result.error}")
-    with c2:
-        if st.button("返回修改", use_container_width=True):
-            st.session_state[f"show_inbound_confirm_{log_id}"] = False
-            st.rerun()
+    # ============ 物料采购：批次信息录入 ============
+    elif vc['type'] == VCType.MATERIAL_PROCUREMENT:
+        st.markdown("#### <i class='bi bi-box-seam'></i> 物料批次分配", unsafe_allow_html=True)
+
+        from logic.vc.queries import get_valid_receiving_points_for_mat_procurement
+        receiving_pts = get_valid_receiving_points_for_mat_procurement(session, vc['supply_chain_id'])
+        pt_options_map = {p['id']: p['name'] for p in receiving_pts}
+
+        # 获取 SKU 信息
+        sku_ids = set()
+        for o in orders:
+            for item in (o.get('items') or []):
+                sku_ids.add(item.get('sku_id'))
+        sku_map = {}
+        sku_model_map = {}
+        if sku_ids:
+            skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+            sku_map = {s.id: s.name for s in skus}
+            sku_model_map = {s.id: s.model for s in skus}
+
+        # 构建 (SKU × 收货点) 聚合数据（仅用于 Step 2 显示总量）
+        sku_recv_groups = {}  # key = f"{sku_id}-{recv_pt_id}"
+        for o in orders:
+            addr_info = o.get('address_info') or {}
+            recv_pt_id = addr_info.get('收货点位Id')
+            recv_pt_name = addr_info.get('收货点位名称') or ''
+            for item in (o.get('items') or []):
+                sid = item.get('sku_id')
+                qty = float(item.get('qty', 0))
+                if sid and qty > 0:
+                    gk = f"{sid}-{recv_pt_id}"
+                    if gk not in sku_recv_groups:
+                        sku_recv_groups[gk] = {
+                            'sku_id': sid, 'sku_name': sku_map.get(sid, f'SKU-{sid}'),
+                            'recv_pt_id': recv_pt_id, 'recv_pt_name': recv_pt_name,
+                            'total_qty': 0.0
+                        }
+                    sku_recv_groups[gk]['total_qty'] += qty
+
+        # session_state 结构：
+        # batch_definitions: { sku_id: [ {'pd': str, 'cert': UploadedFile} ] }  -- Step1 定义批次
+        # batch_allocations: { group_key: { total_qty, per_batch_qty: { pd: qty } } }  -- Step2 分配数量
+        def_key = f"batch_def_{log_id}"
+        alloc_key = f"batch_alloc_{log_id}"
+
+        if def_key not in st.session_state:
+            # 初始化：每个 SKU 一个默认批次行
+            st.session_state[def_key] = {sid: [{'pd': '', 'cert': None}] for sid in sku_ids}
+        if alloc_key not in st.session_state:
+            st.session_state[alloc_key] = {}
+
+        step_key = f"batch_step_{log_id}"
+        if step_key not in st.session_state:
+            st.session_state[step_key] = 1
+
+        # ── Step 1：定义各 SKU 的批次（生产日期 + 质检报告）────────────────────
+        if st.session_state[step_key] == 1:
+            st.info("**步骤 1/2**：为每个入库 SKU 定义所有批次并上传质检报告")
+
+            for sid in sorted(sku_ids):
+                sku_name = sku_map.get(sid, f'SKU-{sid}')
+                with st.expander(f"📦 {sku_name}", expanded=True):
+                    batches = st.session_state[def_key].get(sid, [])
+                    to_del = None
+                    for bi, batch in enumerate(batches):
+                        bc = st.columns([3, 1])
+                        with bc[0]:
+                            new_pd = st.text_input(
+                                f"生产日期（{sku_name} 第{bi+1}批）",
+                                value=batch['pd'],
+                                placeholder="YYYYMMDD",
+                                label_visibility="collapsed",
+                                key=f"def_pd_{log_id}_{sid}_{bi}"
+                            )
+                        with bc[1]:
+                            st.write("")
+                            if len(batches) > 1 and st.button("删除", key=f"def_del_{log_id}_{sid}_{bi}", use_container_width=True):
+                                to_del = bi
+                        new_cert = st.file_uploader(
+                            f"质检报告（{sku_name} 第{bi+1}批）",
+                            accept_multiple_files=False,
+                            label_visibility="collapsed",
+                            key=f"def_cert_{log_id}_{sid}_{bi}"
+                        )
+                        # 暂存
+                        st.session_state[def_key][sid][bi]['pd'] = new_pd
+                        st.session_state[def_key][sid][bi]['cert'] = new_cert
+                    if to_del is not None:
+                        st.session_state[def_key][sid].pop(to_del)
+                        st.rerun()
+                    if st.button(f"+ 添加 {sku_name} 批次", key=f"def_add_{log_id}_{sid}", use_container_width=True):
+                        st.session_state[def_key][sid].append({'pd': '', 'cert': None})
+                        st.rerun()
+
+            st.divider()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("下一步：分配批次数量 →", type="primary", use_container_width=True):
+                    # 验证 Step1：每个 SKU 至少有一个生产日期
+                    missing = [sku_map.get(sid, f'SKU-{sid}') for sid in sku_ids
+                               if not any(b['pd'] for b in st.session_state[def_key].get(sid, []))]
+                    if missing:
+                        st.error(f"以下 SKU 尚未填写任何生产日期：{', '.join(missing)}")
+                        st.rerun()
+                    st.session_state[step_key] = 2
+                    st.rerun()
+            with c2:
+                if st.button("返回修改", use_container_width=True):
+                    st.session_state[f"show_inbound_confirm_{log_id}"] = False
+                    st.rerun()
+
+        # ── Step 2：按收货点分配批次数量 ───────────────────────────────────────
+        else:
+            st.info("**步骤 2/2**：为每个 SKU×收货点 分配各批次的数量（总和须等于收货总量）")
+
+            # 显示验证错误（rerun后出现在 dialog 顶部）
+            err_key = f"batch_alloc_errors_{log_id}"
+            if st.session_state.get(err_key):
+                for err in st.session_state[err_key]:
+                    st.error(f"❌ {err}")
+                st.session_state[err_key] = []
+                col_b = st.columns([1, 1, 2])[1]
+                if col_b.button("← 退回上一步", use_container_width=True):
+                    st.session_state[step_key] = 1
+                    st.rerun()
+                return
+
+            # 确保 allocation 初始状态完整（每次进入 Step2 重建，保证与 SKU 定义一致）
+            all_pds_by_sku = {}  # sku_id -> [pd1, pd2, ...] 稳定顺序
+            for sid in sorted(sku_ids):
+                batches = st.session_state[def_key].get(sid, [])
+                all_pds_by_sku[sid] = [b['pd'] for b in batches if b['pd']]
+
+            # 初始化 / 重建 allocation
+            for gk, grp in sku_recv_groups.items():
+                sid = grp['sku_id']
+                pds = all_pds_by_sku.get(sid, [])
+                if gk not in st.session_state[alloc_key]:
+                    st.session_state[alloc_key][gk] = {
+                        'total_qty': grp['total_qty'],
+                        'per_batch_qty': {pd: 0.0 for pd in pds}
+                    }
+                else:
+                    # sku 批次定义变了（用户回退 Step1 修改了），重建
+                    existing = st.session_state[alloc_key][gk]['per_batch_qty']
+                    new_alloc = {pd: existing.get(pd, 0.0) for pd in pds}
+                    st.session_state[alloc_key][gk] = {
+                        'total_qty': grp['total_qty'],
+                        'per_batch_qty': new_alloc
+                    }
+
+            for gk, grp in sku_recv_groups.items():
+                sid = grp['sku_id']
+                sku_name = grp['sku_name']
+                total = grp['total_qty']
+                pds = all_pds_by_sku.get(sid, [])
+                alloc = st.session_state[alloc_key][gk]['per_batch_qty']
+
+                gk_cols = st.columns([1, 3, 1])
+                with gk_cols[0]:
+                    st.write(f"**{sku_name}**")
+                with gk_cols[1]:
+                    st.caption(f"→ {grp['recv_pt_name']}  |  收货总量: {int(total)}")
+                used_placeholder = gk_cols[2].empty()
+
+                # 每个批次一行：显示完整批次号 + 数量输入框
+                for pd_val in pds:
+                    pd_short = pd_val.replace("-", "")
+                    model = sku_model_map.get(sid, f"SKU{sid}")
+                    batch_no_label = f"{pd_short}-{model}"
+                    batch_qty = st.number_input(
+                        batch_no_label,
+                        min_value=0.0,
+                        max_value=float(total),
+                        value=float(alloc.get(pd_val, 0)),
+                        step=1.0,
+                        format="%.0f",
+                        label_visibility="visible",
+                        key=f"alloc_{log_id}_{gk}_{pd_val}"
+                    )
+                    st.session_state[alloc_key][gk]['per_batch_qty'][pd_val] = batch_qty
+
+                # compute AFTER number_input loop so session_state is current
+                used = sum(st.session_state[alloc_key][gk]['per_batch_qty'].values())
+                if abs(used - total) < 0.001:
+                    color = "blue"
+                elif used > total:
+                    color = "red"
+                else:
+                    color = "green"
+                used_placeholder.markdown(f"已分配: <b style='color:{color}'>{int(used)}</b> / {int(total)}", unsafe_allow_html=True)
+
+                st.divider()
+
+            # 提交
+            st.divider()
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("准予结单并同步系统", type="primary", use_container_width=True):
+                    # 验证：每个组的数量之和
+                    errors = []
+                    formal_batch_items = []
+                    for gk, grp in sku_recv_groups.items():
+                        sid = grp['sku_id']
+                        total = grp['total_qty']
+                        alloc = st.session_state[alloc_key][gk]['per_batch_qty']
+                        used = sum(alloc.values())
+                        if abs(used - total) > 0.001:
+                            errors.append(f"{grp['sku_name']}（{grp['recv_pt_name']}）：已分配 {int(used)}，不等于收货总量 {int(total)}")
+
+                    if errors:
+                        st.session_state[err_key] = errors
+                        st.rerun()
+
+                    # 构建 batch_items
+                    for gk, grp in sku_recv_groups.items():
+                        sid = grp['sku_id']
+                        recv_pt_id = grp['recv_pt_id']
+                        alloc = st.session_state[alloc_key][gk]['per_batch_qty']
+                        batches = st.session_state[def_key].get(sid, [])
+
+                        for bi_idx, batch in enumerate(batches):
+                            pd_val = batch['pd']
+                            qty = alloc.get(pd_val, 0.0)
+                            if qty <= 0:
+                                continue
+                            cert_path = None
+                            cert_file = batch.get('cert')
+                            if cert_file:
+                                prod_date_str = pd_val.replace("-", "")
+                                model = sku_model_map.get(sid, f"SKU{sid}")
+                                batch_no = f"{prod_date_str}-{model}"
+                                cert_path = save_batch_certificate(batch_no, cert_file)
+
+                            formal_batch_items.append(BatchItemSchema(
+                                sku_id=sid,
+                                production_date=pd_val,
+                                receiving_point_id=recv_pt_id,
+                                qty=qty,
+                                certificate_filename=cert_path
+                            ))
+
+                    payload = ConfirmInboundSchema(
+                        log_id=log_id,
+                        sn_list=sn_list or [],
+                        batch_items=formal_batch_items
+                    )
+                    result = confirm_inbound_action(session, payload)
+
+                    if result.success:
+                        st.session_state[f"show_inbound_confirm_{log_id}"] = False
+                        st.session_state[f"temp_sn_list_{log_id}"] = []
+                        st.session_state.pop(def_key, None)
+                        st.session_state.pop(alloc_key, None)
+                        st.session_state.pop(step_key, None)
+                        st.success("系统状态与账务已成功同步！")
+                        st.rerun()
+                    else:
+                        st.error(f"操作失败: {result.error}")
+            with c2:
+                if st.button("← 上一步", use_container_width=True):
+                    st.session_state[step_key] = 1
+                    st.rerun()
+
 
 @st.dialog("财务审签确认：资金流水录入", width="large")
 def confirm_cash_flow_dialog(session, cf_data):

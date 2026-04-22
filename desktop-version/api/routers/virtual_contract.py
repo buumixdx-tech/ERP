@@ -61,6 +61,26 @@ def create_material_supply_vc(req: CreateMaterialSupplyVCRequest, session: Sessi
     return create_material_supply_vc_action(session, req.vc, draft_rules=req.draft_rules).model_dump()
 
 
+class MaterialSupplyProposalRequest(BaseModel):
+    business_id: int
+    items: List[dict]  # [{sku_id, qty, receiving_point_id}]
+
+
+@router.post("/material-supply-proposal", summary="物料供应出货提案")
+def material_supply_proposal(req: MaterialSupplyProposalRequest, session: Session = Depends(get_db)):
+    """
+    根据客户补货需求，生成物料供应出货提案。
+
+    - 校验库存是否足够
+    - 按 FIFO + 仓库优先级（供应商仓>自有仓>客户仓）分配批次
+    - 返回推荐方案（含 alternatives 供客户选择）
+
+    客户确认后，将返回的 proposed_plan 作为 elements 传入 /create-material-supply 创建 VC。
+    """
+    from logic.services import generate_material_supply_proposal
+    return generate_material_supply_proposal(session, req.business_id, req.items)
+
+
 @router.post("/create-return", summary="创建退货执行单")
 def create_return_vc(req: CreateReturnVCRequest, session: Session = Depends(get_db)):
     """创建退货虚拟合同。需指定目标VC和退货方向(客户退我方/我方退供应商)。"""

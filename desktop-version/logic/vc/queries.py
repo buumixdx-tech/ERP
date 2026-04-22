@@ -423,18 +423,19 @@ def get_valid_receiving_points_for_material_supply(session, business_id: int) ->
 def get_valid_shipping_points_for_material_supply(session, sku_id: int) -> list[dict]:
     """
     物料供应：发货点 = 有该 SKU 物料库存的仓库
-    stock_distribution 的 key 是 Point.id，数量是库存量
+    从 MaterialInventory 批次行查询有库存的点位及其数量
     """
-    mat_invs = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).all()
+    mat_invs = session.query(MaterialInventory).filter(
+        MaterialInventory.sku_id == sku_id,
+        MaterialInventory.qty > 0
+    ).all()
     if not mat_invs:
         return []
     # 聚合所有点位ID和库存量（同一SKU可能存在于多个仓库）
     point_qty = {}  # point_id -> total qty
     for mat_inv in mat_invs:
-        if mat_inv.stock_distribution:
-            for k, qty in mat_inv.stock_distribution.items():
-                pid = int(k)
-                point_qty[pid] = point_qty.get(pid, 0) + qty
+        if mat_inv.point_id:
+            point_qty[mat_inv.point_id] = point_qty.get(mat_inv.point_id, 0) + mat_inv.qty
     if not point_qty:
         return []
     pts = session.query(Point).filter(Point.id.in_(point_qty.keys())).all()
@@ -500,22 +501,102 @@ def get_valid_shipping_points_for_return_mat(session, sku_id: int) -> list[dict]
 def get_valid_receiving_points_for_return(session, target_vc_id: int, return_direction: str) -> list[dict]:
     """
     退货收货点：
-    - CUSTOMER_TO_US → 我们仓库（自有仓）
-    - US_TO_SUPPLIER → 挂钩VC供应链的供应商仓库
+    - CUSTOMER_TO_US → 我们的仓 + 客户仓；默认我们仓ID最小
+    - US_TO_SUPPLIER → 我们的仓 + 供应商仓；默认供应商仓
     """
+    target_vc = session.query(VirtualContract).get(target_vc_id)
+
     if return_direction == ReturnDirection.CUSTOMER_TO_US:
-        pts = session.query(Point).filter(Point.type == "自有仓").all()
+        # 物料供应退货：可退给我们仓 或 客户仓
+        our_pts = session.query(Point).filter(Point.type == "自有仓").all()
+        # 找客户仓（从 target_vc.business.customer_id）
+        cust_pts = []
+        if target_vc and target_vc.business_id:
+            biz = session.query(Business).get(target_vc.business_id)
+            if biz and biz.customer_id:
+                cust_pts = session.query(Point).filter(
+                    Point.customer_id == biz.customer_id
+                ).all()
+        all_pts = our_pts + cust_pts
+        # 默认：我们仓ID最小
+        all_pts.sort(key=lambda p: (p.type != "自有仓", p.id))
     else:
-        target_vc = session.query(VirtualContract).get(target_vc_id)
+        # 物料采购退货：可退给我们仓 或 供应商仓
+        our_pts = session.query(Point).filter(Point.type == "自有仓").all()
+        supplier_pts = []
         if target_vc and target_vc.supply_chain_id:
             sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
             if sc:
-                pts = session.query(Point).filter(
+                supplier_pts = session.query(Point).filter(
                     Point.supplier_id == sc.supplier_id,
                     Point.type == "供应商仓"
                 ).all()
-            else:
-                pts = []
-        else:
-            pts = []
-    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in pts]
+        all_pts = our_pts + supplier_pts
+        # 默认：供应商仓优先
+        all_pts.sort(key=lambda p: (p.type != "供应商仓", p.id))
+
+    return [{"id": p.id, "name": p.name, "type": p.type or ""} for p in all_pts]
+
+
+# =============================================================================
+# 物料供应提案生成
+# =============================================================================
+
+def get_latest_supply_batches_by_sku(session, business_id: int) -> dict[tuple, str]:
+    """
+    查询某业务下每个 SKU 最近一次物料供应的批次号。
+    返回 {(sku_id, receiving_point_id): last_batch_no}，无历史则 value 为 None。
+    只查询有 batch_no 且非空的记录。
+    """
+    vcs = session.query(VirtualContract).filter(
+        VirtualContract.business_id == business_id,
+        VirtualContract.type == VCType.MATERIAL_SUPPLY
+    ).order_by(VirtualContract.status_timestamp.desc()).all()
+
+    result = {}  # (sku_id, receiving_point_id) -> last_batch_no
+    for vc in vcs:
+        elems = (vc.elements or {}).get("elements", [])
+        for e in elems:
+            sid = e.get("sku_id")
+            rp = e.get("receiving_point_id")
+            bn = e.get("batch_no")
+            if sid and rp and bn:
+                key = (sid, rp)
+                if key not in result:
+                    result[key] = bn  # 第一条就是最新的（倒序）
+    return result
+
+
+def get_available_batches_by_sku(session, sku_id: int, min_batch_no: str = None) -> list[dict]:
+    """
+    查询某 SKU 所有可用批次行（qty > 0）。
+    可选过滤：只返回 batch_no >= min_batch_no 的批次（满足新鲜度要求）。
+    返回 list[dict]，每项含 batch_no, point_id, point_name, point_type, qty。
+    """
+    query = session.query(MaterialInventory).filter(
+        MaterialInventory.sku_id == sku_id,
+        MaterialInventory.qty > 0
+    )
+    rows = query.all()
+
+    point_ids = list(set(r.point_id for r in rows if r.point_id))
+    point_map = {}
+    if point_ids:
+        pts = session.query(Point).filter(Point.id.in_(point_ids)).all()
+        point_map = {p.id: p for p in pts}
+
+    result = []
+    for r in rows:
+        bn = r.batch_no
+        if min_batch_no and bn and bn < min_batch_no:
+            continue
+        pt = point_map.get(r.point_id)
+        pt_type = pt.type or "" if pt else ""
+        result.append({
+            "batch_no": bn,
+            "point_id": r.point_id,
+            "point_name": pt.name if pt else f"点位{r.point_id}",
+            "point_type": pt_type,
+            "qty": r.qty,
+        })
+    return result

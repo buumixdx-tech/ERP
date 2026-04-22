@@ -10,3 +10,4 @@ if _legacy:
     _mod = importlib.util.module_from_spec(_legacy)
     _legacy.loader.exec_module(_mod)
     inventory_module = _mod.inventory_module
+    generate_batch_no = _mod.generate_batch_no

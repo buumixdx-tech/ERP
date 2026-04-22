@@ -5,10 +5,11 @@ from logic.time_rules.schemas import TimeRuleSchema
 
 
 class VCElementSchema(BaseModel):
-    """统一 VC elements 条目结构：按(shipping_point_id, receiving_point_id, sku_id)唯一确定"""
+    """统一 VC elements 条目结构：按(shipping_point_id, receiving_point_id, sku_id, batch_no)唯一确定"""
     shipping_point_id: int = Field(..., description="发货点位ID")
     receiving_point_id: int = Field(..., description="收货点位ID")
     sku_id: int = Field(..., description="SKU ID")
+    batch_no: Optional[str] = Field(None, description="物料批次号（物料供应必填）")
     qty: float = Field(..., gt=0, description="数量")
     price: float = Field(..., ge=0, description="单价")
     deposit: float = Field(default=0.0, ge=0, description="单台押金（设备VC有值，物料VC为0）")
@@ -33,8 +34,8 @@ class VCElementSchema(BaseModel):
 
     @property
     def id(self) -> str:
-        """自动生成唯一标识：sp{shipping_point_id}_rp{receiving_point_id}_sku{sku_id}"""
-        return f"sp{self.shipping_point_id}_rp{self.receiving_point_id}_sku{self.sku_id}"
+        """自动生成唯一标识：sp{shipping_point_id}_rp{receiving_point_id}_sku{sku_id}_bn{batch_no}"""
+        return f"sp{self.shipping_point_id}_rp{self.receiving_point_id}_sku{self.sku_id}_bn{self.batch_no or '-'}"
 
 
 class CreateProcurementVCSchema(BaseModel):

@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from api.deps import get_db, verify_api_key, row_to_dict, paginate
-from models import EquipmentInventory, MaterialInventory
+from models import EquipmentInventory, MaterialInventory, SKU, Point
 
 router = APIRouter(prefix="/api/v1/inventory", tags=["库存"], dependencies=[Depends(verify_api_key)])
 
@@ -49,79 +50,108 @@ def list_material(
     size: int = 50,
     session: Session = Depends(get_db)
 ):
-    """物料库存列表查询
-    - sku_id + warehouse_point_id: 该SKU在该仓库的库存数量
-    - 只有 sku_id: 该SKU所有仓库的库存分布
-    - 只有 warehouse_point_id: 该仓库下所有SKU的库存
     """
+    物料库存列表查询（新批次结构）
+
+    - sku_id + warehouse_point_id: 该SKU在该仓库的批次库存
+    - 只有 sku_id: 该SKU所有批次的库存
+    - 只有 warehouse_point_id: 该仓库下所有SKU的批次库存
+    - 都没有: 返回所有批次库存
+    """
+    # 构建基础查询
     q = session.query(MaterialInventory)
 
-    # 基础过滤（warehouse_point_id 在 Python 中过滤）
+    # 按sku_id过滤
     if sku_id is not None:
         q = q.filter(MaterialInventory.sku_id == sku_id)
 
-    items = q.all()
-
-    # 场景1: sku_id + warehouse_point_id → 返回该SKU在该仓库的数量
-    if sku_id is not None and warehouse_point_id is not None:
-        result = []
-        for item in items:
-            dist = item.stock_distribution or {}
-            qty = dist.get(str(warehouse_point_id), 0)
-            result.append({
-                "id": item.id,
-                "sku_id": item.sku_id,
-                "warehouse_point_id": warehouse_point_id,
-                "quantity": qty,
-                "average_price": item.average_price,
-                "total_balance": item.total_balance,
-            })
-        result.sort(key=lambda x: x["id"], reverse=True)
-        total = len(result)
-        start = (page - 1) * size
-        end = start + size
-        return {"success": True, "data": {
-            "items": result[start:end],
-            "total": total,
-            "page": page,
-            "size": size
-        }}
-
-    # 场景3: 只有 warehouse_point_id → 返回该仓库下所有SKU的库存
+    # 按point_id过滤
     if warehouse_point_id is not None:
-        result = []
-        for item in items:
-            dist = item.stock_distribution or {}
-            qty = dist.get(str(warehouse_point_id), 0)
-            if qty > 0:  # 只返回有库存的
-                result.append({
-                    "id": item.id,
-                    "sku_id": item.sku_id,
-                    "warehouse_point_id": warehouse_point_id,
-                    "quantity": qty,
-                    "average_price": item.average_price,
-                })
-        result.sort(key=lambda x: x["id"], reverse=True)
-        total = len(result)
-        start = (page - 1) * size
-        end = start + size
-        return {"success": True, "data": {
-            "items": result[start:end],
-            "total": total,
-            "page": page,
-            "size": size
-        }}
+        q = q.filter(MaterialInventory.point_id == warehouse_point_id)
 
-    # 场景2: 只有 sku_id → 返回所有仓库分布
+    # 获取批次行
+    batches = q.filter(MaterialInventory.qty > 0).all()
+
+    # 收集所有需要的sku_id和point_id
+    sku_ids = set(b.sku_id for b in batches if b.sku_id)
+    point_ids = set(b.point_id for b in batches if b.point_id)
+
+    # 批量查询SKU和Point
+    sku_map = {}
+    if sku_ids:
+        skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+        sku_map = {s.id: s for s in skus}
+
+    point_map = {}
+    if point_ids:
+        points = session.query(Point).filter(Point.id.in_(point_ids)).all()
+        point_map = {p.id: p for p in points}
+
+    # 按SKU分组统计
     result = []
-    for item in items:
-        result.append({
-            "id": item.id,
-            "sku_id": item.sku_id,
-            "stock_distribution": item.stock_distribution,
-            "average_price": item.average_price,
-            "total_balance": item.total_balance,
-        })
+    if sku_id is not None and warehouse_point_id is not None:
+        # 场景1: sku_id + warehouse_point_id → 返回该SKU在该仓库的数量
+        for b in batches:
+            sku = sku_map.get(b.sku_id)
+            result.append({
+                "id": b.id,
+                "sku_id": b.sku_id,
+                "sku_name": sku.name if sku else "未知",
+                "batch_no": b.batch_no,
+                "warehouse_point_id": warehouse_point_id,
+                "warehouse_point_name": point_map.get(warehouse_point_id).name if point_map.get(warehouse_point_id) else "未知",
+                "quantity": b.qty,
+                "average_price": float(sku.params.get("average_price", 0.0)) if sku and sku.params else 0.0,
+                "vc_id": b.latest_purchase_vc_id
+            })
+    elif sku_id is not None:
+        # 场景2: 只有 sku_id → 返回所有批次
+        for b in batches:
+            sku = sku_map.get(b.sku_id)
+            point = point_map.get(b.point_id)
+            result.append({
+                "id": b.id,
+                "sku_id": b.sku_id,
+                "sku_name": sku.name if sku else "未知",
+                "batch_no": b.batch_no,
+                "warehouse_point_id": b.point_id,
+                "warehouse_point_name": point.name if point else f"点位{b.point_id}",
+                "quantity": b.qty,
+                "average_price": float(sku.params.get("average_price", 0.0)) if sku and sku.params else 0.0,
+                "vc_id": b.latest_purchase_vc_id
+            })
+    elif warehouse_point_id is not None:
+        # 场景3: 只有 warehouse_point_id → 返回该仓库下所有SKU
+        for b in batches:
+            sku = sku_map.get(b.sku_id)
+            result.append({
+                "id": b.id,
+                "sku_id": b.sku_id,
+                "sku_name": sku.name if sku else "未知",
+                "batch_no": b.batch_no,
+                "warehouse_point_id": warehouse_point_id,
+                "warehouse_point_name": point_map.get(warehouse_point_id).name if point_map.get(warehouse_point_id) else "未知",
+                "quantity": b.qty,
+                "average_price": float(sku.params.get("average_price", 0.0)) if sku and sku.params else 0.0,
+                "vc_id": b.latest_purchase_vc_id
+            })
+    else:
+        # 场景4: 都没有 → 返回所有批次
+        for b in batches:
+            sku = sku_map.get(b.sku_id)
+            point = point_map.get(b.point_id)
+            result.append({
+                "id": b.id,
+                "sku_id": b.sku_id,
+                "sku_name": sku.name if sku else "未知",
+                "batch_no": b.batch_no,
+                "warehouse_point_id": b.point_id,
+                "warehouse_point_name": point.name if point else f"点位{b.point_id}",
+                "quantity": b.qty,
+                "average_price": float(sku.params.get("average_price", 0.0)) if sku and sku.params else 0.0,
+                "vc_id": b.latest_purchase_vc_id
+            })
+
     result.sort(key=lambda x: x["id"], reverse=True)
     total = len(result)
     start = (page - 1) * size

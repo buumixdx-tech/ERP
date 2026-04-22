@@ -667,3 +667,26 @@ def get_contract_files(contract_id):
         return []
     return [f for f in os.listdir(target_dir) if os.path.isfile(os.path.join(target_dir, f))]
 
+
+# --- 批次质检报告管理 ---
+BATCH_CERT_DIR = "data/batchcertificate"
+
+def save_batch_certificate(batch_no: str, uploaded_file) -> str:
+    """保存批次质检报告到本地目录，返回保存后的文件路径"""
+    os.makedirs(BATCH_CERT_DIR, exist_ok=True)
+    ext = os.path.splitext(uploaded_file.filename)[1] if uploaded_file.filename else ""
+    filename = f"{batch_no}{ext}"
+    path = os.path.join(BATCH_CERT_DIR, filename)
+    with open(path, "wb") as out:
+        out.write(uploaded_file.file.read())
+    return path
+
+
+def get_batch_certificate_path(batch_no: str) -> str | None:
+    """根据批次号查找质检报告路径（支持多种扩展名）"""
+    if not os.path.exists(BATCH_CERT_DIR):
+        return None
+    for f in os.listdir(BATCH_CERT_DIR):
+        if f.startswith(batch_no):
+            return os.path.join(BATCH_CERT_DIR, f)
+    return None

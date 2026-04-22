@@ -253,17 +253,23 @@ class TestMaterialProcurementInventory:
     """物料采购入库测试"""
 
     def test_material_procurement_single_warehouse(self, db_session, sample_customer, sample_supplier):
-        """✅ 物料采购入库 - 单仓库，stock_distribution 使用 Point ID 作为 key"""
-        from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        """✅ 物料采购入库 - 单仓库，创建批次行"""
+        from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU, Point
 
         # 创建物料SKU
         material_sku = SKU(
             supplier_id=sample_supplier.id,
             name="测试物料-001",
+            model="SKU001",
             type_level1="物料",
             type_level2="原料"
         )
         db_session.add(material_sku)
+        db_session.flush()
+
+        # 创建仓库点位
+        warehouse = Point(name="物料仓库A", type="自有仓")
+        db_session.add(warehouse)
         db_session.flush()
 
         business = Business(customer_id=sample_customer.id, status="业务开展", details={})
@@ -294,7 +300,7 @@ class TestMaterialProcurementInventory:
             tracking_number="MF555555",
             items=[{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100}],
             address_info={
-                "收货点位Id": 300,
+                "收货点位Id": warehouse.id,
                 "收货点位名称": "物料仓库A",
                 "收货方联系电话": "13900139000",
                 "发货点位名称": "供应商仓库",
@@ -307,23 +313,29 @@ class TestMaterialProcurementInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证物料库存
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat is not None
-        assert mat.total_balance == 100.0
+        # 验证物料库存批次行
+        batch = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id
+        ).first()
+        assert batch is not None
+        assert batch.qty == 100.0
+        assert batch.point_id == warehouse.id
+        assert batch.batch_no is not None
+        assert f"-{material_sku.model}" in batch.batch_no
+        assert batch.latest_purchase_vc_id == vc.id
 
-        # 关键验证：stock_distribution 使用 Point ID (str) 作为 key
-        dist = mat.stock_distribution
-        assert dist is not None
-        dist_dict = dict(dist)
-        assert "300" in dist_dict  # 使用点位ID作为key
-        assert dist_dict["300"] == 100
+        # 验证SKU采购统计已更新
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 100.0
+        assert material_sku.params.get("average_price") == 10.0
+        assert material_sku.params.get("latest_purchase_vc_id") == vc.id
 
     def test_material_procurement_multiple_warehouses(self, db_session, sample_customer, sample_supplier):
-        """✅ 物料采购入库 - 多仓库，每个仓库独立记录库存"""
+        """✅ 物料采购入库 - 多仓库，每个仓库独立批次行"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="测试物料-002", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="测试物料-002", model="MAT002", type_level1="物料")
         db_session.add(material_sku)
         db_session.flush()
 
@@ -381,32 +393,42 @@ class TestMaterialProcurementInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证物料库存
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat is not None
-        assert mat.total_balance == 200.0
+        # 验证两个批次行
+        batches = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.qty > 0
+        ).all()
+        assert len(batches) == 2
 
-        # 验证分仓库库存 - 使用 Point ID 作为 key
-        dist_dict = dict(mat.stock_distribution)
-        assert "301" in dist_dict
-        assert "302" in dist_dict
-        assert dist_dict["301"] == 80
-        assert dist_dict["302"] == 120
+        batch_map = {b.point_id: b for b in batches}
+        assert 301 in batch_map
+        assert 302 in batch_map
+        assert batch_map[301].qty == 80.0
+        assert batch_map[302].qty == 120.0
+
+        # 验证SKU采购统计
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 200.0
+        assert material_sku.params.get("average_price") == 10.0
 
     def test_material_procurement_accumulate_existing(self, db_session, sample_customer, sample_supplier):
-        """✅ 物料采购入库 - 追加已有库存"""
+        """✅ 物料采购入库 - 追加同一批次"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="测试物料-003", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="测试物料-003", model="MAT003", type_level1="物料",
+                           params={"historical_purchase_qty": 50.0, "average_price": 5.0})
         db_session.add(material_sku)
         db_session.flush()
 
-        # 预先创建物料库存
+        # 预先创建批次库存（与新采购同一日期同一SKU）
+        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{material_sku.model}"
         existing_mat = MaterialInventory(
             sku_id=material_sku.id,
-            total_balance=50.0,
-            average_price=5.0,
-            stock_distribution={"400": 50}  # 使用 Point ID 作为 key
+            batch_no=batch_no,
+            point_id=400,
+            qty=50.0,
+            latest_purchase_vc_id=999  # 旧采购VC
         )
         db_session.add(existing_mat)
         db_session.flush()
@@ -450,33 +472,43 @@ class TestMaterialProcurementInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证累加库存
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 80.0  # 50 + 30
+        # 验证同一批次累加
+        batch = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == 400,
+            MaterialInventory.batch_no == batch_no
+        ).first()
+        assert batch is not None
+        assert batch.qty == 80.0  # 50 + 30
 
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict["400"] == 80  # 累加到同一仓库
+        # 验证SKU采购统计已更新
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 80.0  # 50 + 30
+        assert material_sku.params.get("average_price") == ((50 * 5.0 + 30 * 6) / 80)
 
 
 class TestMaterialSupplyInventory:
     """物料供应出库测试"""
 
     def test_material_supply_deduct_by_shipping_point(self, db_session, sample_customer, sample_supplier):
-        """✅ 物料供应出库 - 按发货点位扣减 stock_distribution"""
+        """✅ 物料供应出库 - 按发货点位扣减批次库存"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="供应物料-001", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="供应物料-001", model="SUP001", type_level1="物料")
         db_session.add(material_sku)
         db_session.flush()
 
-        # 预先创建物料库存
-        existing_mat = MaterialInventory(
-            sku_id=material_sku.id,
-            total_balance=200.0,
-            average_price=10.0,
-            stock_distribution={"500": 150, "501": 50}  # 两个仓库
+        # 预先创建批次库存
+        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{material_sku.model}"
+        existing_mat1 = MaterialInventory(
+            sku_id=material_sku.id, batch_no=batch_no, point_id=500, qty=150.0
         )
-        db_session.add(existing_mat)
+        existing_mat2 = MaterialInventory(
+            sku_id=material_sku.id, batch_no=batch_no, point_id=501, qty=50.0
+        )
+        db_session.add(existing_mat1)
+        db_session.add(existing_mat2)
         db_session.flush()
 
         business = Business(customer_id=sample_customer.id, status="业务开展", details={})
@@ -520,27 +552,38 @@ class TestMaterialSupplyInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证扣减
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 170.0  # 200 - 30
+        # 验证扣减：仓库500的批次被扣30
+        batch1 = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == 500
+        ).first()
+        assert batch1.qty == 120.0  # 150 - 30
 
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict["500"] == 120  # 150 - 30
-        assert dist_dict["501"] == 50    # 未变化
+        # 仓库501未变化
+        batch2 = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == 501
+        ).first()
+        assert batch2.qty == 50.0
 
     def test_material_supply_without_shipping_point_id(self, db_session, sample_customer, sample_supplier):
         """✅ 物料供应出库 - 无发货点位ID使用默认仓"""
-        from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU, Point
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="供应物料-002", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="供应物料-002", model="SUP002", type_level1="物料")
         db_session.add(material_sku)
         db_session.flush()
 
+        # 创建默认点位
+        default_point = Point(name="默认点位")
+        db_session.add(default_point)
+        db_session.flush()
+
+        # 预先创建批次库存
+        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{material_sku.model}"
         existing_mat = MaterialInventory(
-            sku_id=material_sku.id,
-            total_balance=100.0,
-            average_price=8.0,
-            stock_distribution={"默认点位": 100}
+            sku_id=material_sku.id, batch_no=batch_no, point_id=default_point.id, qty=100.0
         )
         db_session.add(existing_mat)
         db_session.flush()
@@ -572,7 +615,7 @@ class TestMaterialSupplyInventory:
             address_info={
                 "收货点位Id": 700,
                 "收货点位名称": "客户仓",
-                # 无发货点位Id，代码 fallback 到 SystemConstants.DEFAULT_POINT = "默认点位"
+                # 无发货点位Id，代码 fallback 到默认点位
                 "address": "地址"
             },
             status="签收"
@@ -582,30 +625,31 @@ class TestMaterialSupplyInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 80.0
-
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict.get("默认点位") == 80
+        # 验证默认仓扣减
+        batch = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == default_point.id
+        ).first()
+        assert batch.qty == 80.0
 
 
 class TestReturnInventory:
     """退货库存处理测试"""
 
     def test_return_customer_to_us_inbound(self, db_session, sample_customer, sample_supplier):
-        """✅ 退货-客户退给我们：物料入库，收货点位增加库存"""
+        """✅ 退货-客户退给我们：物料入库，收货点位增加库存（追加到同一批次）"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="退货物料-001", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="退货物料-001", model="RET001", type_level1="物料",
+                           params={"historical_purchase_qty": 100.0, "average_price": 10.0})
         db_session.add(material_sku)
         db_session.flush()
 
-        # 已有库存
+        # 已有批次库存（与退货同一日期同一SKU）
+        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{material_sku.model}"
         existing_mat = MaterialInventory(
-            sku_id=material_sku.id,
-            total_balance=100.0,
-            average_price=10.0,
-            stock_distribution={"800": 100}
+            sku_id=material_sku.id, batch_no=batch_no, point_id=800, qty=100.0
         )
         db_session.add(existing_mat)
         db_session.flush()
@@ -653,26 +697,33 @@ class TestReturnInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证退货入库
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 120.0  # 100 + 20
+        # 验证退货入库：_get_or_create_batch 会追加到同一批次
+        batch = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == 800,
+            MaterialInventory.batch_no == batch_no
+        ).first()
+        assert batch is not None
+        assert batch.qty == 120.0  # 100 + 20，追加到同一批次
 
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict["800"] == 120  # 增加
+        # SKU历史采购统计不变（退货不计入）
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 100.0
 
     def test_return_us_to_supplier_outbound(self, db_session, sample_customer, sample_supplier):
-        """✅ 退货-我们退给供应商：物料出库，发货点位减少库存"""
+        """✅ 退货-我们退给供应商：物料出库，发货点位减少库存，回退采购统计"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="退货物料-002", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="退货物料-002", model="RET002", type_level1="物料",
+                           params={"historical_purchase_qty": 100.0, "average_price": 10.0})
         db_session.add(material_sku)
         db_session.flush()
 
+        # 创建原采购批次
+        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{material_sku.model}"
         existing_mat = MaterialInventory(
-            sku_id=material_sku.id,
-            total_balance=100.0,
-            average_price=10.0,
-            stock_distribution={"900": 100}
+            sku_id=material_sku.id, batch_no=batch_no, point_id=900, qty=100.0
         )
         db_session.add(existing_mat)
         db_session.flush()
@@ -681,9 +732,27 @@ class TestReturnInventory:
         db_session.add(business)
         db_session.flush()
 
+        # 原采购VC（用于退货回退）
+        orig_vc = VirtualContract(
+            business_id=business.id,
+            type=VCType.MATERIAL_PROCUREMENT,
+            elements={
+                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
+                "total_amount": 1000
+            },
+            deposit_info={},
+            status=VCStatus.EXE,
+            subject_status=SubjectStatus.EXE,
+            cash_status=CashStatus.EXE
+        )
+        db_session.add(orig_vc)
+        db_session.flush()
+
+        # 退货VC
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.RETURN,
+            related_vc_id=orig_vc.id,
             elements={
                 "return_items": [
                     {"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "sn": "-", "price": 10}
@@ -720,12 +789,17 @@ class TestReturnInventory:
 
         inventory_module(logistics.id, session=db_session)
 
-        # 验证退货出库
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 70.0  # 100 - 30
+        # 验证退货出库：批次数量减少
+        batch = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.point_id == 900
+        ).first()
+        assert batch.qty == 70.0  # 100 - 30
 
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict["900"] == 70  # 100 - 30
+        # 验证采购统计回退到原采购VC的数据
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 100.0
+        assert material_sku.params.get("average_price") == 10.0
 
 
 class TestInventoryEdgeCases:
@@ -784,10 +858,11 @@ class TestInventoryEdgeCases:
         assert equipment_list[0].sn == "SNEDGE1"
 
     def test_multiple_express_orders_same_vc(self, db_session, sample_customer, sample_supplier, sample_sku):
-        """✅ 同一VC多个快递单，全部处理"""
+        """✅ 同一VC多个快递单，每个仓库独立批次行"""
         from models import Business, VirtualContract, Logistics, ExpressOrder, MaterialInventory, SKU
+        from datetime import datetime
 
-        material_sku = SKU(supplier_id=sample_supplier.id, name="多单物料-001", type_level1="物料")
+        material_sku = SKU(supplier_id=sample_supplier.id, name="多单物料-001", model="MULTI01", type_level1="物料")
         db_session.add(material_sku)
         db_session.flush()
 
@@ -814,7 +889,7 @@ class TestInventoryEdgeCases:
         db_session.add(logistics)
         db_session.flush()
 
-        # 快递单1
+        # 快递单1 -> 仓库111
         eo1 = ExpressOrder(
             logistics_id=logistics.id,
             tracking_number="MFMulti01",
@@ -824,7 +899,7 @@ class TestInventoryEdgeCases:
         )
         db_session.add(eo1)
 
-        # 快递单2
+        # 快递单2 -> 仓库222
         eo2 = ExpressOrder(
             logistics_id=logistics.id,
             tracking_number="MFMulti02",
@@ -837,12 +912,20 @@ class TestInventoryEdgeCases:
 
         inventory_module(logistics.id, session=db_session)
 
-        mat = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id == material_sku.id).first()
-        assert mat.total_balance == 150.0
+        # 验证两个批次行
+        batches = db_session.query(MaterialInventory).filter(
+            MaterialInventory.sku_id == material_sku.id,
+            MaterialInventory.qty > 0
+        ).all()
+        assert len(batches) == 2
 
-        dist_dict = dict(mat.stock_distribution)
-        assert dist_dict["111"] == 60
-        assert dist_dict["222"] == 90
+        batch_map = {b.point_id: b for b in batches}
+        assert batch_map[111].qty == 60.0
+        assert batch_map[222].qty == 90.0
+
+        # 验证采购统计
+        db_session.refresh(material_sku)
+        assert material_sku.params.get("historical_purchase_qty") == 150.0
 
     def test_empty_express_orders(self, db_session, sample_customer, sample_supplier, sample_sku):
         """✅ 物流无快递单时不创建库存"""

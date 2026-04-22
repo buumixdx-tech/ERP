@@ -5,8 +5,9 @@ from .actions import (
 )
 from .queries import get_logistics_list_for_ui as get_logistics_list, get_logistics_by_id as get_logistics_detail, get_express_orders_by_logistics as get_express_detail
 from .schemas import (
-    CreateLogisticsPlanSchema, ConfirmInboundSchema, 
-    UpdateExpressOrderSchema, ExpressOrderStatusSchema
+    CreateLogisticsPlanSchema, ConfirmInboundSchema,
+    UpdateExpressOrderSchema, ExpressOrderStatusSchema,
+    BatchItemSchema
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     'ConfirmInboundSchema',
     'UpdateExpressOrderSchema',
     'ExpressOrderStatusSchema',
+    'BatchItemSchema',
 ]

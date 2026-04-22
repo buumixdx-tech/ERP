@@ -30,7 +30,7 @@ from logic.vc.schemas import (
     CreateReturnVCSchema, AllocateInventorySchema, VCElementSchema,
 )
 from logic.logistics.actions import create_logistics_plan_action, confirm_inbound_action
-from logic.logistics.schemas import CreateLogisticsPlanSchema, ConfirmInboundSchema
+from logic.logistics.schemas import CreateLogisticsPlanSchema, ConfirmInboundSchema, BatchItemSchema
 from logic.state_machine import virtual_contract_state_machine, logistics_state_machine
 from logic.inventory import inventory_module
 from logic.constants import (
@@ -202,9 +202,9 @@ def _advance_logistics(session, logistics_id):
         logistics_state_machine(logistics_id, session=session)
 
 
-def _confirm_inbound(session, logistics_id, sn_list=None):
+def _confirm_inbound(session, logistics_id, sn_list=None, batch_items=None):
     """确认入库"""
-    payload = ConfirmInboundSchema(log_id=logistics_id, sn_list=sn_list or [])
+    payload = ConfirmInboundSchema(log_id=logistics_id, sn_list=sn_list or [], batch_items=batch_items)
     return confirm_inbound_action(session, payload)
 
 
@@ -441,8 +441,12 @@ class TestMaterialProcurementFullFlow:
         db_session.refresh(logistics)
         assert logistics.status == LogisticsStatus.SIGNED
 
-        # 5. 确认入库（物料无 SN）
-        inbound_result = _confirm_inbound(db_session, logistics.id, sn_list=[])
+        # 5. 确认入库（物料需提供 batch_items）
+        batch_items = [
+            BatchItemSchema(sku_id=2, production_date="2026-04-20", receiving_point_id=1, qty=500, certificate_filename=None),
+            BatchItemSchema(sku_id=3, production_date="2026-04-20", receiving_point_id=1, qty=500, certificate_filename=None),
+        ]
+        inbound_result = _confirm_inbound(db_session, logistics.id, sn_list=[], batch_items=batch_items)
         assert inbound_result.success
 
         # 6. 触发 VC 状态机（处理物流）
@@ -452,7 +456,7 @@ class TestMaterialProcurementFullFlow:
         # 7. 验证物料库存（MaterialInventory 无 vc_id 字段，按 sku_id 过滤）
         mat_inv = db_session.query(MaterialInventory).filter(MaterialInventory.sku_id.in_([2, 3])).all()
         assert len(mat_inv) == 2, f"物料库存条目: {len(mat_inv)}"
-        total_qty = sum(m.total_balance for m in mat_inv)
+        total_qty = sum(m.qty for m in mat_inv)
         assert total_qty == 1000, f"物料总量: {total_qty}"
 
         # 8. 验证 VC subject_status
@@ -471,11 +475,9 @@ class TestMaterialSupplyFullFlow:
 
     def test_material_supply_complete_flow(self, db_session, base_data):
         """✅ 物料供应：创建 → 物流 → 出库 → 状态推进"""
-        # 前置：预置物料库存（朝旭食养仓 sp=3 有 sku 2, 3 的库存）
-        mat2 = MaterialInventory(sku_id=2, total_balance=500.0, average_price=6.5,
-                                stock_distribution={"3": 500.0})
-        mat3 = MaterialInventory(sku_id=3, total_balance=500.0, average_price=8.3,
-                                stock_distribution={"3": 500.0})
+        # 前置：预置物料库存批次（朝旭食养仓 sp=3 有 sku 2, 3 的库存）
+        mat2 = MaterialInventory(sku_id=2, batch_no="20260420-YUANWEI", point_id=3, qty=500.0)
+        mat3 = MaterialInventory(sku_id=3, batch_no="20260420-YUMIYANMAI", point_id=3, qty=500.0)
         db_session.add_all([mat2, mat3])
         db_session.flush()
 

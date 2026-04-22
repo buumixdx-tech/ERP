@@ -6,7 +6,9 @@ from models import (
     get_session, VirtualContract, EquipmentInventory, MaterialInventory,
     SKU, Point, SupplyChain, Business, PartnerRelation, ExternalPartner
 )
+from sqlalchemy import func
 from sqlalchemy.orm import joinedload
+from typing import List, Optional
 from logic.constants import (
     VCType, VCStatus, SubjectStatus, ReturnDirection, OperationalStatus, SKUType,
     AccountOwnerType, SystemConstants, CashFlowType, CounterpartType, AccountLevel1,
@@ -37,6 +39,8 @@ def normalize_item_data(item: dict) -> dict:
         "target_point_name": item.get("target_point_name") or item.get("targetPointName"),
         # 发货点位ID（退货场景）
         "shipping_point_id": item.get("shipping_point_id") or item.get("shippingPointId"),
+        # 批次号（物料供应）
+        "batch_no": item.get("batch_no") or item.get("batchNo"),
     }
 
 def format_item_list_preview(items: list) -> str:
@@ -119,43 +123,74 @@ def get_returnable_items(session, target_vc_id, return_direction):
                 "deposit": float(e.deposit_amount or 0.0)
             })
 
-    # 3. 物料采购类型的退货逻辑 (向供应商退款)
+    # 3. 物料采购类型的退货逻辑 (向供应商退货)
     elif target_vc.type == VCType.MATERIAL_PROCUREMENT:
-        unique_skus = {}
-        for i in vc_elems:
-            sid = i.get("sku_id")
-            if sid not in unique_skus:
-                unique_skus[sid] = {
-                    "name": i.get("sku_name") or i.get("name"),
-                    "price": float(i.get("price") or 0),
-                    "target_total": float(i.get("qty") or 0)
-                }
-            else:
-                unique_skus[sid]["target_total"] += float(i.get("qty") or 0)
+        # 按 receiving_point_id（即我们的收货仓库）分组，退货目的地是供应商仓库
+        # 批次精确追溯：每个 element 有 batch_no，按 batch_no FIFO 扣减
+        pt_group = {}
+        pt_ids = set()
+        for e in vc_elems:
+            pt_id = e.get("receiving_point_id")
+            if pt_id:
+                pt_ids.add(pt_id)
+            if pt_id not in pt_group:
+                pt_group[pt_id] = {"items": []}
+            pt_group[pt_id]["items"].append(e)
+        point_by_id = {}
+        if pt_ids:
+            pts = session.query(Point).filter(Point.id.in_(pt_ids)).all()
+            point_by_id = {p.id: p for p in pts}
+        points_data = [{"pointName": (point_by_id.get(pt_id).name if point_by_id.get(pt_id) else f"点位{pt_id}"), "items": v["items"]} for pt_id, v in pt_group.items()]
 
-        mat_inv_by_sid = {}
-        if unique_skus:
-            mat_invs = session.query(MaterialInventory).filter(
-                MaterialInventory.sku_id.in_(list(unique_skus.keys()))
-            ).all()
-            mat_inv_by_sid = {m.sku_id: m for m in mat_invs}
+        # 批量查 SKU 名称
+        all_sku_ids = set()
+        for p in points_data:
+            for i in p.get("items", []):
+                sid = i.get("sku_id")
+                if sid:
+                    all_sku_ids.add(sid)
+        sku_name_map = {}
+        if all_sku_ids:
+            skus = session.query(SKU).filter(SKU.id.in_(all_sku_ids)).all()
+            sku_name_map = {s.id: s.name for s in skus}
 
-        for sid, meta in unique_skus.items():
-            mat = mat_inv_by_sid.get(sid)
-            if mat and mat.stock_distribution:
-                for wh, wh_qty in mat.stock_distribution.items():
-                    if wh_qty > 0:
-                        already_ret = returned_qtys.get(sid, {}).get(wh, 0)
-                        final_returnable = min(float(wh_qty), meta["target_total"] - already_ret)
-                        if final_returnable > 0:
-                            return_items.append({
-                                "sku_id": sid,
-                                "sku_name": meta["name"],
-                                "price": meta["price"],
-                                "qty": int(final_returnable),
-                                "point_name": wh,
-                                "shipping_point_name": wh
-                            })
+        # 阶段一：收集所有 element 行，按 (sku_id, point_name) 分组
+        grouped: dict[tuple, dict] = {}
+        for p in points_data:
+            p_name = p.get("pointName") or "未知点位"
+            for i in p.get("items", []):
+                norm = normalize_item_data(i)
+                sid = norm["sku_id"]
+                key = (sid, p_name)
+                if key not in grouped:
+                    grouped[key] = {"rows": [], "ret_qty": 0.0}
+                grouped[key]["rows"].append({
+                    "norm": norm,
+                    "qty": norm["qty"],
+                    "bn": norm.get("batch_no") or "-",
+                })
+                # 累计已退量（稍后 FIFO 扣减）
+                if sid in returned_qtys and p_name in returned_qtys[sid]:
+                    grouped[key]["ret_qty"] += returned_qtys[sid][p_name]
+
+        # 阶段二：FIFO 扣减，生成最终退货行
+        for (sid, pname), g in grouped.items():
+            ret_left = g["ret_qty"]
+            for row in sorted(g["rows"], key=lambda x: x["bn"]):
+                deduct = min(row["qty"], ret_left)
+                remain = row["qty"] - deduct
+                ret_left -= deduct
+                if remain > 0:
+                    norm = row["norm"]
+                    return_items.append({
+                        "sku_id": sid,
+                        "sku_name": sku_name_map.get(sid, norm["sku_name"]),
+                        "price": norm["price"],
+                        "qty": int(remain),
+                        "point_name": pname,
+                        "shipping_point_name": norm.get("shipping_point_name"),
+                        "batch_no": row["bn"],
+                    })
 
     # 4. 物料供应类型的退货逻辑 (客户退回)
     elif target_vc.type == VCType.MATERIAL_SUPPLY:
@@ -172,26 +207,60 @@ def get_returnable_items(session, target_vc_id, return_direction):
                 if pt_id not in pt_group:
                     pt_group[pt_id] = {"items": []}
                 pt_group[pt_id]["items"].append(e)
-            # 批量查询所有需要的 Point，避免 N+1
             point_by_id = {}
             if pt_ids:
                 points = session.query(Point).filter(Point.id.in_(pt_ids)).all()
                 point_by_id = {p.id: p for p in points}
             points_data = [{"pointName": (point_by_id.get(pt_id).name if point_by_id.get(pt_id) else f"点位{pt_id}"), "items": v["items"]} for pt_id, v in pt_group.items()]
 
+        # 批量查 SKU 名称
+        all_sku_ids = set()
+        for p in points_data:
+            for i in p.get("items", []):
+                sid = i.get("sku_id")
+                if sid:
+                    all_sku_ids.add(sid)
+        sku_name_map = {}
+        if all_sku_ids:
+            skus = session.query(SKU).filter(SKU.id.in_(all_sku_ids)).all()
+            sku_name_map = {s.id: s.name for s in skus}
+
+        # 阶段一：收集所有批次行，按 (sku_id, point_name) 分组
+        grouped: dict[tuple, dict] = {}
         for p in points_data:
             p_name = p.get("pointName") or "未知点位"
             for i in p.get("items", []):
                 norm = normalize_item_data(i)
-                remain_qty = int(norm["qty"]) - returned_qtys.get(norm["sku_id"], {}).get(p_name, 0)
-                if remain_qty > 0:
+                sid = norm["sku_id"]
+                key = (sid, p_name)
+                if key not in grouped:
+                    grouped[key] = {"rows": [], "ret_qty": 0.0}
+                grouped[key]["rows"].append({
+                    "norm": norm,
+                    "qty": norm["qty"],
+                    "bn": norm.get("batch_no") or "-",
+                })
+                # 累计已退量（暂存，稍后 FIFO 扣减）
+                if sid in returned_qtys and p_name in returned_qtys[sid]:
+                    grouped[key]["ret_qty"] += returned_qtys[sid][p_name]
+
+        # 阶段二：FIFO 扣减，生成最终退货行
+        for (sid, pname), g in grouped.items():
+            ret_left = g["ret_qty"]
+            for row in sorted(g["rows"], key=lambda x: x["bn"]):
+                deduct = min(row["qty"], ret_left)
+                remain = row["qty"] - deduct
+                ret_left -= deduct
+                if remain > 0:
+                    norm = row["norm"]
                     return_items.append({
-                        "sku_id": norm["sku_id"],
-                        "sku_name": norm["sku_name"],
+                        "sku_id": sid,
+                        "sku_name": sku_name_map.get(sid, norm["sku_name"]),
                         "price": norm["price"],
-                        "qty": int(remain_qty),
-                        "point_name": p_name,
-                        "shipping_point_name": norm.get("shipping_point_name")
+                        "qty": int(remain),
+                        "point_name": pname,
+                        "shipping_point_name": norm.get("shipping_point_name"),
+                        "batch_no": row["bn"],
                     })
 
     return return_items
@@ -215,10 +284,11 @@ def get_sku_agreement_price(session, sc_id, business_id, sku_name):
     unit_price = 0.0
     if sc and sku_id:
         sc_pricing = sc.get_pricing_dict()
-        unit_price = sc_pricing.get(sku_id, 0.0)
-
-    if not isinstance(unit_price, (int, float)):
-        unit_price = 0.0
+        raw_price = sc_pricing.get(sku_id, 0.0)
+        if isinstance(raw_price, dict):
+            unit_price = float(raw_price.get("price") or 0.0)
+        elif isinstance(raw_price, (int, float)):
+            unit_price = float(raw_price)
 
     # 获取客户业务约定的押金与单价 (优先级覆盖)
     if biz and isinstance(biz, dict):
@@ -259,17 +329,32 @@ def validate_inventory_availability(session, request_items):
 
     over_stock = []
     for (sku_n, wh_n), total_req in totals.items():
-        mat_inv = session.query(MaterialInventory).join(SKU).filter(SKU.name == sku_n).first()
-        dist = mat_inv.stock_distribution if (mat_inv and mat_inv.stock_distribution) else {}
+        # 查询SKU
+        sku = session.query(SKU).filter(SKU.name == sku_n).first()
+        if not sku:
+            over_stock.append(f"【{wh_n}】的 {sku_n}: SKU不存在")
+            continue
 
-        # stock_distribution 的 key 是 str(point_id)，将 warehouse name 转为 point_id 再查询
         # warehouse name 格式为 "SKU - 仓库名 (类型) - 数量件"，提取中间段"仓库名"
         wh_n_clean = wh_n.split(' - ')[1].split(' (')[0] if ' - ' in wh_n else wh_n
         pt = session.query(Point).filter(Point.name == wh_n_clean).first()
-        if pt:
-            available = float(dist.get(str(pt.id), 0.0))
-        else:
-            available = float(dist.get(wh_n, 0.0))
+        if not pt:
+            over_stock.append(f"【{wh_n}】的 {sku_n}: 仓库不存在")
+            continue
+
+        # 查询该SKU在该仓库的批次库存总和
+        available = session.query(
+            session.query(func.sum(MaterialInventory.qty)).filter(
+                MaterialInventory.sku_id == sku.id,
+                MaterialInventory.point_id == pt.id
+            ).scalar() or 0.0
+        )
+
+        # 使用新的批次结构查询
+        available = session.query(func.sum(MaterialInventory.qty)).filter(
+            MaterialInventory.sku_id == sku.id,
+            MaterialInventory.point_id == pt.id
+        ).scalar() or 0.0
 
         if total_req > available:
             over_stock.append(f"【{wh_n}】的 {sku_n}: 申请 {total_req}, 当前存量 {available}")
@@ -646,11 +731,11 @@ def get_logistics_finance_context(session, logistics_id):
         for item in mat_elems:
             sid = item.get("sku_id") or item.get("skuId")
             qty = float(item.get("qty") or 0)
-            mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
-            unit_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
+            # 使用 sku.params.average_price
+            sku_obj = session.query(SKU).get(sid)
+            unit_cost = float(sku_obj.params.get("average_price", 0.0)) if (sku_obj and sku_obj.params) else 0.0
             if unit_cost == 0:
-                sku_obj = session.query(SKU).get(sid)
-                unit_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
+                unit_cost = float(sku_obj.params.get("unit_price", 0.0)) if (sku_obj and sku_obj.params) else 0.0
             total_cost += qty * unit_cost
         ctx["items_cost"] = total_cost
 
@@ -658,13 +743,13 @@ def get_logistics_finance_context(session, logistics_id):
         total_asset_cost = 0.0
         ret_elems = (vc.elements or {}).get("elements", [])
         for item in ret_elems:
-            sid = item.get("id") or item.get("sku_id")
+            sid = item.get("sku_id")
             qty = float(item.get("qty") or 0)
-            mat_inv = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sid).first()
-            u_cost = mat_inv.average_price if (mat_inv and mat_inv.average_price > 0) else 0.0
+            # 使用 sku.params.average_price
+            sku_obj = session.query(SKU).get(sid)
+            u_cost = float(sku_obj.params.get("average_price", 0.0)) if (sku_obj and sku_obj.params) else 0.0
             if u_cost == 0:
-                sku_obj = session.query(SKU).get(sid)
-                u_cost = float(sku_obj.params.get("unit_price") or 0.0) if (sku_obj and sku_obj.params) else 0.0
+                u_cost = float(sku_obj.params.get("unit_price", 0.0)) if (sku_obj and sku_obj.params) else 0.0
             total_asset_cost += qty * u_cost
         ctx["items_cost"] = total_asset_cost
         
@@ -736,4 +821,175 @@ def get_cashflow_finance_context(session, cash_flow_id):
         "pre_amt": pre_amt,
         "our_bank_id": our_bank_id,
         "can_process": not cf.finance_triggered
+    }
+
+
+# =============================================================================
+# 物料供应提案生成
+# =============================================================================
+
+from logic.vc.queries import get_latest_supply_batches_by_sku, get_available_batches_by_sku
+
+
+def _warehouse_priority(point_type: str) -> tuple:
+    """仓库优先级：供应商仓 > 自有仓 > 客户仓"""
+    if point_type == "供应商仓":
+        return (1, 0)
+    elif point_type == "自有仓":
+        return (2, 0)
+    else:
+        return (3, 0)
+
+
+def generate_material_supply_proposal(session, business_id: int, items: List[dict]) -> dict:
+    """
+    生成物料供应出货提案。
+
+    逻辑：
+    1. 对每个需求行，查历史批次新鲜度下限
+    2. 过滤可用批次行（batch_no >= last_sent），按 FIFO + 仓库优先级分配
+    3. 返回推荐方案 + 各 SKU 其他可选批次
+
+    Args:
+        business_id: 业务ID
+        items: 客户需求列表 [{sku_id, qty, receiving_point_id}, ...]
+
+    Returns:
+        {
+            valid: bool,
+            proposed_plan: [...],
+            alternatives: [...],
+            total_amt: float,
+            error: str | None
+        }
+    """
+    from models import SKU, Point
+    from logic.vc.queries import get_latest_supply_batches_by_sku, get_available_batches_by_sku
+
+    # 批量查 SKU 信息
+    sku_ids = list(set(i["sku_id"] for i in items))
+    sku_map = {s.id: s for s in session.query(SKU).filter(SKU.id.in_(sku_ids)).all()}
+
+    # 批量查点位信息
+    pt_ids = list(set(i["receiving_point_id"] for i in items))
+    pt_map = {p.id: p for p in session.query(Point).filter(Point.id.in_(pt_ids)).all()}
+
+    # 查历史批次新鲜度
+    last_batches = get_latest_supply_batches_by_sku(session, business_id)
+
+    proposed_plan = []
+    alternatives = []
+    total_amt = 0.0
+    errors = []
+
+    for idx, item in enumerate(items):
+        sku_id = item["sku_id"]
+        qty_needed = float(item["qty"])
+        rp_id = item["receiving_point_id"]
+
+        sku_obj = sku_map.get(sku_id)
+        rp_name = pt_map.get(rp_id).name if pt_map.get(rp_id) else f"点位{rp_id}"
+
+        # 历史批次新鲜度下限
+        last_bn = last_batches.get((sku_id, rp_id))
+        all_batches = get_available_batches_by_sku(session, sku_id)
+        if last_bn:
+            all_batches = [b for b in all_batches if b["batch_no"] and b["batch_no"] >= last_bn]
+
+        if not all_batches:
+            errors.append(f"SKU {sku_obj.name if sku_obj else sku_id}（{rp_name}）：无可用批次" +
+                          (f"，上次供货批次 {last_bn}" if last_bn else "，无历史供货记录"))
+            continue
+
+        # 收集所有可选方案（用于 alternatives）
+        all_options = sorted(all_batches, key=lambda x: (x["batch_no"], _warehouse_priority(x["point_type"])))
+
+        # FIFO 分配：先按 batch_no 排序，同批次按仓库优先级
+        sorted_batches = sorted(all_batches, key=lambda x: (x["batch_no"], _warehouse_priority(x["point_type"])))
+
+        # 按仓库合并同批次但不同仓库的行
+        merged = {}
+        for b in sorted_batches:
+            key = (b["batch_no"], b["point_id"])
+            if key not in merged:
+                merged[key] = dict(b)
+            else:
+                merged[key]["qty"] += b["qty"]
+        merged_batches = list(merged.values())
+
+        # FIFO 凑够 qty_needed
+        remaining = qty_needed
+        sku_lines = []
+        proposed_batch_nos = []
+        for b in merged_batches:
+            if remaining <= 0:
+                break
+            take = min(b["qty"], remaining)
+            price = float(sku_obj.params.get("unit_price", 0)) if sku_obj and sku_obj.params else 0.0
+            sku_lines.append({
+                "idx": idx,
+                "sku_id": sku_id,
+                "sku_name": sku_obj.name if sku_obj else f"SKU{sku_id}",
+                "qty": take,
+                "receiving_point_id": rp_id,
+                "receiving_point_name": rp_name,
+                "batch_no": b["batch_no"],
+                "shipping_point_id": b["point_id"],
+                "shipping_point_name": b["point_name"],
+                "unit_price": price,
+                "subtotal": take * price,
+            })
+            proposed_batch_nos.append(f"{b['batch_no']}({b['point_name']}, {int(take)}件)")
+            remaining -= take
+            total_amt += take * price
+
+        if remaining > 0:
+            errors.append(f"SKU {sku_obj.name if sku_obj else sku_id}（{rp_name}）：库存不足，当前可发 {qty_needed - remaining}，需要 {qty_needed}")
+            continue
+
+        proposed_plan.extend(sku_lines)
+
+        # alternatives：当前行所有可用选项
+        options_for_sku = [
+            {
+                "batch_no": b["batch_no"],
+                "shipping_point_id": b["point_id"],
+                "shipping_point_name": b["point_name"],
+                "available_qty": b["qty"],
+                "warehouse_priority": _warehouse_priority(b["point_type"])[0],
+            }
+            for b in all_options
+        ]
+        alternatives.append({
+            "idx": idx,
+            "sku_id": sku_id,
+            "sku_name": sku_obj.name if sku_obj else f"SKU{sku_id}",
+            "receiving_point_id": rp_id,
+            "receiving_point_name": rp_name,
+            "options": options_for_sku,
+            "current_proposed": " + ".join(proposed_batch_nos),
+        })
+
+    valid = len(errors) == 0 and len(proposed_plan) > 0
+
+    # 生成摘要
+    summary_parts = []
+    by_sku_rp = {}
+    for line in proposed_plan:
+        key = (line["sku_name"], line["receiving_point_name"])
+        if key not in by_sku_rp:
+            by_sku_rp[key] = 0
+        by_sku_rp[key] += line["qty"]
+    for (sname, rpname), total_q in by_sku_rp.items():
+        summary_parts.append(f"{sname}({rpname}): {total_q}件")
+
+    summary = f"共需{len(set(l['shipping_point_name'] for l in proposed_plan))}个仓库发货，" + "，".join(summary_parts)
+
+    return {
+        "valid": valid,
+        "proposed_plan": proposed_plan,
+        "alternatives": alternatives,
+        "total_amt": total_amt,
+        "summary": summary,
+        "errors": errors if errors else None,
     }

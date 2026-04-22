@@ -70,22 +70,22 @@ def inventory_low_stock_listener(session: Session, event: SystemEvent):
     
     # 检查所有物料库存的水位
     LOW_STOCK_THRESHOLD = 10  # 低水位阈值
-    
+
     low_stock_items = []
-    materials = session.query(MaterialInventory).all()
-    
+    materials = session.query(MaterialInventory).filter(MaterialInventory.qty > 0).all()
+
     for mat in materials:
-        if mat.stock_distribution:
-            for warehouse, qty in mat.stock_distribution.items():
-                if qty <= LOW_STOCK_THRESHOLD:
-                    sku = session.query(SKU).get(mat.sku_id)
-                    sku_name = sku.name if sku else f"SKU-{mat.sku_id}"
-                    low_stock_items.append({
-                        "sku_id": mat.sku_id,
-                        "sku_name": sku_name,
-                        "warehouse": warehouse,
-                        "remaining": qty
-                    })
+        if mat.qty <= LOW_STOCK_THRESHOLD:
+            sku = session.query(SKU).get(mat.sku_id)
+            sku_name = sku.name if sku else f"SKU-{mat.sku_id}"
+            point = session.query(Point).get(mat.point_id) if mat.point_id else None
+            point_name = point.name if point else f"点位{mat.point_id}"
+            low_stock_items.append({
+                "sku_id": mat.sku_id,
+                "sku_name": sku_name,
+                "warehouse": point_name,
+                "remaining": mat.qty
+            })
     
     if low_stock_items:
         # 发布库存预警事件

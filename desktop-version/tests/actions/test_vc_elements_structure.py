@@ -427,9 +427,10 @@ class TestMaterialSupplyElements:
         # 预置物料库存（stock_distribution 的 key = str(point_id)，与真实系统一致）
         mat_inv = MaterialInventory(
             sku_id=sku.id,
-            total_balance=500.0,
-            average_price=5.0,
-            stock_distribution={str(wh.id): 500.0}
+            batch_no="20260315-TEST",
+            point_id=wh.id,
+            qty=500.0,
+            latest_purchase_vc_id=None
         )
         db_session.add(mat_inv)
         db_session.flush()
@@ -493,11 +494,10 @@ class TestMaterialSupplyElements:
         db_session.add(customer_pt)
         db_session.flush()
 
-        # 预置两个物料库存（stock_distribution 的 key = str(point_id)，与真实系统一致）
+        # 预置两个物料库存批次
         for sku in [sku1, sku2]:
             mat_inv = MaterialInventory(
-                sku_id=sku.id, total_balance=500.0, average_price=5.0,
-                stock_distribution={str(wh.id): 500.0}
+                sku_id=sku.id, batch_no="20260420-TEST", point_id=wh.id, qty=500.0
             )
             db_session.add(mat_inv)
         db_session.flush()
