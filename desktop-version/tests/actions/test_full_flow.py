@@ -40,7 +40,7 @@ from logic.constants import (
 )
 from models import (
     VirtualContract, Logistics, ExpressOrder, CashFlow,
-    Business, ChannelCustomer, Supplier, SKU, SupplyChain, Point,
+    Business, ChannelCustomer, Supplier, SKU, SupplyChain, SupplyChainItem, Point,
     EquipmentInventory,
 )
 from models import MaterialInventory
@@ -150,9 +150,25 @@ def _create_supplier(session, id, name, category):
 def _create_sc(session, id, supplier_id, sc_type, pricing):
     sc = SupplyChain(
         id=id, supplier_id=supplier_id,
-        type=sc_type, pricing_config=pricing,
+        type=sc_type,
     )
     session.add(sc)
+    session.flush()
+
+    # pricing: {sku_name: price_value} → 创建 SupplyChainItem
+    for sku_name, price_val in pricing.items():
+        sku = session.query(SKU).filter(SKU.name == sku_name).first()
+        if sku:
+            is_floating = (price_val == "浮动" or price_val == "浮动 ")
+            price = 0.0 if is_floating else float(price_val)
+            sci = SupplyChainItem(
+                supply_chain_id=sc.id,
+                sku_id=sku.id,
+                price=price,
+                is_floating=is_floating
+            )
+            session.add(sci)
+
     return sc
 
 def _create_sku(session, id, supplier_id, name):

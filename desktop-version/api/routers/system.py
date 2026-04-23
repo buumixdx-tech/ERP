@@ -47,7 +47,7 @@ def tool_manifest():
         {"name": "create_logistics_plan", "endpoint": "POST /api/v1/logistics/create-plan", "description": "创建物流发货计划", "params": ["vc_id", "orders"]},
         {"name": "confirm_inbound", "endpoint": "POST /api/v1/logistics/confirm-inbound", "description": "确认入库", "params": ["log_id", "sn_list"]},
         {"name": "create_cashflow", "endpoint": "POST /api/v1/finance/create-cashflow", "description": "录入资金流水", "params": ["vc_id", "type", "amount", "transaction_date"]},
-        {"name": "create_supply_chain", "endpoint": "POST /api/v1/supply-chain/create", "description": "创建供应链协议", "params": ["sc.supplier_id", "sc.type", "sc.pricing_config"]},
+        {"name": "create_supply_chain", "endpoint": "POST /api/v1/supply-chain/create", "description": "创建供应链协议", "params": ["sc.supplier_id", "sc.type", "sc.items"]},
         {"name": "get_system_status", "endpoint": "GET /api/v1/system/status", "description": "获取系统状态看板（待办、预警）", "params": []},
         {"name": "list_businesses", "endpoint": "GET /api/v1/business/list", "description": "查询业务列表", "params": ["customer_id?", "status?"]},
         {"name": "get_vc_detail", "endpoint": "GET /api/v1/vc/{id}", "description": "查询虚拟合同详情（含物流、资金流、状态时间线）", "params": ["id"]},

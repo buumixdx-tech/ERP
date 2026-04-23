@@ -1038,14 +1038,20 @@ def show_supply_chain_list():
                 if sel_det_tab == '价格协议明细':
                     st.write("**SKU 协议单价约定**")
                     items_data = []
-                    pricing_dict = sc.get('pricing_config', {})
+                    pricing_dict = sc.get('pricing_dict', {})
                     sku_name_map = sc.get('sku_name_map', {})  # {sku_id: sku_name}
-                    for sku_id_key, price in pricing_dict.items():
+                    for sku_id_key, price_info in pricing_dict.items():
                         sku_display_name = sku_name_map.get(sku_id_key, sku_id_key)
+                        if isinstance(price_info, dict):
+                            price_val = price_info.get("price", 0)
+                            is_floating = price_info.get("is_floating", False)
+                        else:
+                            price_val = price_info if price_info != "浮动" else 0.0
+                            is_floating = (price_info == "浮动")
                         items_data.append({
                             "品类名称": sku_display_name,
-                            "协议单价": price if price != "浮动" else 0.0,
-                            "定价模式": "固定协议价" if price != "浮动" else "按次浮动"
+                            "协议单价": price_val,
+                            "定价模式": "固定协议价" if not is_floating else "按次浮动"
                         })
                     
                     if items_data:
@@ -1102,11 +1108,28 @@ def show_supply_chain_list():
                         c1, c2 = st.columns([1, 1])
                         if c1.form_submit_button("确认并更新供应链数据", type="primary"):
                             try:
+                                # 构建 items 列表（从 pricing_dict 逆向构建）
+                                items = []
+                                for sku_id_key, price_info in pricing_dict.items():
+                                    sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
+                                    if sku_id_int:
+                                        if isinstance(price_info, dict):
+                                            items.append({
+                                                "sku_id": sku_id_int,
+                                                "price": price_info.get("price", 0),
+                                                "is_floating": price_info.get("is_floating", False)
+                                            })
+                                        else:
+                                            items.append({
+                                                "sku_id": sku_id_int,
+                                                "price": price_info if price_info != "浮动" else 0.0,
+                                                "is_floating": (price_info == "浮动")
+                                            })
                                 payload = UpdateSupplyChainSchema(
                                     id=sc['id'],
                                     supplier_name=sc['supplier_name'],
                                     type=sc['type'],
-                                    pricing_config=json.loads(new_pricing_str),
+                                    items=items,
                                     payment_terms=json.loads(new_payment_str)
                                 )
                                 from logic.supply_chain.actions import update_supply_chain_action
@@ -1237,19 +1260,23 @@ def show_supply_chain_import():
         # submit_with_rules 已不再需要，逻辑并入上方
 
         if submit:
-            pricing_config = {}
+            sc_items = []
             for _, row in edited_df.iterrows():
                 if row["品类"]:
                     sku_name = row["品类"]
                     sku = session.query(SKU).filter(SKU.name == sku_name).first()
                     if sku:
-                        pricing_config[str(sku.id)] = row["协议单价"] if row["协议单价"] > 0 else "浮动"
-            
+                        sc_items.append({
+                            "sku_id": sku.id,
+                            "price": row["协议单价"] if row["协议单价"] > 0 else 0.0,
+                            "is_floating": (row["协议单价"] <= 0)
+                        })
+
             payload = CreateSupplyChainSchema(
                 supplier_id=sid,
                 supplier_name=s_name,
                 type=sc_type,
-                pricing_config=pricing_config,
+                items=sc_items,
                 payment_terms={
                     "prepayment_ratio": prepay_ratio_pct / 100.0,
                     "balance_period": balance_days,

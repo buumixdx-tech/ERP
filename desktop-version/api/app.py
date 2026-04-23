@@ -35,8 +35,8 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
     from api.routers import system, master, business, supply_chain, virtual_contract, logistics, finance, rules, query, inventory, events, partner_relations, raw_query

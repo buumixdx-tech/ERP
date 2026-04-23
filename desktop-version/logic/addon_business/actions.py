@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from models import AddonBusiness
 from logic.base import ActionResult
+from api.middleware.error_handler import raise_not_found_error, BusinessError
 from logic.events.dispatcher import emit_event
 from logic.constants import SystemEventType, SystemAggregateType, AddonType, AddonStatus
 from .schemas import CreateAddonSchema, UpdateAddonSchema
@@ -211,7 +212,7 @@ def deactivate_addon_business_action(session: Session, addon_id: int) -> ActionR
     """软删除/失效附加业务"""
     addon = get_addon_detail(session, addon_id)
     if not addon:
-        return ActionResult(success=False, error="附加项不存在")
+        raise_not_found_error("附加政策", str(addon_id))
 
     addon.status = AddonStatus.INACTIVE
 

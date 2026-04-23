@@ -19,8 +19,8 @@ class Point(Base):
     """2. 点位: 存储所有客户的所有点位和所有仓的信息"""
     __tablename__ = 'points'
     id = Column(Integer, primary_key=True)
-    customer_id = Column(Integer, ForeignKey('channel_customers.id'), nullable=True)
-    supplier_id = Column(Integer, ForeignKey('suppliers.id'), nullable=True) 
+    customer_id = Column(Integer, ForeignKey('channel_customers.id', ondelete='SET NULL'), nullable=True)
+    supplier_id = Column(Integer, ForeignKey('suppliers.id', ondelete='SET NULL'), nullable=True)
     name = Column(String(255), nullable=False)
     address = Column(String(512))
     type = Column(String(50)) # 运营点位、客户仓、自有仓、供应商仓
@@ -68,7 +68,7 @@ class EquipmentInventory(Base):
     
     id = Column(Integer, primary_key=True)
     sku_id = Column(Integer, ForeignKey('skus.id'))
-    sn = Column(String(100), unique=True) # 设备序列号
+    sn = Column(String(100), unique=True, nullable=False)  # 设备序列号（必填，保证唯一性）
     operational_status = Column(String(50)) # 库存、运营、处置
     device_status = Column(String(50)) # 正常、维修、损坏、故障、维护、锁机
     virtual_contract_id = Column(Integer, ForeignKey('virtual_contracts.id'), nullable=True)
@@ -84,6 +84,7 @@ class MaterialInventory(Base):
     __tablename__ = 'material_inventory'
     __table_args__ = (
         UniqueConstraint('sku_id', 'batch_no', 'point_id', name='uq_sku_batch_point'),
+        Index('ix_material_inventory_qty', 'qty'),
     )
     id = Column(Integer, primary_key=True)
     sku_id = Column(Integer, ForeignKey('skus.id'))
@@ -130,9 +131,9 @@ class VirtualContract(Base):
     related_vc_id = Column(Integer, ForeignKey('virtual_contracts.id'), nullable=True)
     type = Column(String(100)) # 设备采购、物料供应、物料采购、退货、设备维护
     summary = Column(Text)
-    elements = Column(JSON) # 统一结构：{elements[{id, shipping_point_id, receiving_point_id, sku_id, qty, price, deposit, subtotal, sn_list}], total_amount, payment_terms}
+    elements = Column(JSON)  # 结构因 VC 类型而异，详见 logic/vc/schemas.py 各 CreateVCSchema 文档
     return_direction = Column(String(50), nullable=True) # 退货方向：CUSTOMER_TO_US / US_TO_SUPPLIER
-    deposit_info = Column(JSON) # 应收/实收押金、总额、最后流水 ID、调整原因
+    deposit_info = Column(JSON)  # 押金信息，结构因 VC 类型而异（设备采购有值，库存/物料采购无此字段），详见 logic/vc/schemas.py
     status = Column(String(50)) # 执行、完成、终止
     subject_status = Column(String(50)) # 执行、发货、签收、完成
     cash_status = Column(String(50)) # 执行、预付、完成
@@ -301,8 +302,11 @@ class BankAccount(Base):
 class Business(Base):
     """12. 业务: 对具体业务开展的信息记录"""
     __tablename__ = 'business'
+    __table_args__ = (
+        Index('ix_business_customer_id', 'customer_id'),
+    )
     id = Column(Integer, primary_key=True)
-    customer_id = Column(Integer, ForeignKey('channel_customers.id'))
+    customer_id = Column(Integer, ForeignKey('channel_customers.id', ondelete='SET NULL'))
     status = Column(String(50)) # 前期接洽、业务评估、客户反馈、合作落地、业务开展、业务暂缓、业务终止
     timestamp = Column(DateTime, default=datetime.now)
     details = Column(JSON) # 记录业务演进历史
@@ -348,7 +352,6 @@ class SupplyChain(Base):
     supplier_id = Column(Integer, ForeignKey('suppliers.id'))
     type = Column(String(50)) # 物料 or 设备
     contract_id = Column(Integer, ForeignKey('contracts.id'))
-    pricing_config = Column(JSON) # 兼容旧版
     payment_terms = Column(JSON)  # 兼容旧版
     # elements = Column(JSON)      # 新版：存储 pricing_config, payment_terms 等
 
@@ -356,10 +359,10 @@ class SupplyChain(Base):
     items = relationship("SupplyChainItem", back_populates="supply_chain", cascade="all, delete-orphan")
 
     def get_pricing_dict(self):
-        """统一获取定价配置：优先使用 SupplyChainItem 中间表，备选 JSON 配置"""
+        """统一获取定价配置：只从 SupplyChainItem 中间表获取"""
         if self.items:
             return {str(item.sku_id): {"price": item.price, "is_floating": item.is_floating} for item in self.items}
-        return self.pricing_config or {}
+        return {}
 
 class SupplyChainItem(Base):
     """21. 供应链协议明细: 规范化存储每个 SKU 的价格约定"""
@@ -377,6 +380,9 @@ class SupplyChainItem(Base):
 class Logistics(Base):
     """行动-1. 物流"""
     __tablename__ = 'logistics'
+    __table_args__ = (
+        Index('ix_logistics_timestamp', 'timestamp'),
+    )
     id = Column(Integer, primary_key=True)
     virtual_contract_id = Column(Integer, ForeignKey('virtual_contracts.id'))
     finance_triggered = Column(Boolean, default=False)

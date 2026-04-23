@@ -39,8 +39,7 @@ def base_data(db_session, sample_customer, sample_supplier):
     # 供应链
     sc = SupplyChain(
         supplier_id=sample_supplier.id,
-        type="设备",
-        pricing_config={"测试SKU": 1000}
+        type="设备"
     )
     db_session.add(sc)
     db_session.flush()
@@ -48,6 +47,11 @@ def base_data(db_session, sample_customer, sample_supplier):
     # SKU（设备类）
     sku_equip = SKU(supplier_id=sample_supplier.id, name="测试设备A", type_level1="设备", type_level2="主机")
     db_session.add(sku_equip)
+    db_session.flush()
+
+    from models import SupplyChainItem
+    sci = SupplyChainItem(supply_chain_id=sc.id, sku_id=sku_equip.id, price=1000.0, is_floating=False)
+    db_session.add(sci)
     db_session.flush()
 
     # SKU（物料类）
@@ -81,8 +85,8 @@ def assert_element_item(elem: dict, expected_keys: dict):
     assert "sn_list" in elem, "element 缺少 sn_list"
     assert isinstance(elem["sn_list"], list), "sn_list 必须是 list"
 
-    # id 格式验证：sp{shipping}_rp{receiving}_sku{sku}
-    assert elem["id"] == f"sp{elem['shipping_point_id']}_rp{elem['receiving_point_id']}_sku{elem['sku_id']}"
+    # id 格式验证：sp{shipping}_rp{receiving}_sku{sku}_bn{batch_no}（batch_no 为空时输出 _bn-）
+    assert elem["id"] == f"sp{elem['shipping_point_id']}_rp{elem['receiving_point_id']}_sku{elem['sku_id']}_bn-"
 
     # 小计验证
     assert abs(elem["subtotal"] - elem["qty"] * elem["price"]) < 0.01
@@ -190,7 +194,7 @@ class TestEquipmentProcurementElements:
             "subtotal": 5000.0,
             "sn_list": [],
         })
-        assert item["id"] == f"sp{sup_wh.id}_rp{cust_wh.id}_sku{sku.id}"
+        assert item["id"] == f"sp{sup_wh.id}_rp{cust_wh.id}_sku{sku.id}_bn-"
 
         assert vc.status == VCStatus.EXE
         assert vc.subject_status == SubjectStatus.EXE
@@ -349,14 +353,18 @@ class TestMaterialProcurementElements:
 
         sc = SupplyChain(
             supplier_id=sample_supplier.id,
-            type=SKUType.MATERIAL,
-            pricing_config={"测试物料A": 5.0}
+            type=SKUType.MATERIAL
         )
         db_session.add(sc)
         db_session.flush()
 
         sku = SKU(supplier_id=sample_supplier.id, name="测试物料X", type_level1="物料")
         db_session.add(sku)
+        db_session.flush()
+
+        from models import SupplyChainItem
+        sci = SupplyChainItem(supply_chain_id=sc.id, sku_id=sku.id, price=5.0, is_floating=False)
+        db_session.add(sci)
         db_session.flush()
 
         payload = CreateMatProcurementVCSchema(
@@ -664,7 +672,7 @@ class TestReturnElements:
             "subtotal": 1000.0,
             "sn_list": ["EQSN001"],
         })
-        assert item["id"] == f"sp{cust_op_pt.id}_rp1_sku{sku.id}"
+        assert item["id"] == f"sp{cust_op_pt.id}_rp1_sku{sku.id}_bn-"
 
         # related_vc_id 正确关联
         assert vc.related_vc_id == target_vc_id
@@ -745,7 +753,7 @@ class TestInventoryAllocationElements:
             "subtotal": 0.0,
             "sn_list": [eq1.sn, eq2.sn],
         })
-        assert item["id"] == f"sp1_rp{target_point.id}_sku{base_data['sku_equip'].id}"
+        assert item["id"] == f"sp1_rp{target_point.id}_sku{base_data['sku_equip'].id}_bn-"
 
         # 库存拨付：subject_status 和 cash_status 直接 FINISH
         assert vc.subject_status == SubjectStatus.FINISH
@@ -856,4 +864,4 @@ class TestElementsNoRedundancy:
         assert item["shipping_point_id"] == sup_wh.id
         assert item["receiving_point_id"] == cust_wh.id
         assert item["sku_id"] == sku.id
-        assert item["id"] == f"sp{sup_wh.id}_rp{cust_wh.id}_sku{sku.id}"
+        assert item["id"] == f"sp{sup_wh.id}_rp{cust_wh.id}_sku{sku.id}_bn-"

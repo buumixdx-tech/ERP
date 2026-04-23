@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import Base, SupplyChain
+from models import Base, SupplyChain, SupplyChainItem
 
 
 # 测试数据库配置
@@ -178,16 +178,24 @@ def sample_business(db_session, sample_customer):
 
 
 @pytest.fixture
-def sample_supply_chain(db_session, sample_supplier):
+def sample_supply_chain(db_session, sample_supplier, sample_sku):
     """创建测试用供应链数据"""
     from logic.constants import SKUType
 
     sc = SupplyChain(
         supplier_id=sample_supplier.id,
-        type=SKUType.EQUIPMENT,
-        pricing_config={"测试设备-001": 1000}
+        type=SKUType.EQUIPMENT
     )
     db_session.add(sc)
+    db_session.flush()
+
+    sci = SupplyChainItem(
+        supply_chain_id=sc.id,
+        sku_id=sample_sku.id,
+        price=1000.0,
+        is_floating=False
+    )
+    db_session.add(sci)
     db_session.flush()
 
     return sc

@@ -17,6 +17,7 @@ from logic.vc import (
     UpdateVCSchema,
     DeleteVCSchema
 )
+from api.middleware.error_handler import NotFoundError
 
 
 class TestCreateProcurementVCAction:
@@ -189,16 +190,15 @@ class TestUpdateVCAction:
         assert result.success is True
 
     def test_update_vc_not_found(self, db_session):
-        """❌ VC 不存在"""
+        """❌ VC 不存在时抛出 NotFoundError"""
         payload = UpdateVCSchema(
             id=99999,
             description="描述",
             elements={},
             deposit_info={}
         )
-        result = update_vc_action(db_session, payload)
-
-        assert result.success is False
+        with pytest.raises(NotFoundError):
+            update_vc_action(db_session, payload)
 
 
 class TestDeleteVCAction:
@@ -217,8 +217,7 @@ class TestDeleteVCAction:
         assert result.success is True
 
     def test_delete_vc_not_found(self, db_session):
-        """❌ VC 不存在"""
+        """❌ VC 不存在时抛出 NotFoundError"""
         payload = DeleteVCSchema(id=99999)
-        result = delete_vc_action(db_session, payload)
-
-        assert result.success is False
+        with pytest.raises(NotFoundError):
+            delete_vc_action(db_session, payload)

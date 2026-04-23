@@ -3,6 +3,7 @@ from models import Business, Contract, VirtualContract
 from .schemas import CreateBusinessSchema, UpdateBusinessStatusSchema, AdvanceBusinessStageSchema
 from logic.base import ActionResult
 from logic.events.dispatcher import emit_event
+from api.middleware.error_handler import raise_not_found_error, raise_conflict_error, BusinessError
 from datetime import datetime
 from logic.constants import BusinessStatus, ContractStatus, TimeRuleRelatedType, SystemEventType, SystemAggregateType
 from logic.time_rules.rule_manager import RuleManager
@@ -21,13 +22,15 @@ def create_business_action(session: Session, payload: CreateBusinessSchema) -> A
         return ActionResult(success=True, data={"business_id": new_b.id}, message="业务项已成功创建")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def update_business_status_action(session: Session, payload: UpdateBusinessStatusSchema) -> ActionResult:
     try:
         biz = session.query(Business).get(payload.business_id)
         if not biz:
-            return ActionResult(success=False, error="未找到业务记录")
+            raise_not_found_error("业务", str(payload.business_id))
         
         old_status = biz.status
         if payload.details is not None:
@@ -57,17 +60,19 @@ def update_business_status_action(session: Session, payload: UpdateBusinessStatu
         return ActionResult(success=True, message=f"业务状态已更新至 {payload.status}")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def delete_business_action(session: Session, business_id: int) -> ActionResult:
     try:
         biz = session.query(Business).get(business_id)
         if not biz:
-            return ActionResult(success=False, error="未找到业务记录")
-        
+            raise_not_found_error("业务", str(business_id))
+
         vc_count = session.query(VirtualContract).filter(VirtualContract.business_id == business_id).count()
         if vc_count > 0:
-            return ActionResult(success=False, error=f"该业务下有 {vc_count} 个关联虚拟合同，无法删除")
+            raise_conflict_error(f"该业务下有 {vc_count} 个关联虚拟合同，无法删除")
             
         session.delete(biz)
         emit_event(session, SystemEventType.BUSINESS_DELETED, SystemAggregateType.BUSINESS, business_id)
@@ -75,13 +80,15 @@ def delete_business_action(session: Session, business_id: int) -> ActionResult:
         return ActionResult(success=True, message="业务已成功删除")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def advance_business_stage_action(session: Session, payload: AdvanceBusinessStageSchema) -> ActionResult:
     try:
         biz = session.query(Business).get(payload.business_id)
         if not biz:
-            return ActionResult(success=False, error="未找到业务记录")
+            raise_not_found_error("业务", str(payload.business_id))
             
         old_status = biz.status
         valid_transitions = {
@@ -157,4 +164,6 @@ def advance_business_stage_action(session: Session, payload: AdvanceBusinessStag
         return ActionResult(success=True, data={"contract_id": new_details.get("contract_id")}, message=msg)
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))

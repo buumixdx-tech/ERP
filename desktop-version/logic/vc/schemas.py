@@ -39,7 +39,15 @@ class VCElementSchema(BaseModel):
 
 
 class CreateProcurementVCSchema(BaseModel):
-    """设备采购 / 库存采购 / 物料采购 统一 Schema"""
+    """设备采购 Schema
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 采购明细列表
+        "total_amount": float,             # 总金额
+        "payment_terms": dict             # 结算条款（prepayment_ratio, balance_period, day_rule, start_trigger）
+    }
+    """
     business_id: int = Field(..., description="关联业务ID")
     sc_id: Optional[int] = Field(None, description="供应链协议ID")
     elements: List[VCElementSchema] = Field(..., description="采购明细列表")
@@ -60,7 +68,15 @@ class CreateProcurementVCSchema(BaseModel):
 
 
 class CreateStockProcurementVCSchema(BaseModel):
-    """库存采购 Schema"""
+    """库存采购 Schema（向供应商采购设备，不涉及客户押金）
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 采购明细列表
+        "total_amount": float,             # 总金额
+        "payment_terms": dict             # 结算条款
+    }
+    """
     sc_id: int = Field(..., description="供应链协议ID")
     elements: List[VCElementSchema] = Field(..., description="采购明细")
     total_amt: float = Field(..., ge=0, description="总金额")
@@ -69,7 +85,15 @@ class CreateStockProcurementVCSchema(BaseModel):
 
 
 class CreateMatProcurementVCSchema(BaseModel):
-    """物料采购 Schema"""
+    """物料采购 Schema
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 采购明细列表
+        "total_amount": float,             # 总金额
+        "payment_terms": dict             # 结算条款
+    }
+    """
     sc_id: int = Field(..., description="供应链协议ID")
     elements: List[VCElementSchema] = Field(..., description="物料采购明细")
     total_amt: float = Field(..., gt=0, description="总金额")
@@ -78,7 +102,15 @@ class CreateMatProcurementVCSchema(BaseModel):
 
 
 class CreateMaterialSupplyVCSchema(BaseModel):
-    """物料供应 Schema"""
+    """物料供应 Schema
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 供应明细列表
+        "total_amount": float,             # 总金额
+        "payment_terms": dict             # 结算条款
+    }
+    """
     business_id: int = Field(..., description="关联业务ID")
     elements: List[VCElementSchema] = Field(..., description="供应明细列表")
     total_amt: float = Field(..., ge=0, description="总金额")
@@ -86,7 +118,17 @@ class CreateMaterialSupplyVCSchema(BaseModel):
 
 
 class CreateReturnVCSchema(BaseModel):
-    """退货 Schema"""
+    """退货 Schema（可针对设备采购 VC 或库存拨付 VC 退货，押金通过 CashFlow 系统处理）
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 退货明细列表
+        "goods_amount": float,             # 退货货款金额
+        "deposit_amount": float,           # 退还押金金额
+        "total_refund": float,             # 总退款金额（= goods_amount + deposit_amount）
+        "reason": str                      # 退货原因
+    }
+    """
     target_vc_id: int = Field(..., description="退货目标虚拟合同ID")
     return_direction: str = Field(..., description="退货方向")
     elements: List[VCElementSchema] = Field(..., description="退货明细")
@@ -100,7 +142,14 @@ class CreateReturnVCSchema(BaseModel):
 
 
 class AllocateInventorySchema(BaseModel):
-    """库存拨付 Schema"""
+    """库存拨付 Schema（自有库存设备拨付给客户，可能涉及押金）
+
+    elements JSON 结构：
+    {
+        "elements": [{VCElementSchema}],   # 拨付明细列表
+        "total_amount": float              # 总金额（通常为 0）
+    }
+    """
     business_id: int = Field(..., description="目标业务ID")
     elements: List[VCElementSchema] = Field(..., description="拨付明细")
     description: Optional[str] = Field("", description="备注")

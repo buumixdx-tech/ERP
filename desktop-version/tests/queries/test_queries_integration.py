@@ -165,6 +165,9 @@ class TestQueryInterfaceConsistency:
             'get_valid_shipping_points_for_return_equipment',
             'get_valid_shipping_points_for_return_mat',
             'get_valid_receiving_points_for_return',
+            # 物料批次查询（session-aware）
+            'get_available_batches_by_sku',
+            'get_latest_supply_batches_by_sku',
         }
         violations = [
             name for name, func in inspect.getmembers(vc_queries, inspect.isfunction)

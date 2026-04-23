@@ -143,14 +143,22 @@ class ResponseWrapperMiddleware(BaseHTTPMiddleware):
 
         # 包装为标准格式
         status_code = response.status_code
-        wrapped_response = {
-            "success": 200 <= status_code < 300,
-            "data": original_data if 200 <= status_code < 300 else None,
-            "error": None if 200 <= status_code < 300 else {
-                "code": f"HTTP_{status_code}",
-                "message": self._get_http_error_message(status_code)
+        if 200 <= status_code < 300:
+            wrapped_response = {
+                "success": True,
+                "data": original_data,
+                "error": None,
             }
-        }
+        else:
+            # 保留原始错误信息（来自 ErrorHandlerMiddleware），不做覆盖
+            wrapped_response = {
+                "success": False,
+                "data": None,
+                "error": original_data.get("error") or {
+                    "code": f"HTTP_{status_code}",
+                    "message": self._get_http_error_message(status_code)
+                }
+            }
 
         return JSONResponse(
             status_code=status_code,

@@ -20,7 +20,7 @@ class TestMatProcurementVCAction:
 
     def test_create_mat_procurement_success(self, db_session, sample_supplier):
         """✅ 正常创建物料采购单"""
-        from models import SupplyChain, Point
+        from models import SupplyChain, SupplyChainItem, SKU, Point
         from logic.constants import SKUType
 
         # 创建供应商仓库（发货点）和我们仓库（收货点）
@@ -32,10 +32,19 @@ class TestMatProcurementVCAction:
 
         sc = SupplyChain(
             supplier_id=sample_supplier.id,
-            type=SKUType.MATERIAL,
-            pricing_config={"物料A": 10}
+            type=SKUType.MATERIAL
         )
         db_session.add(sc)
+        db_session.flush()
+
+        sku = db_session.query(SKU).filter(SKU.name == "物料A").first()
+        if not sku:
+            sku = SKU(supplier_id=sample_supplier.id, name="物料A", type_level1="物料", type_level2="原料")
+            db_session.add(sku)
+            db_session.flush()
+
+        sci = SupplyChainItem(supply_chain_id=sc.id, sku_id=sku.id, price=10.0, is_floating=False)
+        db_session.add(sci)
         db_session.flush()
 
         payload = CreateMatProcurementVCSchema(

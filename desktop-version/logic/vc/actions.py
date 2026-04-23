@@ -11,6 +11,7 @@ from logic.constants import (
 from logic.time_rules import RuleManager
 from logic.offset_manager import apply_offset_to_vc
 from logic.events.dispatcher import emit_event
+from api.middleware.error_handler import raise_not_found_error, BusinessError
 from .schemas import (
     CreateProcurementVCSchema, CreateStockProcurementVCSchema, CreateMatProcurementVCSchema,
     CreateMaterialSupplyVCSchema, CreateReturnVCSchema, AllocateInventorySchema,
@@ -433,6 +434,8 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"设备采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def create_material_supply_vc_action(session: Session, payload: CreateMaterialSupplyVCSchema, draft_rules: list = None) -> ActionResult:
@@ -596,6 +599,8 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"物料供应单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, draft_rules: list = None) -> ActionResult:
@@ -813,13 +818,15 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"退货单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
     """底层 VC 数据修正 Action（支持回滚）"""
     try:
         vc = session.query(VirtualContract).get(payload.id)
-        if not vc: return ActionResult(success=False, error="未找到 VC")
+        if not vc: raise_not_found_error("虚拟合同", str(payload.id))
 
         # snapshot_before：捕获修改前的值（UPDATE 类型）
         from logic.transactions import serialize_model
@@ -859,6 +866,8 @@ def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
         return ActionResult(success=True, message="底层数据已更新")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
@@ -869,7 +878,7 @@ def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
 
         vc_id = payload.id
         vc = session.query(VirtualContract).get(vc_id)
-        if not vc: return ActionResult(success=False, error="未找到 VC")
+        if not vc: raise_not_found_error("虚拟合同", str(vc_id))
 
         # FK 完整性检查：检查是否有下游引用阻止删除
         cf_count = session.query(CashFlow).filter(CashFlow.virtual_contract_id == vc_id).count()
@@ -921,6 +930,8 @@ def delete_vc_action(session: Session, payload: DeleteVCSchema) -> ActionResult:
         return ActionResult(success=True, message="该虚拟合同已从系统中完全移除")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcurementVCSchema, draft_rules: list = None) -> ActionResult:
@@ -1062,6 +1073,8 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"物料采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def create_stock_procurement_vc_action(session: Session, payload: CreateStockProcurementVCSchema, draft_rules: list = None) -> ActionResult:
@@ -1204,6 +1217,8 @@ def create_stock_procurement_vc_action(session: Session, payload: CreateStockPro
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"库存采购单 VC-{new_vc.id} 创建成功")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))
 
 def create_inventory_allocation_action(session: Session, payload: AllocateInventorySchema) -> ActionResult:
@@ -1350,4 +1365,6 @@ def create_inventory_allocation_action(session: Session, payload: AllocateInvent
         return ActionResult(success=True, data={"vc_id": new_vc.id}, message=f"库存拨付完成")
     except Exception as e:
         session.rollback()
+        if isinstance(e, BusinessError):
+            raise
         return ActionResult(success=False, error=str(e))

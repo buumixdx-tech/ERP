@@ -14,6 +14,7 @@ from logic.business import (
     UpdateBusinessStatusSchema,
 )
 from logic.constants import BusinessStatus
+from api.middleware.error_handler import NotFoundError
 
 
 class TestCreateBusinessAction:
@@ -138,15 +139,14 @@ class TestUpdateBusinessStatusAction:
         assert result.success is True
 
     def test_update_business_not_found(self, db_session):
-        """❌ 业务不存在"""
+        """❌ 业务不存在时抛出 NotFoundError"""
         payload = UpdateBusinessStatusSchema(
             business_id=99999,
             status="业务评估"
         )
 
-        result = update_business_status_action(db_session, payload)
-
-        assert result.success is False
+        with pytest.raises(NotFoundError):
+            update_business_status_action(db_session, payload)
 
 
 class TestDeleteBusinessAction:
@@ -164,7 +164,6 @@ class TestDeleteBusinessAction:
         assert result.success is True
 
     def test_delete_business_not_found(self, db_session):
-        """❌ 业务不存在"""
-        result = delete_business_action(db_session, 99999)
-
-        assert result.success is False
+        """❌ 业务不存在时抛出 NotFoundError"""
+        with pytest.raises(NotFoundError):
+            delete_business_action(db_session, 99999)

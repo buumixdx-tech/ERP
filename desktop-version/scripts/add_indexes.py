@@ -78,8 +78,16 @@ def add_indexes():
         ("ix_cf_transaction_date", 
          "CREATE INDEX IF NOT EXISTS ix_cf_transaction_date ON cash_flows(transaction_date)"),
         
-        ("ix_cf_vc_type", 
+        ("ix_cf_vc_type",
          "CREATE INDEX IF NOT EXISTS ix_cf_vc_type ON cash_flows(virtual_contract_id, type)"),
+
+        # ========== 物料库存 (MaterialInventory) 索引 ==========
+        ("ix_material_inventory_qty",
+         "CREATE INDEX IF NOT EXISTS ix_material_inventory_qty ON material_inventory(qty)"),
+
+        # ========== 物流 (Logistics) 索引 ==========
+        ("ix_logistics_timestamp",
+         "CREATE INDEX IF NOT EXISTS ix_logistics_timestamp ON logistics(timestamp)"),
     ]
     
     success_count = 0

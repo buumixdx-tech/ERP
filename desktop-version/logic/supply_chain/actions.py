@@ -7,6 +7,21 @@ from logic.constants import SystemEventType, SystemAggregateType, TimeRuleRelate
 from logic.time_rules.rule_manager import RuleManager
 from datetime import datetime
 
+
+def _sync_supply_chain_items(session: Session, sc: SupplyChain, items_data: list):
+    """全量同步 SupplyChainItem 记录：先删后插（利用 cascade）"""
+    sc.items.clear()
+    session.flush()
+    for item in items_data:
+        sci = SupplyChainItem(
+            supply_chain_id=sc.id,
+            sku_id=item.sku_id,
+            price=item.price,
+            is_floating=item.is_floating
+        )
+        session.add(sci)
+
+
 def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchema, template_rules: list = None) -> ActionResult:
     """创建或更新供应链协议 Action"""
     try:
@@ -21,8 +36,8 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
         c_num = payload.contract_num or f"SC-{payload.supplier_id}-{payload.type}-{datetime.now().strftime('%Y%m%d')}"
 
         if existing_sc:
-            existing_sc.pricing_config = payload.pricing_config
             existing_sc.payment_terms = payload.payment_terms
+            _sync_supply_chain_items(session, existing_sc, payload.items)
             sc_id = existing_sc.id
             msg = f"已更新供应商 {payload.supplier_name} 的 {payload.type} 协议"
             emit_event(session, SystemEventType.SUPPLY_CHAIN_UPDATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
@@ -32,11 +47,11 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
             new_sc = SupplyChain(
                 supplier_id=payload.supplier_id,
                 type=payload.type,
-                pricing_config=payload.pricing_config,
                 payment_terms=payload.payment_terms
             )
             session.add(new_sc)
             session.flush()
+            _sync_supply_chain_items(session, new_sc, payload.items)
             sc_id = new_sc.id
             msg = f"已为供应商 {payload.supplier_name} 创建新的 {payload.type} 协议"
             emit_event(session, SystemEventType.SUPPLY_CHAIN_CREATED, SystemAggregateType.SUPPLY_CHAIN, sc_id, {
@@ -66,16 +81,17 @@ def create_supply_chain_action(session: Session, payload: CreateSupplyChainSchem
         session.rollback()
         return ActionResult(success=False, error=str(e))
 
+
 def delete_supply_chain_action(session: Session, payload: DeleteSupplyChainSchema) -> ActionResult:
     """物理删除供应链协议 Action"""
     try:
         sc = session.query(SupplyChain).get(payload.id)
         if not sc: return ActionResult(success=False, error="协议不存在")
-        
+
         from models import VirtualContract
         if session.query(VirtualContract).filter(VirtualContract.supply_chain_id == sc.id).count() > 0:
             return ActionResult(success=False, error="该协议已有对应合同执行，无法删除")
-            
+
         session.delete(sc)
         emit_event(session, SystemEventType.SUPPLY_CHAIN_DELETED, SystemAggregateType.SUPPLY_CHAIN, sc.id)
         session.commit()
@@ -84,6 +100,7 @@ def delete_supply_chain_action(session: Session, payload: DeleteSupplyChainSchem
         session.rollback()
         return ActionResult(success=False, error=str(e))
 
+
 def update_supply_chain_action(session: Session, payload: UpdateSupplyChainSchema) -> ActionResult:
     """更新供应链协议 Action"""
     try:
@@ -91,8 +108,8 @@ def update_supply_chain_action(session: Session, payload: UpdateSupplyChainSchem
         if not sc: return ActionResult(success=False, error="协议不存在")
 
         sc.type = payload.type
-        sc.pricing_config = payload.pricing_config
         sc.payment_terms = payload.payment_terms
+        _sync_supply_chain_items(session, sc, payload.items)
 
         # 更新付款条款时间规则
         if payload.payment_terms:

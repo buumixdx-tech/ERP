@@ -198,7 +198,7 @@ class TestTimeRuleInheritance:
             supplier_id=self.s1_id,
             supplier_name="测试供应商s1",
             type="设备",
-            pricing_config={"测试设备-01": 1000.0},
+            items=[{"sku_id": self.sku_id, "price": 1000.0, "is_floating": False}],
             payment_terms={
                 "prepayment_ratio": 0.5,
                 "balance_period": 30,
@@ -304,7 +304,7 @@ class TestTimeRuleInheritance:
         # 创建供应链（直接创建，不需要推进状态）
         result = create_supply_chain_action(self.session, CreateSupplyChainSchema(
             supplier_id=self.s1_id, supplier_name="测试供应商s1", type="设备",
-            pricing_config={"测试设备-01": 1000.0},
+            items=[{"sku_id": self.sku_id, "price": 1000.0, "is_floating": False}],
             payment_terms={"prepayment_ratio": 0.5, "balance_period": 30, "day_rule": "自然日", "start_trigger": "入库"}
         ))
         assert result.success is True

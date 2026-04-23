@@ -46,16 +46,7 @@ def get_supply_chain_with_pricing(
         supplier = session.query(Supplier).get(chain.supplier_id)
         
         # 解析定价配置
-        pricing_dict = {}
-        if chain.pricing_config:
-            import json
-            try:
-                if isinstance(chain.pricing_config, str):
-                    pricing_dict = json.loads(chain.pricing_config)
-                else:
-                    pricing_dict = chain.pricing_config
-            except:
-                pricing_dict = {}
+        pricing_dict = chain.get_pricing_dict()
         
         result.append({
             "id": chain.id,
@@ -122,7 +113,7 @@ def get_supply_chains_for_ui(
             supplier = session.query(Supplier).get(chain.supplier_id)
 
             # 解析定价配置
-            pricing_dict = chain.get_pricing_dict() if hasattr(chain, 'get_pricing_dict') else (chain.pricing_config or {})
+            pricing_dict = chain.get_pricing_dict()
 
             # 解析结算条款
             payment_terms = chain.payment_terms or {}
@@ -193,7 +184,7 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
         supplier = session.query(Supplier).get(chain.supplier_id)
         
         # 解析定价配置
-        pricing_dict = chain.get_pricing_dict() if hasattr(chain, 'get_pricing_dict') else (chain.pricing_config or {})
+        pricing_dict = chain.get_pricing_dict()
 
         # 格式化定价明细（pricing_config 的 key 已改为 sku_id，需查询 SKU 名称用于显示）
         pricing_details = []
@@ -227,7 +218,6 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
             "type_label": _get_sc_type_label(chain.type),
             "status": "active",
             "status_label": "正常",
-            "pricing_config": chain.pricing_config or {},
             "pricing_details": pricing_details,
             "sku_name_map": sku_name_map,
             "pricing_count": len(pricing_details),

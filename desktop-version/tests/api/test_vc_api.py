@@ -44,7 +44,7 @@ class TestVCAPI:
         assert data["success"] is True
 
     def test_get_vc_detail_not_found(self, client: TestClient):
-        """✅ 获取不存在的 VC 返回错误"""
+        """✅ 获取不存在的 VC 返回 404"""
         # Given & When
         response = client.get(
             "/api/v1/vc/99999",
@@ -52,10 +52,7 @@ class TestVCAPI:
         )
 
         # Then
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is False
-        assert "error" in data
+        assert response.status_code == 404
 
     def test_vc_detail_includes_relations(self, client: TestClient, db_session, monkeypatch):
         """✅ 详情接口包含关联数据"""
@@ -107,7 +104,7 @@ class TestVCAPI:
         assert "cash_flows" in data["data"]
 
     def test_update_vc_not_found(self, client: TestClient):
-        """❌ 更新不存在的 VC"""
+        """❌ 更新不存在的 VC 返回 404"""
         # Given
         payload = {
             "vc_id": 99999,
@@ -117,33 +114,25 @@ class TestVCAPI:
         }
 
         # When
-        response = client.post(
+        response = client.put(
             "/api/v1/vc/update",
             json=payload,
             headers=API_HEADERS
         )
 
         # Then
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is False
+        assert response.status_code == 404
 
     def test_delete_vc_not_found(self, client: TestClient):
-        """❌ 删除不存在的 VC"""
-        # Given
-        payload = {"vc_id": 99999}
-
-        # When
-        response = client.post(
-            "/api/v1/vc/delete",
-            json=payload,
+        """❌ 删除不存在的 VC 返回 404"""
+        # Given & When
+        response = client.delete(
+            "/api/v1/vc/delete?vc_id=99999",
             headers=API_HEADERS
         )
 
         # Then
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is False
+        assert response.status_code == 404
 
 
 # 为 pytest 提供的 client fixture
