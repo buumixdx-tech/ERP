@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import List, Optional, Dict
 from datetime import datetime
 from logic.time_rules.schemas import TimeRuleSchema
@@ -6,6 +6,7 @@ from logic.time_rules.schemas import TimeRuleSchema
 
 class VCElementSchema(BaseModel):
     """统一 VC elements 条目结构：按(shipping_point_id, receiving_point_id, sku_id, batch_no)唯一确定"""
+    model_config = ConfigDict(extra='allow')
     shipping_point_id: int = Field(..., description="发货点位ID")
     receiving_point_id: int = Field(..., description="收货点位ID")
     sku_id: int = Field(..., description="SKU ID")
@@ -28,8 +29,8 @@ class VCElementSchema(BaseModel):
     @model_validator(mode='after')
     def validate_subtotal(self) -> 'VCElementSchema':
         expected = self.qty * self.price
-        if abs(self.subtotal - expected) > 0.01:
-            raise ValueError(f"小计 {self.subtotal} 与 qty×price ({expected}) 不符")
+        if self.subtotal < expected - 0.01:
+            raise ValueError(f"小计 {self.subtotal} 不能小于 qty×price ({expected})")
         return self
 
     @property
@@ -139,6 +140,15 @@ class CreateReturnVCSchema(BaseModel):
     total_refund: float = Field(..., ge=0, description="总退款金额")
     reason: Optional[str] = Field("", description="退货原因")
     description: Optional[str] = Field("", description="备注")
+
+    @model_validator(mode='after')
+    def validate_return_elements(self) -> 'CreateReturnVCSchema':
+        for elem in self.elements:
+            # 物料退货必须指定 batch_no；设备退货通过 sn/sn_list 标识，不要求 batch_no
+            has_sn = bool(elem.sn_list) or (elem.sn and elem.sn != "-")
+            if elem.batch_no is None and not has_sn:
+                raise ValueError("物料退货必须指定 batch_no")
+        return self
 
 
 class AllocateInventorySchema(BaseModel):

@@ -372,9 +372,9 @@ class TestDepositFullLifecycle:
 
         vc = db_session.query(VirtualContract).get(vc_id)
         new_elements = {
-            "elements": [
+            "items": [
                 {**e, "qty": 5} if e.get("sku_id") == 17 else e
-                for e in (vc.elements.get("elements") or [])
+                for e in (vc.elements.get("items") or [])
             ],
             "total_amount": 14750,
             "payment_terms": {},

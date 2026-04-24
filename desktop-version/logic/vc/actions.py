@@ -321,7 +321,7 @@ def create_procurement_vc_action(session: Session, payload: CreateProcurementVCS
             supply_chain_id=sc.id if sc else None,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
@@ -506,7 +506,7 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
             business_id=payload.business_id,
             type=VCType.MATERIAL_SUPPLY,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payment_terms
             },
@@ -604,110 +604,114 @@ def create_material_supply_vc_action(session: Session, payload: CreateMaterialSu
         return ActionResult(success=False, error=str(e))
 
 def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, draft_rules: list = None) -> ActionResult:
-    """退货执行单创建 Action（支持回滚）"""
+    """退货执行单创建 Action（支持回滚）
+
+    物料退货按批次维度校验：
+    - 从 get_returnable_items 获取每个批次的跨VC汇总可退量
+    - 校验 payload.elements 中每个 element 的 qty <= 可退量
+    - 向供应商退货时 deposit_amount 必须为 0
+    - elements 中附加 source_vc_ids、original_qty（系统内部字段）
+    - 不调用 apply_offset_to_vc（退货VC不自动核销）
+    """
     import os
     import json as _json
     from logic.finance.engine import VOUCHER_DIR
     try:
         target_vc = session.query(VirtualContract).get(payload.target_vc_id)
-        if not target_vc: return ActionResult(success=False, error="未找到目标虚拟合同")
+        if not target_vc:
+            return ActionResult(success=False, error="未找到目标虚拟合同")
 
         if target_vc.subject_status not in [SubjectStatus.EXE, SubjectStatus.FINISH]:
             return ActionResult(success=False, error=f"原单标的状态为 {target_vc.subject_status}，此时无法发起退货")
 
+        # -------------------------------------------------------
+        # 批次维度可退量查询
+        # -------------------------------------------------------
         from logic.services import get_returnable_items
         allowed_items = get_returnable_items(session, target_vc.id, payload.return_direction)
-        allowed_map = {}
-        for ai in allowed_items:
-            key = (ai['sku_id'], ai.get('point_name'), ai.get('sn', '-'))
-            allowed_map[key] = allowed_map.get(key, 0) + ai['qty']
 
-        for ri in payload.elements:
-            pt_name = _get_point_name(session, ri.shipping_point_id)
-            sn = ri.sn_list[0] if ri.sn_list else '-'
-            key = (ri.sku_id, pt_name, sn)
-            avail = allowed_map.get(key, 0)
-            if ri.qty > avail:
-                return ActionResult(success=False, error=f"退货越界: SKU {ri.sku_id} 在 {pt_name} 申请退货 {ri.qty}，而最大可退仅 {avail}")
+        # 构建 allowed_map: key = (sku_id, batch_no), value = 可退量
+        allowed_map = {}
+        source_vc_ids_map = {}   # key = (sku_id, batch_no) -> list of source_vc_ids
+        original_qty_map = {}    # key = (sku_id, batch_no) -> original_qty
+        for ai in allowed_items:
+            key = (ai['sku_id'], ai.get('batch_no'))
+            allowed_map[key] = allowed_map.get(key, 0) + ai['qty']
+            if ai.get('source_vc_ids'):
+                source_vc_ids_map[key] = ai['source_vc_ids']
+            if 'original_qty' in ai:
+                original_qty_map[key] = original_qty_map.get(key, 0) + ai['original_qty']
 
         # -------------------------------------------------------
-        # 商业逻辑：确定退货收货点 + 校验收货点/发货点范围
+        # 批次维度越界校验
+        # -------------------------------------------------------
+        for ri in payload.elements:
+            key = (ri.sku_id, ri.batch_no)
+            avail = allowed_map.get(key, 0)
+            if ri.qty > avail:
+                bn = ri.batch_no or '-'
+                return ActionResult(success=False, error=f"退货越界: SKU {ri.sku_id} 批次 {bn} 申请退货 {ri.qty}，而最大可退仅 {avail}")
+
+        # 向供应商退货时，押金必须为 0
+        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER and payload.deposit_amount > 0:
+            return ActionResult(success=False, error="向供应商退货时 deposit_amount 必须为 0")
+
+        # -------------------------------------------------------
+        # 商业逻辑：确定退货收货点
         # -------------------------------------------------------
         target_type = target_vc.type
         is_equipment_target = target_type in (VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT)
-        is_mat_or_stock_target = target_type in (VCType.MATERIAL_PROCUREMENT,)
+        is_mat_target = target_type == VCType.MATERIAL_PROCUREMENT
 
-        # 4.2/4.3: 获取target_vc的供应链供应商仓库（退货目的地）
-        rp_supplier = None
-        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER and is_mat_or_stock_target:
-            if target_vc.supply_chain_id:
-                sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
-                if sc:
-                    rp_supplier = _get_supplier_warehouse(session, sc.supplier_id)
-            if not rp_supplier:
+        rp_target = None  # 退货目的地（收货点）
+        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER:
+            if is_equipment_target:
+                if target_vc.supply_chain_id:
+                    sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
+                    if sc:
+                        rp_target = _get_supplier_warehouse(session, sc.supplier_id)
+            elif is_mat_target:
+                if target_vc.supply_chain_id:
+                    sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
+                    if sc:
+                        rp_target = _get_supplier_warehouse(session, sc.supplier_id)
+            if not rp_target:
                 return ActionResult(success=False, error="无法确定退货目的地供应商仓库")
+        else:
+            # 客户退回：我方仓库
+            rp_target = DEFAULT_WAREHOUSE_ID
 
-        # 4.1: 获取挂钩vc供应链的供应商仓库（US_TO_SUPPLIER时）
-        rp_equipment_supplier = None
-        if payload.return_direction == ReturnDirection.US_TO_SUPPLIER and is_equipment_target:
-            if target_vc.supply_chain_id:
-                sc = session.query(SupplyChain).get(target_vc.supply_chain_id)
-                if sc:
-                    rp_equipment_supplier = _get_supplier_warehouse(session, sc.supplier_id)
-            if not rp_equipment_supplier:
-                return ActionResult(success=False, error="无法确定设备退货目的地供应商仓库")
-
-        # 4.1: 获取"有该sku的客户运营点位"列表（发货点允许范围）
-        # 4.2/4.3: 获取"我们有该sku库存的点位"列表（发货点允许范围）
-        allowed_shipping_by_sku = {}
-        if is_equipment_target:
-            # 4.1: 按sku查客户运营点位下有该设备的点位
-            for e in payload.elements:
-                if e.sku_id not in allowed_shipping_by_sku:
-                    # 从target_vc关联的客户查
-                    biz = session.query(Business).get(target_vc.business_id) if target_vc.business_id else None
-                    cust_id = biz.customer_id if biz else None
-                    if cust_id:
-                        allowed_shipping_by_sku[e.sku_id] = set(
-                            _get_customer_points_with_sku(session, cust_id, e.sku_id)
-                        )
-                    else:
-                        allowed_shipping_by_sku[e.sku_id] = set()
-        elif is_mat_or_stock_target:
-            # 4.2/4.3: 按sku查我们有库存的点位
-            for e in payload.elements:
-                if e.sku_id not in allowed_shipping_by_sku:
-                    allowed_shipping_by_sku[e.sku_id] = set(_get_our_points_with_sku(session, e.sku_id))
-
-        # 收货点 + 全面校验收货点/发货点
+        # -------------------------------------------------------
+        # 构建 clean_elems，附加 source_vc_ids / original_qty
+        # -------------------------------------------------------
         clean_elems = []
         for e in payload.elements:
-            allowed_sp = allowed_shipping_by_sku.get(e.sku_id, set())
-            if not allowed_sp:
-                return ActionResult(success=False, error=f"SKU {e.sku_id} 没有可退货的库存点位")
-
-            # 校验收货点是否在允许范围内
-            if e.shipping_point_id not in allowed_sp:
-                return ActionResult(success=False, error=f"发货点 {e.shipping_point_id} 不在允许范围内")
-
-            # 确定收货点
-            if payload.return_direction == ReturnDirection.US_TO_SUPPLIER:
-                if is_equipment_target:
-                    rp = rp_equipment_supplier  # 供应商仓库
-                else:
-                    rp = rp_supplier  # 供应商仓库
-            else:
-                rp = DEFAULT_WAREHOUSE_ID  # 我们仓库
+            key = (e.sku_id, e.batch_no)
+            src_vcs = source_vc_ids_map.get(key, [target_vc.id])
+            orig_qty = original_qty_map.get(key, e.qty)
 
             corrected = VCElementSchema(
                 shipping_point_id=e.shipping_point_id,
-                receiving_point_id=rp,
-                sku_id=e.sku_id, qty=e.qty, price=e.price,
-                deposit=e.deposit, subtotal=e.subtotal, sn_list=e.sn_list
+                receiving_point_id=rp_target,
+                sku_id=e.sku_id,
+                batch_no=e.batch_no,
+                qty=e.qty,
+                price=e.price,
+                deposit=e.deposit,
+                subtotal=e.subtotal,
+                sn_list=e.sn_list,
+                addon_business_ids=e.addon_business_ids,
+                # 系统内部字段（extra=allow）
+                source_vc_ids=src_vcs,
+                original_qty=orig_qty,
             )
-            clean_elems.append(_elem_to_dict(corrected))
+            elem_dict = _elem_to_dict(corrected)
+            # 确保系统内部字段被存入
+            elem_dict['source_vc_ids'] = src_vcs
+            elem_dict['original_qty'] = orig_qty
+            clean_elems.append(elem_dict)
 
-        # 应用附加业务政策（价格覆盖 + 标记 addon_business_ids）
+        # 应用附加业务政策
         clean_elems = _apply_addons_to_elements(session, target_vc.business_id, clean_elems)
 
         # ============ 记录创建前的最大 ID ============
@@ -718,20 +722,26 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         max_ev_id_before = session.query(func.max(SystemEvent.id)).scalar() or 0
 
         new_vc = VirtualContract(
-            related_vc_id=payload.target_vc_id, business_id=target_vc.business_id,
-            supply_chain_id=target_vc.supply_chain_id, type=VCType.RETURN,
-            status=VCStatus.EXE, subject_status=SubjectStatus.EXE,
+            related_vc_id=payload.target_vc_id,
+            business_id=target_vc.business_id,
+            supply_chain_id=target_vc.supply_chain_id,
+            type=VCType.RETURN,
+            status=VCStatus.EXE,
+            subject_status=SubjectStatus.EXE,
             cash_status=CashStatus.EXE if payload.total_refund > 0 else CashStatus.FINISH,
             description=payload.description,
             return_direction=payload.return_direction,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "goods_amount": payload.goods_amount,
                 "deposit_amount": payload.deposit_amount,
                 "total_refund": payload.total_refund,
                 "total_amount": payload.total_refund,
-                "reason": payload.reason
-            }
+                "reason": payload.reason,
+                "logistics_cost": payload.logistics_cost,
+                "logistics_bearer": payload.logistics_bearer,
+            },
+            deposit_info={"should_receive": payload.deposit_amount, "total_deposit": 0.0},
         )
         session.add(new_vc)
         session.flush()
@@ -740,17 +750,24 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         if draft_rules:
             for r in draft_rules:
                 session.add(TimeRule(
-                    related_id=new_vc.id, related_type=TimeRuleRelatedType.VIRTUAL_CONTRACT,
-                    party=r.get("party"), trigger_event=r.get("trigger_event"),
-                    target_event=r.get("target_event"), offset=r.get("offset"),
-                    unit=r.get("unit"), direction=r.get("direction"),
-                    inherit=r.get("inherit", 0), status=r.get("status", TimeRuleStatus.ACTIVE),
+                    related_id=new_vc.id,
+                    related_type=TimeRuleRelatedType.VIRTUAL_CONTRACT,
+                    party=r.get("party"),
+                    trigger_event=r.get("trigger_event"),
+                    target_event=r.get("target_event"),
+                    offset=r.get("offset"),
+                    unit=r.get("unit"),
+                    direction=r.get("direction"),
+                    inherit=r.get("inherit", 0),
+                    status=r.get("status", TimeRuleStatus.ACTIVE),
                     timestamp=datetime.now()
                 ))
-        apply_offset_to_vc(session, new_vc)
+        # 注意：不调用 apply_offset_to_vc，退货VC不自动核销
         emit_event(session, SystemEventType.VC_CREATED, SystemAggregateType.VIRTUAL_CONTRACT, new_vc.id, {
-            "type": new_vc.type, "business_id": new_vc.business_id,
-            "related_vc_id": new_vc.related_vc_id, "total_refund": payload.total_refund
+            "type": new_vc.type,
+            "business_id": new_vc.business_id,
+            "related_vc_id": new_vc.related_vc_id,
+            "total_refund": payload.total_refund,
         })
         session.flush()
 
@@ -821,6 +838,8 @@ def create_return_vc_action(session: Session, payload: CreateReturnVCSchema, dra
         if isinstance(e, BusinessError):
             raise
         return ActionResult(success=False, error=str(e))
+
+
 
 def update_vc_action(session: Session, payload: UpdateVCSchema) -> ActionResult:
     """底层 VC 数据修正 Action（支持回滚）"""
@@ -982,7 +1001,7 @@ def create_mat_procurement_vc_action(session: Session, payload: CreateMatProcure
             supply_chain_id=payload.sc_id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
@@ -1125,7 +1144,7 @@ def create_stock_procurement_vc_action(session: Session, payload: CreateStockPro
             supply_chain_id=payload.sc_id,
             type=VCType.STOCK_PROCUREMENT,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "total_amount": payload.total_amt,
                 "payment_terms": payload.payment
             },
@@ -1299,7 +1318,7 @@ def create_inventory_allocation_action(session: Session, payload: AllocateInvent
             business_id=payload.business_id,
             type=VCType.INVENTORY_ALLOCATION,
             elements={
-                "elements": clean_elems,
+                "items": clean_elems,
                 "total_amount": 0.0
             },
             deposit_info={"should_receive": 0.0, "total_deposit": 0.0},

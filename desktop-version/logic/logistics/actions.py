@@ -162,7 +162,7 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
             from logic.services import get_logistics_finance_context
             ctx = get_logistics_finance_context(session, payload.log_id)
             if ctx:
-                for item in (vc.elements or {}).get("elements", []):
+                for item in (vc.elements or {}).get("items", []):
                     sku_id = item.get("sku_id")
                     if sku_id:
                         mi = session.query(MaterialInventory).filter(MaterialInventory.sku_id == sku_id).first()
@@ -182,7 +182,7 @@ def confirm_inbound_action(session: Session, payload: ConfirmInboundSchema) -> A
 
         # SKU 旧值（MATERIAL_PROCUREMENT 价格更新）
         if vc and vc.type == VCType.MATERIAL_PROCUREMENT:
-            for item in (vc.elements or {}).get("elements", []):
+            for item in (vc.elements or {}).get("items", []):
                 sku_id = item.get("sku_id")
                 if sku_id:
                     sku = session.query(SKU).get(sku_id)

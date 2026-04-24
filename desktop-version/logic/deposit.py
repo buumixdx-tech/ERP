@@ -72,7 +72,7 @@ def process_vc_deposit(session, vc_id):
     new_should_receive = 0.0
     
     if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
-        items = elements.get("elements") or []
+        items = elements.get("items") or []
         if not items:
             return
 
@@ -179,7 +179,7 @@ def process_vc_deposit(session, vc_id):
     # 获取 SKU 与约定押金的映射
     sku_to_agreed_deposit = {}
     if vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
-        items = elements.get("elements") or []
+        items = elements.get("items") or []
         for item in items:
             sid = item.get("sku_id")
             if sid:

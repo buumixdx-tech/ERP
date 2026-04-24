@@ -595,7 +595,7 @@ def show_logistics_page():
 
                         # 1. Advanced Material Supply format - group by destination AND source warehouse
                         if vc['type'] == VCType.MATERIAL_SUPPLY:
-                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            vc_elems = vc['elements'].get("items", []) if vc['elements'] else []
                             # 兼容旧结构：points[]
                             if not vc_elems:
                                 vc_elems = vc['elements'].get("points", []) if vc['elements'] else []
@@ -705,7 +705,7 @@ def show_logistics_page():
 
                         # 2. Return Order format - group by destination warehouse
                         elif vc['type'] == VCType.RETURN:
-                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            vc_elems = vc['elements'].get("items", []) if vc['elements'] else []
                             # 兼容旧结构：return_items[]
                             if not vc_elems:
                                 vc_elems = vc['elements'].get("return_items", []) if vc['elements'] else []
@@ -801,7 +801,7 @@ def show_logistics_page():
 
                         # 3. 设备/库存采购 - 按收货点位分组
                         elif vc['type'] in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
-                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            vc_elems = vc['elements'].get("items", []) if vc['elements'] else []
                             if vc_elems:
                                 # 批量查询SKU名称
                                 sku_ids = list(set(item.get("sku_id") for item in vc_elems if item.get("sku_id")))
@@ -845,7 +845,7 @@ def show_logistics_page():
 
                         # 4. 物料采购 - 按入库点位分组
                         elif vc['type'] == VCType.MATERIAL_PROCUREMENT:
-                            vc_elems = vc['elements'].get("elements", []) if vc['elements'] else []
+                            vc_elems = vc['elements'].get("items", []) if vc['elements'] else []
                             if vc_elems:
                                 # 批量查询SKU名称
                                 sku_ids = list(set(item.get("sku_id") for item in vc_elems if item.get("sku_id")))

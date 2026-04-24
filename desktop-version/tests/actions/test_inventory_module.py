@@ -165,7 +165,7 @@ class TestEquipmentProcurementInventory:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
-            elements={"elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 2, "price": 1000}], "total_amount": 2000},
+            elements={"items": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 2, "price": 1000}], "total_amount": 2000},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
@@ -211,7 +211,7 @@ class TestStockProcurementInventory:
             business_id=business.id,
             type=VCType.STOCK_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
+                "items": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -280,7 +280,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -347,7 +347,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 200, "price": 10}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 200, "price": 10}],
                 "total_amount": 2000
             },
             deposit_info={},
@@ -441,7 +441,7 @@ class TestMaterialProcurementInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 6}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 6}],
                 "total_amount": 180
             },
             deposit_info={},
@@ -519,7 +519,7 @@ class TestMaterialSupplyInventory:
             business_id=business.id,
             type=VCType.MATERIAL_SUPPLY,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 12}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "price": 12}],
                 "total_amount": 360
             },
             deposit_info={},
@@ -595,7 +595,7 @@ class TestMaterialSupplyInventory:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.MATERIAL_SUPPLY,
-            elements={"elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 20, "price": 10}], "total_amount": 200},
+            elements={"items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 20, "price": 10}], "total_amount": 200},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,
@@ -658,14 +658,32 @@ class TestReturnInventory:
         db_session.add(business)
         db_session.flush()
 
+        # 创建原采购VC（作为 related_vc）
+        orig_vc = VirtualContract(
+            business_id=business.id,
+            type=VCType.MATERIAL_PROCUREMENT,
+            elements={
+                "items": [{"sku_id": material_sku.id, "qty": 100, "price": 10}],
+                "total_amount": 1000
+            },
+            deposit_info={},
+            status=VCStatus.EXE,
+            subject_status=SubjectStatus.EXE,
+            cash_status=CashStatus.EXE
+        )
+        db_session.add(orig_vc)
+        db_session.flush()
+
+        # 退货VC
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.RETURN,
+            related_vc_id=orig_vc.id,
+            return_direction=ReturnDirection.CUSTOMER_TO_US,
             elements={
-                "return_items": [
-                    {"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 20, "sn": "-", "price": 10}
+                "items": [
+                    {"sku_id": material_sku.id, "qty": 20, "price": 10, "batch_no": batch_no}
                 ],
-                "return_direction": ReturnDirection.CUSTOMER_TO_US,
                 "total_refund": 200
             },
             deposit_info={},
@@ -737,7 +755,7 @@ class TestReturnInventory:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 100, "price": 10}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -753,11 +771,11 @@ class TestReturnInventory:
             business_id=business.id,
             type=VCType.RETURN,
             related_vc_id=orig_vc.id,
+            return_direction=ReturnDirection.US_TO_SUPPLIER,
             elements={
-                "return_items": [
-                    {"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 30, "sn": "-", "price": 10}
+                "items": [
+                    {"sku_id": material_sku.id, "qty": 30, "price": 10, "batch_no": batch_no}
                 ],
-                "return_direction": ReturnDirection.US_TO_SUPPLIER,
                 "total_refund": 300
             },
             deposit_info={},
@@ -796,9 +814,9 @@ class TestReturnInventory:
         ).first()
         assert batch.qty == 70.0  # 100 - 30
 
-        # 验证采购统计回退到原采购VC的数据
+        # 验证采购统计增量回退（退货量从历史采购量中扣除）
         db_session.refresh(material_sku)
-        assert material_sku.params.get("historical_purchase_qty") == 100.0
+        assert material_sku.params.get("historical_purchase_qty") == 70.0  # 100 - 30
         assert material_sku.params.get("average_price") == 10.0
 
 
@@ -817,7 +835,7 @@ class TestInventoryEdgeCases:
             business_id=business.id,
             type=VCType.EQUIPMENT_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
+                "items": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 1, "price": 1000}],
                 "total_amount": 1000
             },
             deposit_info={},
@@ -874,7 +892,7 @@ class TestInventoryEdgeCases:
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
             elements={
-                "elements": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 150, "price": 5}],
+                "items": [{"sku_id": material_sku.id, "sku_name": material_sku.name, "qty": 150, "price": 5}],
                 "total_amount": 750
             },
             deposit_info={},
@@ -938,7 +956,7 @@ class TestInventoryEdgeCases:
         vc = VirtualContract(
             business_id=business.id,
             type=VCType.MATERIAL_PROCUREMENT,
-            elements={"elements": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 10, "price": 100}], "total_amount": 1000},
+            elements={"items": [{"sku_id": sample_sku.id, "sku_name": sample_sku.name, "qty": 10, "price": 100}], "total_amount": 1000},
             deposit_info={},
             status=VCStatus.EXE,
             subject_status=SubjectStatus.EXE,

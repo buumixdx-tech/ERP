@@ -479,7 +479,7 @@ def get_valid_shipping_points_for_return_equipment(session, target_vc_id: int) -
     if not cust_point_ids:
         return []
     elements = target_vc.elements or {}
-    sku_ids = [e["sku_id"] for e in elements.get("elements", [])]
+    sku_ids = [e["sku_id"] for e in elements.get("items", [])]
     if not sku_ids:
         return []
     eqs = session.query(EquipmentInventory).filter(
@@ -555,7 +555,7 @@ def get_latest_supply_batches_by_sku(session, business_id: int) -> dict[tuple, s
 
     result = {}  # (sku_id, receiving_point_id) -> last_batch_no
     for vc in vcs:
-        elems = (vc.elements or {}).get("elements", [])
+        elems = (vc.elements or {}).get("items", [])
         for e in elems:
             sid = e.get("sku_id")
             rp = e.get("receiving_point_id")

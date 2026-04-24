@@ -20,6 +20,10 @@ def apply_offset_to_vc(session, vc):
     """
     为新创建的 VC 检查并应用存在的冲抵池余额 (基于会计科目余额)
     """
+    # 退货 VC 不自动核销
+    if vc.type == VCType.RETURN:
+        return
+
     party_type = None
     party_id = None
     account_level1 = None

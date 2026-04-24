@@ -261,7 +261,7 @@ class TestEquipmentProcurementFullFlow:
         vc = db_session.query(VirtualContract).get(vc_id)
         assert vc.type == VCType.EQUIPMENT_PROCUREMENT
         assert vc.status == VCStatus.EXE
-        stored_elems = vc.elements["elements"]
+        stored_elems = vc.elements["items"]
         assert len(stored_elems) == 9
         assert all(e["shipping_point_id"] == 8 for e in stored_elems)  # 广东中贝仓
         assert all(e["price"] == 2950 for e in stored_elems)
@@ -354,7 +354,7 @@ class TestStockProcurementFullFlow:
         # 2. 验证
         vc = db_session.query(VirtualContract).get(vc_id)
         assert vc.type == VCType.STOCK_PROCUREMENT
-        stored_elem = vc.elements["elements"][0]
+        stored_elem = vc.elements["items"][0]
         assert stored_elem["qty"] == 100
         assert stored_elem["subtotal"] == 350000
         assert stored_elem["shipping_point_id"] == 10
@@ -429,7 +429,7 @@ class TestMaterialProcurementFullFlow:
         # 2. 验证
         vc = db_session.query(VirtualContract).get(vc_id)
         assert vc.type == VCType.MATERIAL_PROCUREMENT
-        assert len(vc.elements["elements"]) == 2
+        assert len(vc.elements["items"]) == 2
         assert vc.elements["total_amount"] == 7400
 
         # 3. 创建物流计划
@@ -516,7 +516,7 @@ class TestMaterialSupplyFullFlow:
         # 2. 验证
         vc = db_session.query(VirtualContract).get(vc_id)
         assert vc.type == VCType.MATERIAL_SUPPLY
-        assert len(vc.elements["elements"]) == 2
+        assert len(vc.elements["items"]) == 2
         assert vc.elements["total_amount"] == 5320
 
         # 3. 创建物流计划
@@ -706,7 +706,7 @@ class TestInventoryAllocationFullFlow:
         # 2. 验证拨付 VC
         vc = db_session.query(VirtualContract).get(vc_id)
         assert vc.type == VCType.INVENTORY_ALLOCATION
-        assert len(vc.elements["elements"]) == 1
+        assert len(vc.elements["items"]) == 1
 
         # 3. 触发 VC 状态机（拨付直接完成）
         _trigger_state_machine(db_session, vc_id)

@@ -58,48 +58,70 @@ def format_item_list_preview(items: list) -> str:
     
     return " | ".join(decoded)
 
+def _collect_returned_batch_nos(session, related_vc_ids: list[int]) -> set[str]:
+    """
+    查询所有退货VC涉及的批次号集合。
+    从退货VC的elements中提取batch_no；如果elements中没有batch_no，
+    则从原始VC的elements中回溯。
+    """
+    returned_batches = set()
+    return_vcs = session.query(VirtualContract).filter(
+        VirtualContract.related_vc_id.in_(related_vc_ids),
+        VirtualContract.type == VCType.RETURN,
+        VirtualContract.status != VCStatus.CANCELLED
+    ).all()
+    for r_vc in return_vcs:
+        r_elems = (r_vc.elements or {}).get("items", [])
+        for ri in r_elems:
+            bn = ri.get("batch_no")
+            if bn:
+                returned_batches.add(bn)
+    return returned_batches
+
+
+def _build_source_vc_breakdown(session, related_vc_ids: list[int], sku_id: int, batch_no: str) -> list[dict]:
+    """构造指定批次在各源VC中的供货明细，用于溯源。"""
+    breakdown = []
+    for vid in related_vc_ids:
+        vc = session.query(VirtualContract).get(vid)
+        if not vc:
+            continue
+        elems = (vc.elements or {}).get("items", [])
+        for e in elems:
+            if int(e.get("sku_id")) == int(sku_id) and e.get("batch_no") == batch_no:
+                breakdown.append({
+                    "vc_id": vid,
+                    "qty": float(e.get("qty", 0)),
+                    "price": float(e.get("price", 0)),
+                })
+    return breakdown
+
+
 def get_returnable_items(session, target_vc_id, return_direction):
     """
-    计算一个虚拟合同的可退货明细
-    逻辑：原始总量 - 已发起的退货单(非取消) - 实物状态校验
+    计算一个虚拟合同的可退货明细。
+    物料退货按(sku_id, batch_no)聚合跨VC批次，已退批次标记为不可退。
+    设备退货按SN校验，不变。
     """
     target_vc = session.query(VirtualContract).get(target_vc_id)
     if not target_vc:
         return []
 
-    elements = target_vc.elements or {}
-    
-    # 1. 搜集所有已发起的退货单，计算锁定量
-    existing_returns = session.query(VirtualContract).filter(
-        VirtualContract.related_vc_id == target_vc.id, 
-        VirtualContract.type == VCType.RETURN,
-        VirtualContract.status != VCStatus.CANCELLED
-    ).all()
-    
-    locked_sns = set()
-    returned_qtys = {} # sku_id -> {point_name: total_qty}
-    for r_vc in existing_returns:
-        # 支持新旧两种结构
-        r_elems = (r_vc.elements or {}).get("elements", [])
-        for ri in r_elems:
-            rsn = ri.get("sn")
-            if rsn and rsn != "-":
-                locked_sns.add(rsn)
-            else:
-                rsid = ri.get("sku_id")
-                rpon = ri.get("point_name")
-                rqty = float(ri.get("qty", 0))
-                if rsid:
-                    if rsid not in returned_qtys: returned_qtys[rsid] = {}
-                    returned_qtys[rsid][rpon] = returned_qtys[rsid].get(rpon, 0) + rqty
-
-    return_items = []
-
-    # 获取 elements 列表（兼容新旧结构）
-    vc_elems = elements.get("elements", [])
-
-    # 2. 设备采购类型的退货逻辑
+    # ===================== 设备采购退货（不变） =====================
     if target_vc.type in [VCType.EQUIPMENT_PROCUREMENT, VCType.STOCK_PROCUREMENT]:
+        locked_sns = set()
+        existing_returns = session.query(VirtualContract).filter(
+            VirtualContract.related_vc_id == target_vc.id,
+            VirtualContract.type == VCType.RETURN,
+            VirtualContract.status != VCStatus.CANCELLED
+        ).all()
+        for r_vc in existing_returns:
+            r_elems = (r_vc.elements or {}).get("items", [])
+            for ri in r_elems:
+                rsn = ri.get("sn")
+                if rsn and rsn != "-":
+                    locked_sns.add(rsn)
+
         filter_status = OperationalStatus.OPERATING if ReturnDirection.CUSTOMER_TO_US in return_direction else OperationalStatus.STOCK
         equip_list = session.query(EquipmentInventory).options(
             joinedload(EquipmentInventory.sku),
@@ -109,8 +131,10 @@ def get_returnable_items(session, target_vc_id, return_direction):
             EquipmentInventory.operational_status == filter_status
         ).all()
 
+        return_items = []
         for e in equip_list:
-            if e.sn in locked_sns: continue
+            if e.sn in locked_sns:
+                continue
             return_items.append({
                 "sku_id": e.sku_id,
                 "sn": e.sn,
@@ -120,150 +144,115 @@ def get_returnable_items(session, target_vc_id, return_direction):
                 "point_id": e.point_id,
                 "point_name": e.point.name if e.point else "未定义",
                 "shipping_point_name": e.point.name if e.point else None,
-                "deposit": float(e.deposit_amount or 0.0)
+                "deposit": float(e.deposit_amount or 0.0),
             })
+        return return_items
 
-    # 3. 物料采购类型的退货逻辑 (向供应商退货)
-    elif target_vc.type == VCType.MATERIAL_PROCUREMENT:
-        # 按 receiving_point_id（即我们的收货仓库）分组，退货目的地是供应商仓库
-        # 批次精确追溯：每个 element 有 batch_no，按 batch_no FIFO 扣减
-        pt_group = {}
-        pt_ids = set()
-        for e in vc_elems:
-            pt_id = e.get("receiving_point_id")
-            if pt_id:
-                pt_ids.add(pt_id)
-            if pt_id not in pt_group:
-                pt_group[pt_id] = {"items": []}
-            pt_group[pt_id]["items"].append(e)
-        point_by_id = {}
-        if pt_ids:
-            pts = session.query(Point).filter(Point.id.in_(pt_ids)).all()
-            point_by_id = {p.id: p for p in pts}
-        points_data = [{"pointName": (point_by_id.get(pt_id).name if point_by_id.get(pt_id) else f"点位{pt_id}"), "items": v["items"]} for pt_id, v in pt_group.items()]
+    # ===================== 物料退货（批次维度聚合） =====================
+    if target_vc.type not in [VCType.MATERIAL_PROCUREMENT, VCType.MATERIAL_SUPPLY]:
+        return []
 
-        # 批量查 SKU 名称
-        all_sku_ids = set()
-        for p in points_data:
-            for i in p.get("items", []):
-                sid = i.get("sku_id")
-                if sid:
-                    all_sku_ids.add(sid)
-        sku_name_map = {}
-        if all_sku_ids:
-            skus = session.query(SKU).filter(SKU.id.in_(all_sku_ids)).all()
-            sku_name_map = {s.id: s.name for s in skus}
-
-        # 阶段一：收集所有 element 行，按 (sku_id, point_name) 分组
-        grouped: dict[tuple, dict] = {}
-        for p in points_data:
-            p_name = p.get("pointName") or "未知点位"
-            for i in p.get("items", []):
-                norm = normalize_item_data(i)
-                sid = norm["sku_id"]
-                key = (sid, p_name)
-                if key not in grouped:
-                    grouped[key] = {"rows": [], "ret_qty": 0.0}
-                grouped[key]["rows"].append({
-                    "norm": norm,
-                    "qty": norm["qty"],
-                    "bn": norm.get("batch_no") or "-",
-                })
-                # 累计已退量（稍后 FIFO 扣减）
-                if sid in returned_qtys and p_name in returned_qtys[sid]:
-                    grouped[key]["ret_qty"] += returned_qtys[sid][p_name]
-
-        # 阶段二：FIFO 扣减，生成最终退货行
-        for (sid, pname), g in grouped.items():
-            ret_left = g["ret_qty"]
-            for row in sorted(g["rows"], key=lambda x: x["bn"]):
-                deduct = min(row["qty"], ret_left)
-                remain = row["qty"] - deduct
-                ret_left -= deduct
-                if remain > 0:
-                    norm = row["norm"]
-                    return_items.append({
-                        "sku_id": sid,
-                        "sku_name": sku_name_map.get(sid, norm["sku_name"]),
-                        "price": norm["price"],
-                        "qty": int(remain),
-                        "point_name": pname,
-                        "shipping_point_name": norm.get("shipping_point_name"),
-                        "batch_no": row["bn"],
-                    })
-
-    # 4. 物料供应类型的退货逻辑 (客户退回)
+    # Step 1: 确定同批次相关的VC列表
+    related_vc_ids = []
+    if target_vc.type == VCType.MATERIAL_PROCUREMENT:
+        sc_id = target_vc.supply_chain_id
+        if sc_id:
+            related = session.query(VirtualContract).filter(
+                VirtualContract.supply_chain_id == sc_id,
+                VirtualContract.type == VCType.MATERIAL_PROCUREMENT
+            ).all()
+            related_vc_ids = [v.id for v in related]
     elif target_vc.type == VCType.MATERIAL_SUPPLY:
-        # 旧结构：points[].items[]
-        points_data = elements.get("points", [])
-        if not points_data and vc_elems:
-            # 新结构：elements[] — 按 receiving_point_id 分组
-            pt_group = {}
-            pt_ids = set()
-            for e in vc_elems:
-                pt_id = e.get("receiving_point_id")
-                if pt_id:
-                    pt_ids.add(pt_id)
-                if pt_id not in pt_group:
-                    pt_group[pt_id] = {"items": []}
-                pt_group[pt_id]["items"].append(e)
-            point_by_id = {}
-            if pt_ids:
-                points = session.query(Point).filter(Point.id.in_(pt_ids)).all()
-                point_by_id = {p.id: p for p in points}
-            points_data = [{"pointName": (point_by_id.get(pt_id).name if point_by_id.get(pt_id) else f"点位{pt_id}"), "items": v["items"]} for pt_id, v in pt_group.items()]
+        biz_id = target_vc.business_id
+        if biz_id:
+            related = session.query(VirtualContract).filter(
+                VirtualContract.business_id == biz_id,
+                VirtualContract.type == VCType.MATERIAL_SUPPLY
+            ).all()
+            related_vc_ids = [v.id for v in related]
 
-        # 批量查 SKU 名称
-        all_sku_ids = set()
-        for p in points_data:
-            for i in p.get("items", []):
-                sid = i.get("sku_id")
-                if sid:
-                    all_sku_ids.add(sid)
-        sku_name_map = {}
-        if all_sku_ids:
-            skus = session.query(SKU).filter(SKU.id.in_(all_sku_ids)).all()
-            sku_name_map = {s.id: s.name for s in skus}
+    if not related_vc_ids:
+        return []
 
-        # 阶段一：收集所有批次行，按 (sku_id, point_name) 分组
-        grouped: dict[tuple, dict] = {}
-        for p in points_data:
-            p_name = p.get("pointName") or "未知点位"
-            for i in p.get("items", []):
-                norm = normalize_item_data(i)
-                sid = norm["sku_id"]
-                key = (sid, p_name)
-                if key not in grouped:
-                    grouped[key] = {"rows": [], "ret_qty": 0.0}
-                grouped[key]["rows"].append({
-                    "norm": norm,
-                    "qty": norm["qty"],
-                    "bn": norm.get("batch_no") or "-",
-                })
-                # 累计已退量（暂存，稍后 FIFO 扣减）
-                if sid in returned_qtys and p_name in returned_qtys[sid]:
-                    grouped[key]["ret_qty"] += returned_qtys[sid][p_name]
+    # Step 2: 找出已退批次（跨VC检查同一批次是否已退货）
+    returned_batch_nos = _collect_returned_batch_nos(session, related_vc_ids)
 
-        # 阶段二：FIFO 扣减，生成最终退货行
-        for (sid, pname), g in grouped.items():
-            ret_left = g["ret_qty"]
-            for row in sorted(g["rows"], key=lambda x: x["bn"]):
-                deduct = min(row["qty"], ret_left)
-                remain = row["qty"] - deduct
-                ret_left -= deduct
-                if remain > 0:
-                    norm = row["norm"]
-                    return_items.append({
-                        "sku_id": sid,
-                        "sku_name": sku_name_map.get(sid, norm["sku_name"]),
-                        "price": norm["price"],
-                        "qty": int(remain),
-                        "point_name": pname,
-                        "shipping_point_name": norm.get("shipping_point_name"),
-                        "batch_no": row["bn"],
-                    })
+    # Step 3: 从相关VC的elements聚合批次数据
+    # 对每个related VC，将其elements["items"]按(sku_id, batch_no)聚合
+    batch_totals = {}  # (sku_id, batch_no) -> {qty, price_sum, price_count, source_vc_ids, point_id}
+    for vid in related_vc_ids:
+        vc = session.query(VirtualContract).get(vid)
+        if not vc:
+            continue
+        elems = (vc.elements or {}).get("items", [])
+        for e in elems:
+            sku_id = e.get("sku_id")
+            batch_no = e.get("batch_no") or "-"
+            key = (sku_id, batch_no)
+            if key not in batch_totals:
+                batch_totals[key] = {
+                    "qty": 0.0,
+                    "price_sum": 0.0,
+                    "price_count": 0,
+                    "source_vc_ids": set(),
+                    "point_id": e.get("receiving_point_id"),
+                }
+            qty = float(e.get("qty") or 0)
+            price = float(e.get("price") or 0)
+            batch_totals[key]["qty"] += qty
+            if price > 0:
+                batch_totals[key]["price_sum"] += price
+                batch_totals[key]["price_count"] += 1
+            batch_totals[key]["source_vc_ids"].add(vid)
+
+    # Step 4: 查MaterialInventory获取实际库存量（用于MATERIAL_PROCUREMENT退货）
+    if target_vc.type == VCType.MATERIAL_PROCUREMENT:
+        # MaterialInventory 使用 latest_purchase_vc_id 而非 virtual_contract_id
+        mi_rows = session.query(MaterialInventory).filter(
+            MaterialInventory.latest_purchase_vc_id.in_(related_vc_ids)
+        ).all()
+        for row in mi_rows:
+            key = (row.sku_id, row.batch_no)
+            if key in batch_totals:
+                # 用实际库存量更新
+                batch_totals[key]["qty"] = row.qty
+                if row.point_id:
+                    batch_totals[key]["point_id"] = row.point_id
+
+    # Step 5: 构造返回列表
+    return_items = []
+    sku_ids = list({k[0] for k in batch_totals})
+    sku_name_map = {}
+    if sku_ids:
+        skus = session.query(SKU).filter(SKU.id.in_(sku_ids)).all()
+        sku_name_map = {s.id: s.name for s in skus}
+
+    for (sku_id, batch_no), info in batch_totals.items():
+        is_returned = batch_no in returned_batch_nos
+        source_vc_ids = list(info["source_vc_ids"])
+
+        avg_price = 0.0
+        if info["price_count"] > 0:
+            avg_price = info["price_sum"] / info["price_count"]
+
+        item = {
+            "sku_id": sku_id,
+            "sku_name": sku_name_map.get(sku_id, f"SKU{sku_id}"),
+            "batch_no": batch_no,
+            "original_qty": info['qty'],
+            "price": avg_price,
+            "qty": 0.0 if is_returned else info['qty'],
+            "returnable": not is_returned,
+            "returned_note": "已退货" if is_returned else None,
+            "source_vc_ids": source_vc_ids,
+            "point_id": info['point_id'],
+        }
+        return_items.append(item)
 
     return return_items
+
+
+
 
 def get_sku_agreement_price(session, sc_id, business_id, sku_name):
     """
@@ -528,9 +517,9 @@ def format_vc_items_for_display(vc):
     """
     elements = (vc['elements'] if isinstance(vc, dict) else vc.elements) or {}
 
-    # 统一结构：elements["elements"]（新 VC）
-    if "elements" in elements and isinstance(elements["elements"], list):
-        elems = elements["elements"]
+    # 统一结构：elements["items"]（新 VC）
+    if "elements" in elements and isinstance(elements["items"], list):
+        elems = elements["items"]
         if elems:
             show_items = []
             for e in elems:
@@ -727,7 +716,7 @@ def get_logistics_finance_context(session, logistics_id):
     # 2. 成本核算逻辑
     if vc.type == VCType.MATERIAL_SUPPLY:
         total_cost = 0.0
-        mat_elems = (vc.elements or {}).get("elements", [])
+        mat_elems = (vc.elements or {}).get("items", [])
         for item in mat_elems:
             sid = item.get("sku_id") or item.get("skuId")
             qty = float(item.get("qty") or 0)
@@ -741,7 +730,7 @@ def get_logistics_finance_context(session, logistics_id):
 
     elif vc.type == VCType.RETURN:
         total_asset_cost = 0.0
-        ret_elems = (vc.elements or {}).get("elements", [])
+        ret_elems = (vc.elements or {}).get("items", [])
         for item in ret_elems:
             sid = item.get("sku_id")
             qty = float(item.get("qty") or 0)

@@ -496,7 +496,7 @@ class TestVcAddonApplication:
         assert result2.success is True
 
         vc = db_session.query(VirtualContract).get(result2.data["vc_id"])
-        elems = vc.elements["elements"]
+        elems = vc.elements["items"]
         assert elems[0]["price"] == 800.0
         assert elems[0]["deposit"] == 150.0
         assert addon_id in elems[0]["addon_business_ids"]
@@ -516,8 +516,8 @@ class TestVcAddonApplication:
         ))
         assert result.success is True
         vc = db_session.query(VirtualContract).get(result.data["vc_id"])
-        assert vc.elements["elements"][0]["price"] == 1000.0
-        assert vc.elements["elements"][0]["addon_business_ids"] == []
+        assert vc.elements["items"][0]["price"] == 1000.0
+        assert vc.elements["items"][0]["addon_business_ids"] == []
 
     def test_inactive_addon_not_applied(self, db_session, setup_data):
         """失效 addon 不应用"""
@@ -556,7 +556,7 @@ class TestVcAddonApplication:
         ))
         assert result2.success is True
         vc = db_session.query(VirtualContract).get(result2.data["vc_id"])
-        assert vc.elements["elements"][0]["price"] == 1000.0  # addon 未应用
+        assert vc.elements["items"][0]["price"] == 1000.0  # addon 未应用
 
 
 # =============================================================================

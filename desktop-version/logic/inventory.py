@@ -117,6 +117,54 @@ def _deduct_batch_qty(session, sku_id, point_id, required_qty):
     return required_qty - remaining
 
 
+def _deduct_batch_qty_by_batch(session, sku_id, point_id, batch_no, required_qty):
+    """
+    按指定批次号扣减批次库存
+    返回实际扣减数量
+    """
+    batch = session.query(models.MaterialInventory).filter(
+        models.MaterialInventory.sku_id == sku_id,
+        models.MaterialInventory.point_id == point_id,
+        models.MaterialInventory.batch_no == batch_no,
+        models.MaterialInventory.qty > 0
+    ).first()
+
+    if not batch:
+        return 0.0
+
+    deduct = min(batch.qty, required_qty)
+    batch.qty -= deduct
+    return deduct
+
+
+def _rollback_sku_purchase_stats_incremental(session, sku_id, return_qty, unit_price, vc_id):
+    """
+    退货→供应商时增量回退SKU采购统计
+    从 historical_purchase_qty 中减去退货数量，重新计算平均价
+    """
+    sku = session.query(models.SKU).get(sku_id)
+    if not sku:
+        return
+    params = dict(sku.params or {})
+
+    old_qty = params.get("historical_purchase_qty", 0) or 0
+    old_avg = params.get("average_price", 0) or 0
+
+    # 退货量不能超过历史采购量
+    new_qty = max(0, old_qty - return_qty)
+    # 重新计算平均价：如果 new_qty > 0，用剩余量重新计算；否则设为 0
+    if new_qty > 0:
+        new_avg = (old_qty * old_avg - return_qty * unit_price) / new_qty
+        new_avg = max(0, new_avg)
+    else:
+        new_avg = 0.0
+
+    params["historical_purchase_qty"] = new_qty
+    params["average_price"] = new_avg
+    params["latest_purchase_vc_id"] = vc_id
+    sku.params = params
+
+
 # =============================================================================
 # 主入口
 # =============================================================================
@@ -201,7 +249,7 @@ def _process_equipment_procurement(session, vc, logistics_id, equipment_sn_json)
                         p_id = p_obj.id
 
             if not p_id:
-                vc_elems = (vc.elements or {}).get("elements", [])
+                vc_elems = (vc.elements or {}).get("items", [])
                 if vc_elems:
                     p_id = vc_elems[0].get("receiving_point_id")
 
@@ -246,7 +294,7 @@ def _process_material_procurement(session, vc, logistics_id, batch_items=None):
         models.ExpressOrder.logistics_id == logistics_id
     ).all()
 
-    vc_elems = (vc.elements or {}).get("elements", [])
+    vc_elems = (vc.elements or {}).get("items", [])
 
     # 构建 sku_id -> 单价 映射
     sku_price_map = {}
@@ -323,7 +371,7 @@ def _process_material_supply(session, vc, logistics_id):
 
         # 如果没有发货点位，尝试从vc.elements获取
         if not send_point_id:
-            vc_elems = (vc.elements or {}).get("elements", [])
+            vc_elems = (vc.elements or {}).get("items", [])
             for elem in vc_elems:
                 if elem.get("shipping_point_id"):
                     send_point_id = elem.get("shipping_point_id")
@@ -344,7 +392,11 @@ def _process_material_supply(session, vc, logistics_id):
 
 
 def _process_return(session, vc, logistics_id, equipment_sn_json):
-    """退货处理"""
+    """退货处理
+
+    物料退货：从 vc.elements["items"] 获取 batch_no，按 CUSTOMER_TO_US / US_TO_SUPPLIER 分别处理。
+    设备退货：从 vc.elements["items"] 获取 sn_list，逐个 SN 处理。
+    """
     orders = session.query(models.ExpressOrder).filter(
         models.ExpressOrder.logistics_id == logistics_id
     ).all()
@@ -355,22 +407,26 @@ def _process_return(session, vc, logistics_id, equipment_sn_json):
 
     # 获取原采购VC信息用于回退
     orig_vc = None
-    orig_vc_params = None
     if vc.related_vc_id:
         orig_vc = session.query(models.VirtualContract).get(vc.related_vc_id)
-        if orig_vc:
-            orig_vc_params = orig_vc.elements or {}
 
-    # 构建退货物品映射
-    return_items_map = {}
-    ret_elems = (vc.elements or {}).get("elements", [])
+    # 从 vc.elements["items"] 构建退货物品映射
+    # key = (sku_id, batch_no) for materials, key = (sku_id, sn) for equipment
+    ret_items_map = {}   # (sku_id, key) -> element dict
+    ret_elems = (vc.elements or {}).get("items", [])
+
     for ri in ret_elems:
         sn_val = ri.get("sn")
         if not sn_val or sn_val == "-":
             sn_list = ri.get("sn_list") or []
             sn_val = sn_list[0] if sn_list else "-"
-        key = (ri.get("sku_id"), sn_val)
-        return_items_map[key] = ri
+        batch_no = ri.get("batch_no")
+        # 设备用 SN 做 key，物料用 batch_no 做 key
+        if sn_val and sn_val != "-":
+            key = sn_val
+        else:
+            key = batch_no
+        ret_items_map[(ri.get("sku_id"), key)] = ri
 
     sns = equipment_sn_json if equipment_sn_json else []
 
@@ -389,25 +445,30 @@ def _process_return(session, vc, logistics_id, equipment_sn_json):
             if not sid or qty <= 0:
                 continue
 
-            # 设备退货处理
             if sn and sn != "-":
-                _process_equipment_return(session, vc, direction, sid, sn, recv_point_id, return_items_map, sns, ret_elems)
+                # 设备退货（express order item 本身有 SN）
+                _process_equipment_return(session, vc, direction, sid, sn, recv_point_id, ret_items_map, sns)
             else:
-                # 物料退货处理
-                _process_material_return(session, vc, orig_vc, orig_vc_params, direction, sid, qty, recv_point_id, send_point_id)
-
-            # 当 item 没有 SN 时（ExpressOrder items 不含 SN），从 ret_elems 查找对应 sku_id 的 SN
-            # 然后仍调用 _process_equipment_return（其内部会用 sns 参数匹配）
-            if not sn or sn == "-":
+                # express order item 无 SN：根据 SKU 查找退货 element 判断类型
+                matched_elem = None
                 for ri in ret_elems:
                     if int(ri.get("sku_id")) == int(sid):
-                        ri_sn = ri.get("sn")
-                        if not ri_sn or ri_sn == "-":
-                            sn_list = ri.get("sn_list") or []
-                            ri_sn = sn_list[0] if sn_list else "-"
-                        if ri_sn and ri_sn != "-":
-                            _process_equipment_return(session, vc, direction, sid, ri_sn, recv_point_id, return_items_map, sns, ret_elems)
+                        matched_elem = ri
                         break
+
+                if matched_elem:
+                    # 检查退货 element 是否有 SN（设备退货）
+                    ri_sn = matched_elem.get("sn")
+                    if not ri_sn or ri_sn == "-":
+                        sn_list = matched_elem.get("sn_list") or []
+                        ri_sn = sn_list[0] if sn_list else "-"
+                    if ri_sn and ri_sn != "-":
+                        # 设备退货：通过退货 element 的 sn_list 处理
+                        _process_equipment_return(session, vc, direction, sid, ri_sn, recv_point_id, ret_items_map, sns)
+                    else:
+                        # 物料退货（无 SN，按 batch_no 处理）
+                        batch_no = matched_elem.get("batch_no")
+                        _process_material_return(session, vc, orig_vc, direction, sid, batch_no, qty, recv_point_id, send_point_id)
 
     # 触发原采购VC的押金重算
     if vc.related_vc_id:
@@ -416,20 +477,13 @@ def _process_return(session, vc, logistics_id, equipment_sn_json):
         deposit_module(vc_id=vc.related_vc_id, session=session)
 
 
-def _process_equipment_return(session, vc, direction, sid, sn, recv_point_id, return_items_map, sns, ret_elems):
+
+def _process_equipment_return(session, vc, direction, sid, sn, recv_point_id, ret_items_map, sns):
     """处理设备退货"""
-    # 优先使用 equipment_sn_json 中的 SN
+    # equipment_sn_json 有值时用它精确匹配
     lookup_sn = sn
-    if sns:
-        for ri in ret_elems:
-            if int(ri.get("sku_id")) == int(sid):
-                ri_sn = ri.get("sn")
-                if not ri_sn or ri_sn == "-":
-                    sn_list = ri.get("sn_list") or []
-                    ri_sn = sn_list[0] if sn_list else "-"
-                if ri_sn and ri_sn != "-" and ri_sn in sns:
-                    lookup_sn = ri_sn
-                    break
+    if sns and sn in sns:
+        lookup_sn = sn
 
     equip = session.query(models.EquipmentInventory).filter(
         models.EquipmentInventory.sn == lookup_sn
@@ -445,15 +499,21 @@ def _process_equipment_return(session, vc, direction, sid, sn, recv_point_id, re
         equip.deposit_timestamp = datetime.now()
 
 
-def _process_material_return(session, vc, orig_vc, orig_vc_params, direction, sid, qty, recv_point_id, send_point_id):
-    """处理物料退货"""
+
+def _process_material_return(session, vc, orig_vc, direction, sid, batch_no, qty, recv_point_id, send_point_id):
+    """处理物料退货
+
+    Args:
+        batch_no: 退货 VC element 中指定的批次号（CUSTOMER_TO_US 用原批次，US_TO_SUPPLIER 用 FIFO 扣减）
+    """
     sku_obj = session.query(models.SKU).get(sid)
     if not sku_obj:
         return
 
     if ReturnDirection.CUSTOMER_TO_US in direction:
-        # 退货到我方：视为采购补货，新建批次行
-        batch_no = f"{datetime.now().strftime('%Y%m%d')}-{sku_obj.model}"
+        # 退货到我方：按原批次号入库（批次号不变，只跟生产日期有关）
+        if not batch_no:
+            batch_no = f"{datetime.now().strftime('%Y%m%d')}-{sku_obj.model}"
 
         # 如果没有收货点位，使用默认点位
         if not recv_point_id:
@@ -461,34 +521,31 @@ def _process_material_return(session, vc, orig_vc, orig_vc_params, direction, si
 
         batch = _get_or_create_batch(session, sid, batch_no, recv_point_id, vc.id)
         batch.qty += qty
-        # 注意：退货→我方不计入历史采购统计，不调用 _update_sku_purchase_stats
+        # 注意：退货到我方不计入历史采购统计，不调用 _update_sku_purchase_stats
 
     elif ReturnDirection.US_TO_SUPPLIER in direction:
-        # 退货到供应商：扣减库存 + 回退sku.params
+        # 退货到供应商：按 batch_no 精确扣减批次库存
         if not send_point_id:
             send_point_id = _get_default_point_id(session)
 
-        # 获取原采购VC的批次号
-        orig_batch_no = None
+        # 获取原采购VC的原始采购数据用于回退
         orig_qty = 0
         orig_avg = 0
         if orig_vc:
-            ts = orig_vc.status_timestamp or datetime.now()
-            created_date = ts.strftime('%Y%m%d')
-            orig_batch_no = f"{created_date}-{sku_obj.model}"
-            # 从原采购VC的elements中获取原始采购数据
-            if orig_vc_params:
-                for elem in orig_vc_params.get("elements", []):
-                    if str(elem.get("sku_id")) == str(sid):
-                        orig_qty = float(elem.get("qty") or 0)
-                        orig_avg = float(elem.get("price") or 0)
-                        break
+            orig_elems = (orig_vc.elements or {}).get("items", [])
+            for elem in orig_elems:
+                if str(elem.get("sku_id")) == str(sid):
+                    orig_qty = float(elem.get("qty") or 0)
+                    orig_avg = float(elem.get("price") or 0)
+                    break
 
-        # 扣减批次库存
-        _deduct_batch_qty(session, sid, send_point_id, qty)
+        # 按 batch_no 精确扣减（而非 FIFO）
+        _deduct_batch_qty_by_batch(session, sid, send_point_id, batch_no, qty)
 
-        # 回退sku.params
-        _rollback_sku_purchase_stats(session, sid, orig_qty, orig_avg, orig_vc.id if orig_vc else None)
+        # 增量回退 sku.params（累计已退量）
+        if orig_vc:
+            _rollback_sku_purchase_stats_incremental(session, sid, qty, orig_avg, orig_vc.id)
+
 
 
 def _process_inventory_allocation(session, vc, logistics_id):

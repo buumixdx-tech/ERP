@@ -100,14 +100,14 @@ def assert_vc_elements_structure(vc, expected_type: str, expected_elements_count
     """验证 VC elements 整体结构"""
     elems = vc.elements
     assert elems is not None, "elements 不能为 None"
-    assert "elements" in elems, "elements 缺少顶层 elements 键"
+    assert "items" in elems, "elements 缺少顶层 items 键"
     assert "vc_type" not in elems, "elements 不应包含冗余 vc_type 字段"
     assert "skus" not in elems, "elements 不应包含旧结构 skus"
     assert "points" not in elems, "elements 不应包含旧结构 points"
 
-    items = elems["elements"]
-    assert isinstance(items, list), "elements 必须是 list"
-    assert len(items) == expected_elements_count, f"elements 数量期望 {expected_elements_count}，实际 {len(items)}"
+    items = elems["items"]
+    assert isinstance(items, list), "items 必须是 list"
+    assert len(items) == expected_elements_count, f"items 数量期望 {expected_elements_count}，实际 {len(items)}"
 
     for item in items:
         assert_element_item(item, {})
@@ -182,7 +182,7 @@ class TestEquipmentProcurementElements:
         assert elems["total_amount"] == 5000.0
         assert elems["payment_terms"]["prepayment_ratio"] == 0.3
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         # 商业逻辑：shipping_point_id=供应商仓库, receiving_point_id=客户仓库
         assert_element_item(item, {
             "shipping_point_id": sup_wh.id,
@@ -251,13 +251,13 @@ class TestEquipmentProcurementElements:
         elems = vc.elements
 
         assert_vc_elements_structure(vc, VCType.EQUIPMENT_PROCUREMENT, 2)
-        assert elems["elements"][0]["receiving_point_id"] == cust_wh1.id
-        assert elems["elements"][1]["receiving_point_id"] == cust_wh2.id
-        assert elems["elements"][0]["qty"] == 2.0
-        assert elems["elements"][1]["qty"] == 3.0
+        assert elems["items"][0]["receiving_point_id"] == cust_wh1.id
+        assert elems["items"][1]["receiving_point_id"] == cust_wh2.id
+        assert elems["items"][0]["qty"] == 2.0
+        assert elems["items"][1]["qty"] == 3.0
         # 所有 item 发货点相同（供应商仓库）
-        assert elems["elements"][0]["shipping_point_id"] == sup_wh.id
-        assert elems["elements"][1]["shipping_point_id"] == sup_wh.id
+        assert elems["items"][0]["shipping_point_id"] == sup_wh.id
+        assert elems["items"][1]["shipping_point_id"] == sup_wh.id
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ class TestStockProcurementElements:
         assert elems["total_amount"] == 20000.0
         assert elems["payment_terms"]["prepayment_ratio"] == 0.5
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         # 商业逻辑：shipping_point_id=供应商仓库, receiving_point_id=我们仓库
         assert_element_item(item, {
             "shipping_point_id": sup_wh.id,
@@ -394,7 +394,7 @@ class TestMaterialProcurementElements:
         assert "payment_terms" in elems
         assert elems["total_amount"] == 500.0
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         # 商业逻辑：shipping_point_id=供应商仓库, receiving_point_id=我们仓库
         assert_element_item(item, {
             "shipping_point_id": sup_wh.id,
@@ -469,7 +469,7 @@ class TestMaterialSupplyElements:
         assert "total_amount" in elems
         assert "payment_terms" in elems, "物料供应 elements 应包含 payment_terms（状态机需要用于 cash_status 演进）"
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         # 商业逻辑：shipping_point_id=有库存的仓库, receiving_point_id=客户运营点位
         assert_element_item(item, {
             "shipping_point_id": wh.id,
@@ -536,11 +536,11 @@ class TestMaterialSupplyElements:
         assert_vc_elements_structure(vc, VCType.MATERIAL_SUPPLY, 2)
         elems = vc.elements
         assert elems["total_amount"] == 1400.0
-        for item in elems["elements"]:
+        for item in elems["items"]:
             assert item["shipping_point_id"] == wh.id
             assert item["receiving_point_id"] == customer_pt.id
-        assert elems["elements"][0]["sku_id"] == sku1.id
-        assert elems["elements"][1]["sku_id"] == sku2.id
+        assert elems["items"][0]["sku_id"] == sku1.id
+        assert elems["items"][1]["sku_id"] == sku2.id
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +661,7 @@ class TestReturnElements:
         # 不应有 payment_terms
         assert "payment_terms" not in elems
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         assert_element_item(item, {
             "shipping_point_id": cust_op_pt.id,
             "receiving_point_id": 1,
@@ -742,7 +742,7 @@ class TestInventoryAllocationElements:
         assert "payment_terms" not in elems
         assert "return_direction" not in elems
 
-        item = elems["elements"][0]
+        item = elems["items"][0]
         assert_element_item(item, {
             "shipping_point_id": 1,
             "receiving_point_id": target_point.id,
@@ -818,7 +818,7 @@ class TestElementsNoRedundancy:
         assert "return_items" not in elems
         assert "allocation_items" not in elems
         assert "vc_type" not in elems
-        assert "elements" in elems
+        assert "items" in elems
 
     def test_id_field_consistency(self, db_session, base_data):
         """✅ id 字段与实际 (sp, rp, sku) 一致"""
@@ -858,7 +858,7 @@ class TestElementsNoRedundancy:
 
         from models import VirtualContract
         vc = db_session.query(VirtualContract).get(result.data["vc_id"])
-        item = vc.elements["elements"][0]
+        item = vc.elements["items"][0]
 
         # 商业逻辑：shipping_point_id=供应商仓库, receiving_point_id=客户仓库
         assert item["shipping_point_id"] == sup_wh.id
