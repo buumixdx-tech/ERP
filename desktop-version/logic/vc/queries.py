@@ -1,6 +1,28 @@
 from typing import List, Dict, Optional, Any
 from models import get_session, VirtualContract, Business, ChannelCustomer, TimeRule, VirtualContractStatusLog, CashFlow
 from logic.constants import VCType, VCStatus, TimeRuleRelatedType
+from sqlalchemy import func
+
+
+def _batch_get_latest_log_ts(session, vc_ids: List[int]) -> Dict[int, Any]:
+    """批量获取多个 VC 的最新状态日志时间戳，返回 {vc_id: latest_datetime}"""
+    if not vc_ids:
+        return {}
+    results = session.query(
+        VirtualContractStatusLog.vc_id,
+        func.max(VirtualContractStatusLog.timestamp)
+    ).filter(
+        VirtualContractStatusLog.vc_id.in_(vc_ids)
+    ).group_by(VirtualContractStatusLog.vc_id).all()
+    return {vid: ts for vid, ts in results}
+
+
+def _get_single_latest_log_ts(session, vc_id: int) -> str:
+    """获取单个 VC 最新状态日志时间戳，返回格式化字符串"""
+    ts = session.query(func.max(VirtualContractStatusLog.timestamp)).filter(
+        VirtualContractStatusLog.vc_id == vc_id
+    ).scalar()
+    return ts.strftime("%Y-%m-%d %H:%M") if ts else ""
 
 def get_vc_list(
     business_id: Optional[int] = None,
@@ -19,18 +41,20 @@ def get_vc_list(
         if status:
             query = query.filter(VirtualContract.status == status)
 
-        contracts = query.order_by(VirtualContract.status_timestamp.desc()).limit(limit).all()
+        contracts = query.order_by(VirtualContract.id.desc()).limit(limit).all()
 
-        # 批量预加载 business 和 customer，消除 N+1
+        # 批量预加载 business、customer 和最新日志时间戳，消除 N+1
         biz_ids = list(set(vc.business_id for vc in contracts if vc.business_id))
         biz_map = {b.id: b for b in session.query(Business).filter(Business.id.in_(biz_ids)).all()} if biz_ids else {}
         cust_ids = list(set(b.customer_id for b in biz_map.values() if b.customer_id))
         cust_map = {c.id: c for c in session.query(ChannelCustomer).filter(ChannelCustomer.id.in_(cust_ids)).all()} if cust_ids else {}
+        latest_ts_map = _batch_get_latest_log_ts(session, [vc.id for vc in contracts])
 
         result = []
         for vc in contracts:
             biz = biz_map.get(vc.business_id)
             customer = cust_map.get(biz.customer_id) if biz else None
+            latest_ts = latest_ts_map.get(vc.id)
             result.append({
                 "id": vc.id,
                 "type": vc.type,
@@ -39,7 +63,7 @@ def get_vc_list(
                 "status_label": _get_vc_status_label(vc.status),
                 "customer_name": customer.name if customer else "未知",
                 "total_amount": vc.elements.get("total_amount", 0) if vc.elements else 0,
-                "created_at": vc.status_timestamp.strftime("%Y-%m-%d") if vc.status_timestamp else ""
+                "created_at": latest_ts.strftime("%Y-%m-%d") if latest_ts else ""
             })
         return result
     finally:
@@ -169,6 +193,7 @@ def get_virtual_contracts_for_return(
             VirtualContract.subject_status.in_(subject_statuses)
         ).all()
 
+        latest_ts_map = _batch_get_latest_log_ts(session, [c.id for c in contracts])
         return [
             {
                 "id": c.id,
@@ -180,7 +205,7 @@ def get_virtual_contracts_for_return(
                 "elements": c.elements,
                 "business_id": c.business_id,
                 "supply_chain_id": c.supply_chain_id,
-                "created_at": c.status_timestamp.strftime("%Y-%m-%d %H:%M") if c.status_timestamp else ""
+                "created_at": latest_ts_map.get(c.id).strftime("%Y-%m-%d %H:%M") if latest_ts_map.get(c.id) else ""
             }
             for c in contracts
         ]
@@ -250,6 +275,7 @@ def get_vc_list_for_overview(
             query = query.filter(VirtualContract.subject_status.notin_(exclude_subject_status))
 
         contracts = query.order_by(VirtualContract.id.desc()).all()
+        latest_ts_map = _batch_get_latest_log_ts(session, [c.id for c in contracts])
         return [
             {
                 "id": c.id,
@@ -260,7 +286,7 @@ def get_vc_list_for_overview(
                 "description": c.description,
                 "elements": c.elements,
                 "business_id": c.business_id,
-                "created_at": c.status_timestamp.strftime("%Y-%m-%d %H:%M") if c.status_timestamp else ""
+                "created_at": latest_ts_map.get(c.id).strftime("%Y-%m-%d %H:%M") if latest_ts_map.get(c.id) else ""
             }
             for c in contracts
         ]
@@ -321,7 +347,7 @@ def get_vc_full_detail(vc_id: int) -> Optional[Dict[str, Any]]:
             "business": biz_info,
             "supply_chain": sc_info,
             "related_vc_id": vc.related_vc_id,
-            "created_at": vc.status_timestamp.strftime("%Y-%m-%d %H:%M") if vc.status_timestamp else ""
+            "created_at": _get_single_latest_log_ts(session, vc.id)
         }
     finally:
         session.close()
@@ -346,7 +372,7 @@ def get_vc_by_id(vc_id: int) -> Optional[Dict[str, Any]]:
             "elements": vc.elements,
             "business_id": vc.business_id,
             "supply_chain_id": vc.supply_chain_id,
-            "created_at": vc.status_timestamp.strftime("%Y-%m-%d %H:%M") if vc.status_timestamp else ""
+            "created_at": _get_single_latest_log_ts(session, vc_id)
         }
     finally:
         session.close()

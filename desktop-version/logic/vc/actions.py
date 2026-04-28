@@ -30,15 +30,8 @@ DEFAULT_WAREHOUSE_ID = 1
 
 
 def _record_vc_created_log(session: Session, vc: VirtualContract):
-    """VC创建时记录初始状态日志（只有status=执行）"""
-    from models import VirtualContractStatusLog
-    log = VirtualContractStatusLog(
-        vc_id=vc.id,
-        category="status",
-        status_name=vc.status
-    )
-    session.add(log)
-    session.flush()
+    """VC创建时记录初始状态日志（status=执行），同时更新status_timestamp"""
+    vc.update_status(vc.status, is_initial=True)
 
 
 def _get_supplier_warehouse(session: Session, supplier_id: int) -> int | None:

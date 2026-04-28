@@ -180,23 +180,23 @@ class VirtualContract(Base):
         ts_field = f"{category}_status_timestamp" if category != "status" else "status_timestamp"
         setattr(self, ts_field, datetime.now())
 
-    def update_status(self, new_val):
+    def update_status(self, new_val, is_initial=False):
         old_val = self.status
-        if old_val == new_val: return
+        if old_val == new_val and not is_initial: return
         self.status = new_val
-        self._add_status_log("status", old_val, new_val)
+        self._add_status_log("status", None if is_initial else old_val, new_val)
 
-    def update_subject_status(self, new_val):
+    def update_subject_status(self, new_val, is_initial=False):
         old_val = self.subject_status
-        if old_val == new_val: return
+        if old_val == new_val and not is_initial: return
         self.subject_status = new_val
-        self._add_status_log("subject", old_val, new_val)
+        self._add_status_log("subject", None if is_initial else old_val, new_val)
 
-    def update_cash_status(self, new_val):
+    def update_cash_status(self, new_val, is_initial=False):
         old_val = self.cash_status
-        if old_val == new_val: return
+        if old_val == new_val and not is_initial: return
         self.cash_status = new_val
-        self._add_status_log("cash", old_val, new_val)
+        self._add_status_log("cash", None if is_initial else old_val, new_val)
 
 class VirtualContractStatusLog(Base):
     """新增：20. 虚拟合同状态阶段详细时间戳记录"""

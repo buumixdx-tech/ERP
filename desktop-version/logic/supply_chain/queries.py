@@ -7,6 +7,7 @@
 
 from typing import List, Dict, Optional, Any
 from sqlalchemy import func, cast, String
+from sqlalchemy.orm import joinedload
 from models import (
     get_session, SupplyChain, Supplier, SKU
 )
@@ -34,11 +35,11 @@ def get_supply_chain_with_pricing(
     Returns:
         格式化后的供应链协议列表，包含定价详情
     """
-    query = session.query(SupplyChain).join(Supplier)
-    
+    query = session.query(SupplyChain).options(joinedload(SupplyChain.items)).join(Supplier)
+
     if sc_type:
         query = query.filter(SupplyChain.type == sc_type)
-    
+
     chains = query.order_by(SupplyChain.id.desc()).all()
     
     result = []
@@ -177,37 +178,45 @@ def get_supply_chain_detail_for_ui(sc_id: int) -> Optional[Dict[str, Any]]:
     """
     session = get_session()
     try:
-        chain = session.query(SupplyChain).get(sc_id)
+        chain = session.query(SupplyChain).options(joinedload(SupplyChain.items)).get(sc_id)
         if not chain:
             return None
         
         supplier = session.query(Supplier).get(chain.supplier_id)
         
         # 解析定价配置
-        pricing_dict = chain.get_pricing_dict()
+        try:
+            pricing_dict = chain.get_pricing_dict() if hasattr(chain, 'get_pricing_dict') else {}
+            if not isinstance(pricing_dict, dict):
+                pricing_dict = {}
+        except Exception:
+            pricing_dict = {}
 
         # 格式化定价明细（pricing_config 的 key 已改为 sku_id，需查询 SKU 名称用于显示）
         pricing_details = []
         sku_name_map = {}
-        for sku_id_key, price in pricing_dict.items():
-            sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
-            if sku_id_int:
-                sku_obj = session.query(SKU).get(sku_id_int)
-                sku_display_name = sku_obj.name if sku_obj else sku_id_key
-                sku_name_map[sku_id_key] = sku_display_name
-            else:
-                sku_display_name = sku_id_key
-            pricing_details.append({
-                "sku_id": sku_id_int,
-                "sku_name": sku_display_name,
-                "price": price if isinstance(price, (int, float)) else 0,
-                "price_display": f"¥{price:,.2f}" if isinstance(price, (int, float)) else str(price),
-                "is_floating": price == "浮动" if isinstance(price, str) else False
-            })
+        if pricing_dict:
+            for sku_id_key, price in pricing_dict.items():
+                sku_id_int = int(sku_id_key) if str(sku_id_key).isdigit() else None
+                if sku_id_int:
+                    sku_obj = session.query(SKU).get(sku_id_int)
+                    sku_display_name = sku_obj.name if sku_obj else sku_id_key
+                    sku_name_map[sku_id_key] = sku_display_name
+                else:
+                    sku_display_name = sku_id_key
+                price_val = price.get("price") if isinstance(price, dict) else (price if isinstance(price, (int, float)) else 0)
+                is_floating = price.get("is_floating", False) if isinstance(price, dict) else (price == "浮动" if isinstance(price, str) else False)
+                pricing_details.append({
+                    "sku_id": sku_id_int,
+                    "sku_name": sku_display_name,
+                    "price": price_val,
+                    "price_display": f"¥{price_val:,.2f}" if isinstance(price_val, (int, float)) else str(price),
+                    "is_floating": is_floating
+                })
         
         # 解析结算条款
-        payment_terms = chain.payment_terms or {}
-        
+        payment_terms = chain.payment_terms if isinstance(chain.payment_terms, dict) else {}
+
         return {
             "id": chain.id,
             "supplier_id": chain.supplier_id,

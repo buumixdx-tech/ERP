@@ -518,7 +518,7 @@ def format_vc_items_for_display(vc):
     elements = (vc['elements'] if isinstance(vc, dict) else vc.elements) or {}
 
     # 统一结构：elements["items"]（新 VC）
-    if "elements" in elements and isinstance(elements["items"], list):
+    if "items" in elements and isinstance(elements["items"], list):
         elems = elements["items"]
         if elems:
             show_items = []

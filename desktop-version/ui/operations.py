@@ -1038,20 +1038,15 @@ def show_supply_chain_list():
                 if sel_det_tab == '价格协议明细':
                     st.write("**SKU 协议单价约定**")
                     items_data = []
-                    pricing_dict = sc.get('pricing_dict', {})
-                    sku_name_map = sc.get('sku_name_map', {})  # {sku_id: sku_name}
-                    for sku_id_key, price_info in pricing_dict.items():
-                        sku_display_name = sku_name_map.get(sku_id_key, sku_id_key)
-                        if isinstance(price_info, dict):
-                            price_val = price_info.get("price", 0)
-                            is_floating = price_info.get("is_floating", False)
-                        else:
-                            price_val = price_info if price_info != "浮动" else 0.0
-                            is_floating = (price_info == "浮动")
+                    # pricing_details 已有格式化好的数据，直接使用
+                    pricing_details = sc.get('pricing_details', [])
+                    sku_name_map = sc.get('sku_name_map', {})
+                    for item in pricing_details:
+                        sku_display_name = sku_name_map.get(str(item['sku_id']), item['sku_name'])
                         items_data.append({
                             "品类名称": sku_display_name,
-                            "协议单价": price_val,
-                            "定价模式": "固定协议价" if not is_floating else "按次浮动"
+                            "协议单价": item['price'],
+                            "定价模式": "固定协议价" if not item.get('is_floating') else "按次浮动"
                         })
                     
                     if items_data:

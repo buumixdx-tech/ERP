@@ -135,7 +135,8 @@ class TestVCQueries:
         mock_vc.elements = {"total_amount": 5000}
         mock_vc.business_id = None
 
-        with patch.object(vc_q, 'get_session', return_value=mock_session):
+        with patch.object(vc_q, 'get_session', return_value=mock_session), \
+             patch.object(vc_q, '_batch_get_latest_log_ts', return_value={}):
             # 让所有 query chain 最终返回 [mock_vc]
             q = mock_session.query.return_value
             q.filter.return_value = q
@@ -291,7 +292,14 @@ class TestSupplyChainQueries:
         mock_supplier.name = "Test Supplier"
         mock_supplier.info = {}
 
-        mock_session.query.return_value.get.side_effect = lambda id: mock_sc if id == 1 else mock_supplier
+        def query_get_side_effect(model_or_id):
+            if hasattr(model_or_id, '__tablename__') and model_or_id.__tablename__ == 'supply_chains':
+                return mock_sc
+            return mock_supplier if model_or_id == 101 else None
+
+        # 处理 query(SupplyChain).options().get() 和 query(Supplier).get() 两条路径
+        mock_session.query.return_value.options.return_value.get.side_effect = lambda id: mock_sc if id == 1 else None
+        mock_session.query.return_value.get.side_effect = query_get_side_effect
 
         with patch('logic.supply_chain.queries.get_session', return_value=mock_session):
             result = get_supply_chain_detail_for_ui(1)
