@@ -124,6 +124,7 @@ def _deduct_batch_qty(session, sku_id, point_id, required_qty):
         deduct = min(batch.qty, remaining)
         batch.qty -= deduct
         remaining -= deduct
+        # 批次用完标记
         if batch.qty <= 0:
             batch.status = 'depleted'
 
