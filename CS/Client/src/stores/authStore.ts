@@ -61,16 +61,19 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       })
 
       if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.detail || '登录失败')
+        throw new Error('登录失败')
       }
 
       const data = await response.json()
-      get().setTokens(data.access_token, data.refresh_token)
+      // 支持两种格式：远端 {success, data: {access_token}} 或 本地 {access_token}
+      const token = data?.data?.access_token || data?.access_token
+      const refreshToken = data?.data?.refresh_token || data?.refresh_token
+
+      get().setTokens(token, refreshToken)
 
       // 登录后获取用户信息
       const meRes = await fetch(`${API_URL}/api/v1/auth/me`, {
-        headers: { Authorization: `Bearer ${data.access_token}` },
+        headers: { Authorization: `Bearer ${token}` },
       })
       if (meRes.ok) {
         const meData = await meRes.json()

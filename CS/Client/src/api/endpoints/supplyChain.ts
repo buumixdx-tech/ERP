@@ -64,7 +64,8 @@ export const supplyChainApi = {
     type?: SupplyChainType
     date_from?: string
     date_to?: string
-    search?: string
+    supplier_name_kw?: string
+    sku_name_kw?: string
     page?: number
     size?: number
   }) => apiClient.get<SupplyChainListResponse>('/supply-chain/list', { params }) as unknown as Promise<SupplyChainListResponse>,

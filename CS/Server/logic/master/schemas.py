@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Optional, Literal
 
 class DeleteMasterDataSchema(BaseModel):
     id: int = Field(..., description="要删除的记录ID")
@@ -45,7 +45,9 @@ class PartnerSchema(BaseModel):
 class PartnerRelationSchema(BaseModel):
     id: Optional[int] = Field(None, description="关联ID")
     partner_id: int = Field(..., description="合作方ID")
-    owner_type: str = Field(..., description="归属主体类型 (business/supply_chain/ourselves)")
+    owner_type: Literal["business", "supply_chain", "ourselves"] = Field(
+        ..., description="归属主体类型 (business=业务, supply_chain=供应链, ourselves=我方)"
+    )
     owner_id: Optional[int] = Field(None, description="归属主体ID (ourselves时为None)")
     relation_type: str = Field(..., description="合作模式")
     remark: Optional[str] = Field(None, description="备注")

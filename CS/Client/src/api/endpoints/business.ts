@@ -1,14 +1,14 @@
 import { apiClient } from '../client'
 
-// Backend constants (Chinese)
+// Backend constants (Chinese) — must match DB column business.status
 export type BusinessStatus =
   | '前期接洽'
   | '业务评估'
   | '客户反馈'
   | '合作落地'
   | '业务开展'
-  | '暂停'
-  | '终止'
+  | '业务暂缓'
+  | '业务终止'
   | '业务完成'
 
 export interface Business {
@@ -100,6 +100,8 @@ export type AddonStatus = '生效' | '失效' | '过期'
 export interface AddonBusiness {
   id: number
   business_id: number
+  business_name?: string
+  customer_name?: string
   addon_type: string
   status: string
   sku_id?: number
@@ -139,7 +141,8 @@ export const businessApi = {
     status?: string
     date_from?: string
     date_to?: string
-    search?: string
+    customer_name_kw?: string
+    sku_name_kw?: string
     page?: number
     size?: number
   }) => apiClient.get<BusinessListResponse>('/business/list', { params }) as unknown as Promise<BusinessListResponse>,
@@ -167,6 +170,19 @@ export const businessApi = {
   listActiveAddons: (businessId: number) =>
     apiClient.get<AddonBusiness[]>(`/business/addons/active/${businessId}`) as unknown as Promise<AddonBusiness[]>,
 
+  listAddonsGlobal: (params?: {
+    business_id?: number
+    customer_name_kw?: string
+    sku_name_kw?: string
+    status?: string
+    page?: number
+    size?: number
+  }) =>
+    apiClient.get<{ items: AddonBusiness[]; total: number; page: number; size: number }>(
+      '/business/addons/global',
+      { params }
+    ) as unknown as Promise<{ items: AddonBusiness[]; total: number; page: number; size: number }>,
+
   getAddonDetail: (addonId: number) =>
     apiClient.get<AddonBusiness>(`/business/addons/detail/${addonId}`) as unknown as Promise<AddonBusiness>,
 
@@ -177,5 +193,5 @@ export const businessApi = {
     apiClient.put<{ success: boolean }>('/business/addons/update', data) as unknown as Promise<{ success: boolean }>,
 
   deactivateAddon: (addonId: number) =>
-    apiClient.post<{ success: boolean }>('/business/addons/deactivate', { addon_id: addonId }) as unknown as Promise<{ success: boolean }>,
+    apiClient.post<{ success: boolean }>('/business/addons/deactivate', undefined, { params: { addon_id: addonId } }) as unknown as Promise<{ success: boolean }>,
 }

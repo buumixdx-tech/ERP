@@ -46,7 +46,8 @@ def get_supply_chains(
     type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    search: Optional[str] = None,
+    supplier_name_kw: Optional[str] = None,
+    sku_name_kw: Optional[str] = None,
     page: int = 1,
     size: int = 50,
     session: Session = Depends(get_db)
@@ -56,7 +57,9 @@ def get_supply_chains(
     result = list_supply_chains(session, ids=id_list, supplier_id=supplier_id,
                                  supplier_ids=sup_ids, status=status, type=type,
                                  date_from=date_from, date_to=date_to,
-                                 search=search, page=page, size=size)
+                                 supplier_name_kw=supplier_name_kw,
+                                 sku_name_kw=sku_name_kw,
+                                 page=page, size=size)
     return api_success(result)
 
 

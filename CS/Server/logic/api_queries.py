@@ -6,7 +6,7 @@ API 层专用查询函数（Session-based）
 """
 
 from typing import Any, Dict, List, Optional
-from sqlalchemy import func, and_, or_, exists
+from sqlalchemy import func, and_, or_, exists, text
 from sqlalchemy.orm import Session, selectinload
 
 from models import (
@@ -15,6 +15,7 @@ from models import (
     Logistics, ExpressOrder, SupplyChain, SupplyChainItem,
     TimeRule, SystemEvent, MaterialInventory, EquipmentInventory,
     PartnerRelation, SKU as SKUModel, Point as PointModel,
+    AddonBusiness,
 )
 from logic.constants import VCStatus
 
@@ -257,9 +258,10 @@ def _bank_account_to_dict(a: BankAccount) -> Dict[str, Any]:
 def list_businesses(session: Session, ids: Optional[List[int]] = None,
                     customer_id: Optional[int] = None, customer_ids: Optional[List[int]] = None,
                     status: Optional[str] = None, date_from: Optional[str] = None,
-                    date_to: Optional[str] = None, search: Optional[str] = None,
+                    date_to: Optional[str] = None, customer_name_kw: Optional[str] = None,
+                    sku_name_kw: Optional[str] = None,
                     page: int = 1, size: int = 50) -> Dict[str, Any]:
-    q = session.query(Business)
+    q = session.query(Business).options(selectinload(Business.customer))
     if ids:
         q = q.filter(Business.id.in_(ids))
     if customer_id is not None:
@@ -272,16 +274,35 @@ def list_businesses(session: Session, ids: Optional[List[int]] = None,
         q = q.filter(Business.timestamp >= date_from)
     if date_to:
         q = q.filter(Business.timestamp <= date_to)
-    if search:
+    if customer_name_kw:
         q = q.join(ChannelCustomer, Business.customer_id == ChannelCustomer.id).filter(
-            ChannelCustomer.name.ilike(f"%{search}%"))
+            ChannelCustomer.name.ilike(f"%{customer_name_kw}%"))
+    if sku_name_kw:
+        # 先找到名称匹配的 SKU IDs
+        matching_sku_ids = [s.id for s in session.query(SKUModel).filter(
+            SKUModel.name.ilike(f"%{sku_name_kw}%")
+        ).all()]
+        if not matching_sku_ids:
+            q = q.filter(Business.id.in_([-1]))  # no match
+        else:
+            # 用 text() + json_each 检查 business.details['pricing'] 里是否有匹配的 SKU ID key
+            sku_id_conditions = " OR ".join(
+                f"business.details->'pricing'->>'{sid}' IS NOT NULL" for sid in matching_sku_ids
+            )
+            q = q.filter(
+                Business.details.isnot(None),
+                text(f"({sku_id_conditions})")
+            )
     total = q.count()
-    items = q.order_by(Business.id.desc()).offset((page - 1) * size).limit(size).all()
+    if size and size > 0:
+        items = q.order_by(Business.id.desc()).offset((page - 1) * size).limit(size).all()
+    else:
+        items = q.order_by(Business.id.desc()).all()
     return {"items": [_business_to_dict(b) for b in items], "total": total, "page": page, "size": size}
 
 
 def get_business(session: Session, bid: int) -> Optional[Dict[str, Any]]:
-    biz = session.query(Business).get(bid)
+    biz = session.query(Business).options(selectinload(Business.customer)).get(bid)
     if not biz:
         return None
     vcs = session.query(VirtualContract).filter(VirtualContract.business_id == bid).all()
@@ -295,7 +316,8 @@ def _business_to_dict(b: Business) -> Dict[str, Any]:
     if b is None:
         return {}
     return {"id": b.id, "customer_id": b.customer_id, "status": b.status,
-            "details": b.details or {}, "timestamp": b.timestamp.isoformat() if b.timestamp else None}
+            "details": b.details or {}, "created_at": b.timestamp.isoformat() if b.timestamp else None,
+            "customer_name": b.customer.name if b.customer else None}
 
 
 # =============================================================================
@@ -307,7 +329,19 @@ def list_vcs(session: Session, ids: Optional[List[int]] = None, business_id: Opt
              cash_status: Optional[str] = None, subject_status: Optional[str] = None,
              date_from: Optional[str] = None, date_to: Optional[str] = None,
              search: Optional[str] = None, page: int = 1, size: int = 50) -> Dict[str, Any]:
-    q = session.query(VirtualContract)
+    # Get earliest VC_CREATED event per VC as creation time
+    vc_created = session.query(
+        SystemEvent.aggregate_id,
+        func.min(SystemEvent.created_at).label('created_time')
+    ).filter(
+        SystemEvent.event_type == 'VC_CREATED',
+        SystemEvent.aggregate_type == 'VirtualContract'
+    ).group_by(SystemEvent.aggregate_id).subquery()
+
+    q = session.query(VirtualContract, vc_created.c.created_time).outerjoin(
+        vc_created, VirtualContract.id == vc_created.c.aggregate_id
+    )
+
     if ids:
         q = q.filter(VirtualContract.id.in_(ids))
     if business_id is not None:
@@ -320,30 +354,154 @@ def list_vcs(session: Session, ids: Optional[List[int]] = None, business_id: Opt
         q = q.filter(VirtualContract.cash_status == cash_status)
     if subject_status:
         q = q.filter(VirtualContract.subject_status == subject_status)
-    if date_from or date_to:
-        created_log = session.query(
-            VirtualContractStatusLog.vc_id,
-            func.min(VirtualContractStatusLog.timestamp).label('created_time')
-        ).filter(
-            VirtualContractStatusLog.category == 'status',
-            VirtualContractStatusLog.status_name == VCStatus.EXE
-        ).group_by(VirtualContractStatusLog.vc_id).subquery()
-        q = q.join(created_log, VirtualContract.id == created_log.c.vc_id)
-        if date_from:
-            q = q.filter(func.date(created_log.c.created_time) >= date_from)
-        if date_to:
-            q = q.filter(func.date(created_log.c.created_time) <= date_to)
+    if date_from:
+        q = q.filter(func.date(vc_created.c.created_time) >= date_from)
+    if date_to:
+        q = q.filter(func.date(vc_created.c.created_time) <= date_to)
     if search:
         q = q.filter(VirtualContract.description.ilike(f"%{search}%"))
+    total = q.count()
+    items = q.order_by(VirtualContract.id.desc()).offset((page - 1) * size).limit(size).all()
+
+    result = []
+    for vc_row in items:
+        vc = vc_row[0]
+        created_at_val = vc_row[1]
+        d = _vc_to_dict(vc)
+        d["created_at"] = created_at_val.isoformat() if created_at_val else None
+        result.append(d)
+    return {"items": result, "total": total, "page": page, "size": size}
+
+
+def list_vcs_for_overview(session: Session,
+                          vc_id: Optional[int] = None,
+                          vc_type: Optional[str] = None,
+                          vc_status: Optional[str] = None,
+                          vc_subject_status: Optional[str] = None,
+                          vc_cash_status: Optional[str] = None,
+                          business_id: Optional[int] = None,
+                          business_customer_name_kw: Optional[str] = None,
+                          supply_chain_id: Optional[int] = None,
+                          supply_chain_supplier_name_kw: Optional[str] = None,
+                          sku_id: Optional[int] = None,
+                          sku_name_kw: Optional[str] = None,
+                          shipping_point_id: Optional[int] = None,
+                          shipping_point_name_kw: Optional[str] = None,
+                          receiving_point_id: Optional[int] = None,
+                          receiving_point_name_kw: Optional[str] = None,
+                          tracking_number: Optional[str] = None,
+                          page: int = 1, size: int = 50) -> Dict[str, Any]:
+    from sqlalchemy import cast, String, Integer
+
+    q = session.query(VirtualContract)
+
+    conditions = []
+
+    if vc_id:
+        conditions.append(VirtualContract.id == vc_id)
+    if vc_type:
+        conditions.append(VirtualContract.type == vc_type)
+    if vc_status:
+        conditions.append(VirtualContract.status == vc_status)
+    if vc_subject_status:
+        conditions.append(VirtualContract.subject_status == vc_subject_status)
+    if vc_cash_status:
+        conditions.append(VirtualContract.cash_status == vc_cash_status)
+
+    if business_id:
+        conditions.append(VirtualContract.business_id == business_id)
+    if business_customer_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.business_id == Business.id,
+                Business.customer_id == ChannelCustomer.id,
+                ChannelCustomer.name.ilike(f"%{business_customer_name_kw}%")
+            )
+        )
+
+    if supply_chain_id:
+        conditions.append(VirtualContract.supply_chain_id == supply_chain_id)
+    if supply_chain_supplier_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.supply_chain_id == SupplyChain.id,
+                SupplyChain.supplier_id == Supplier.id,
+                Supplier.name.ilike(f"%{supply_chain_supplier_name_kw}%")
+            )
+        )
+
+    # elements JSON: {"elements": [{"shipping_point_id": ..., "receiving_point_id": ..., "sku_id": ...}]}
+    if sku_id:
+        conditions.append(
+            cast(VirtualContract.elements, String).ilike(f'%\"sku_id\": {sku_id}%')
+        )
+    if sku_name_kw:
+        from sqlalchemy import text
+        ids = session.execute(
+            text("""
+                SELECT DISTINCT v.id FROM virtual_contracts v
+                JOIN json_each(v.elements, '$.elements') elem
+                JOIN skus s ON s.id = CAST(elem.value->>'$.sku_id' AS INTEGER)
+                WHERE s.name LIKE :name
+            """),
+            {'name': f'%{sku_name_kw}%'}
+        ).scalars().all()
+        conditions.append(VirtualContract.id.in_(ids))
+    if shipping_point_id:
+        conditions.append(
+            cast(VirtualContract.elements, String).ilike(f'%\"shipping_point_id\": {shipping_point_id}%')
+        )
+    if shipping_point_name_kw:
+        from sqlalchemy import text
+        ids = session.execute(
+            text("""
+                SELECT DISTINCT v.id FROM virtual_contracts v
+                JOIN json_each(v.elements, '$.elements') elem
+                JOIN points p ON p.id = CAST(elem.value->>'$.shipping_point_id' AS INTEGER)
+                WHERE p.name LIKE :name
+            """),
+            {'name': f'%{shipping_point_name_kw}%'}
+        ).scalars().all()
+        conditions.append(VirtualContract.id.in_(ids))
+    if receiving_point_id:
+        conditions.append(
+            cast(VirtualContract.elements, String).ilike(f'%\"receiving_point_id\": {receiving_point_id}%')
+        )
+    if receiving_point_name_kw:
+        from sqlalchemy import text
+        ids = session.execute(
+            text("""
+                SELECT DISTINCT v.id FROM virtual_contracts v
+                JOIN json_each(v.elements, '$.elements') elem
+                JOIN points p ON p.id = CAST(elem.value->>'$.receiving_point_id' AS INTEGER)
+                WHERE p.name LIKE :name
+            """),
+            {'name': f'%{receiving_point_name_kw}%'}
+        ).scalars().all()
+        conditions.append(VirtualContract.id.in_(ids))
+
+    if tracking_number:
+        conditions.append(
+            exists().where(
+                Logistics.virtual_contract_id == VirtualContract.id,
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.tracking_number.ilike(f"%{tracking_number}%")
+            )
+        )
+
+    if conditions:
+        q = q.filter(and_(*conditions))
+
     total = q.count()
     items = q.order_by(VirtualContract.id.desc()).offset((page - 1) * size).limit(size).all()
     return {"items": [_vc_to_dict(v) for v in items], "total": total, "page": page, "size": size}
 
 
 def get_vc(session: Session, vc_id: int) -> Optional[Dict[str, Any]]:
+    from models import Logistics
     vc = session.query(VirtualContract).options(
         selectinload(VirtualContract.status_logs),
-        selectinload(VirtualContract.logistics),
+        selectinload(VirtualContract.logistics).selectinload(Logistics.express_orders),
         selectinload(VirtualContract.cash_flows),
     ).get(vc_id)
     if not vc:
@@ -351,7 +509,35 @@ def get_vc(session: Session, vc_id: int) -> Optional[Dict[str, Any]]:
     data = _vc_to_dict(vc)
     data["status_logs"] = [{"id": l.id, "category": l.category, "status_name": l.status_name,
                               "timestamp": l.timestamp.isoformat() if l.timestamp else None} for l in vc.status_logs]
-    data["logistics"] = [{"id": l.id, "status": l.status, "timestamp": l.timestamp.isoformat() if l.timestamp else None} for l in vc.logistics]
+
+    # Enrich elements with SKU names
+    elements = data.get("elements", {})
+    elem_list = elements.get("elements", []) if isinstance(elements, dict) else []
+    if elem_list:
+        sku_ids = list(set(e.get("sku_id") for e in elem_list if e.get("sku_id")))
+        sku_map = {s.id: s.name for s in session.query(SKUModel).filter(SKUModel.id.in_(sku_ids)).all()} if sku_ids else {}
+        for e in elem_list:
+            e["sku_name"] = sku_map.get(e.get("sku_id"), f"SKU-{e.get('sku_id')}")
+
+    data["logistics"] = [
+        {
+            "id": l.id,
+            "virtual_contract_id": l.virtual_contract_id,
+            "status": l.status,
+            "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+            "express_orders": [
+                {
+                    "id": o.id,
+                    "tracking_number": o.tracking_number,
+                    "status": o.status,
+                    "items": o.items,
+                    "address_info": o.address_info,
+                }
+                for o in l.express_orders
+            ],
+        }
+        for l in vc.logistics
+    ]
     data["cash_flows"] = [{"id": c.id, "type": c.type, "amount": c.amount,
                              "transaction_date": c.transaction_date.isoformat() if c.transaction_date else None} for c in vc.cash_flows]
     return data
@@ -360,11 +546,13 @@ def get_vc(session: Session, vc_id: int) -> Optional[Dict[str, Any]]:
 def _vc_to_dict(v: VirtualContract) -> Dict[str, Any]:
     if v is None:
         return {}
+    elements = v.elements or {}
     return {"id": v.id, "business_id": v.business_id, "type": v.type, "status": v.status,
             "cash_status": v.cash_status, "subject_status": v.subject_status,
-            "description": v.description, "elements": v.elements or {},
+            "description": v.description, "elements": elements,
             "deposit_info": v.deposit_info or {}, "supply_chain_id": v.supply_chain_id,
             "related_vc_id": v.related_vc_id,
+            "total_amount": elements.get("total_amount", 0) if elements else 0,
             "status_timestamp": v.status_timestamp.isoformat() if v.status_timestamp else None}
 
 
@@ -375,14 +563,17 @@ def _vc_to_dict(v: VirtualContract) -> Dict[str, Any]:
 def list_logistics(session: Session, ids: Optional[List[int]] = None, vc_id: Optional[int] = None,
                    status: Optional[str] = None, date_from: Optional[str] = None,
                    date_to: Optional[str] = None, tracking_number: Optional[str] = None,
-                   page: int = 1, size: int = 50) -> Dict[str, Any]:
-    q = session.query(Logistics)
+                   page: int = 1, size: int = 20) -> Dict[str, Any]:
+    q = session.query(Logistics).options(selectinload(Logistics.express_orders))
     if ids:
         q = q.filter(Logistics.id.in_(ids))
     if vc_id is not None:
         q = q.filter(Logistics.virtual_contract_id == vc_id)
     if status:
-        q = q.filter(Logistics.status == status)
+        if status == '待处理':
+            q = q.filter(Logistics.status.in_(['待发货', '在途', '签收']))
+        else:
+            q = q.filter(Logistics.status == status)
     if date_from:
         q = q.filter(Logistics.timestamp >= date_from)
     if date_to:
@@ -407,6 +598,25 @@ def get_logistics(session: Session, log_id: int) -> Optional[Dict[str, Any]]:
     data = _logistics_to_dict(log)
     data["express_orders"] = [{"id": e.id, "tracking_number": e.tracking_number, "status": e.status,
                                  "address_info": e.address_info, "items": e.items} for e in log.express_orders]
+    # Load VC detail for elements and vc_type
+    vc = session.query(VirtualContract).get(log.virtual_contract_id)
+    if vc:
+        data["vc_type"] = vc.type
+        # elements stored as {"elements": [...], "total_amount": ..., "payment_terms": ...}
+        elements = (vc.elements or {}).get("elements", []) if isinstance(vc.elements, dict) else []
+        # Enrich with SKU and Point names
+        if elements:
+            sku_ids = set(e.get("sku_id") for e in elements if e.get("sku_id"))
+            rp_ids = set(e.get("receiving_point_id") for e in elements if e.get("receiving_point_id"))
+            sp_ids = set(e.get("shipping_point_id") for e in elements if e.get("shipping_point_id"))
+            sku_names = {s.id: s.name for s in session.query(SKU).filter(SKU.id.in_(sku_ids)).all()} if sku_ids else {}
+            rp_names = {p.id: p.name for p in session.query(Point).filter(Point.id.in_(rp_ids)).all()} if rp_ids else {}
+            sp_names = {p.id: p.name for p in session.query(Point).filter(Point.id.in_(sp_ids)).all()} if sp_ids else {}
+            for e in elements:
+                e["sku_name"] = sku_names.get(e.get("sku_id"), f"SKU-{e.get('sku_id')}")
+                e["receiving_point_name"] = rp_names.get(e.get("receiving_point_id"), f"点位-{e.get('receiving_point_id')}")
+                e["shipping_point_name"] = sp_names.get(e.get("shipping_point_id"), f"点位-{e.get('shipping_point_id')}")
+        data["elements"] = elements
     return data
 
 
@@ -414,7 +624,322 @@ def _logistics_to_dict(l: Logistics) -> Dict[str, Any]:
     if l is None:
         return {}
     return {"id": l.id, "virtual_contract_id": l.virtual_contract_id, "status": l.status,
-            "timestamp": l.timestamp.isoformat() if l.timestamp else None}
+            "created_at": l.timestamp.isoformat() if l.timestamp else None,
+            "express_orders_count": len(l.express_orders) if l.express_orders else 0}
+
+
+# =============================================================================
+# Express Order Global Query (Tab 2)
+# =============================================================================
+
+def list_express_orders_global(session: Session,
+                               ids: Optional[List[int]] = None,
+                               tracking_number: Optional[str] = None,
+                               status: Optional[str] = None,
+                               date_from: Optional[str] = None,
+                               date_to: Optional[str] = None,
+                               sku_id: Optional[int] = None,
+                               sku_name_kw: Optional[str] = None,
+                               shipping_point_id: Optional[int] = None,
+                               shipping_point_name_kw: Optional[str] = None,
+                               receiving_point_id: Optional[int] = None,
+                               receiving_point_name_kw: Optional[str] = None,
+                               vc_id: Optional[int] = None,
+                               vc_type: Optional[str] = None,
+                               vc_status_type: Optional[str] = None,
+                               vc_status_value: Optional[str] = None,
+                               subject_status: Optional[str] = None,
+                               business_id: Optional[int] = None,
+                               business_customer_name_kw: Optional[str] = None,
+                               supply_chain_id: Optional[int] = None,
+                               supply_chain_supplier_name_kw: Optional[str] = None,
+                               page: int = 1, size: int = 20) -> Dict[str, Any]:
+    from sqlalchemy import exists, and_, cast, Integer, String
+
+    q = session.query(ExpressOrder).outerjoin(
+        Logistics, ExpressOrder.logistics_id == Logistics.id
+    ).outerjoin(
+        VirtualContract, Logistics.virtual_contract_id == VirtualContract.id
+    )
+
+    conditions = []
+
+    if ids:
+        conditions.append(ExpressOrder.id.in_(ids))
+    if tracking_number:
+        conditions.append(ExpressOrder.tracking_number.ilike(f"%{tracking_number}%"))
+    if status:
+        conditions.append(ExpressOrder.status == status)
+    if date_from:
+        conditions.append(ExpressOrder.timestamp >= date_from)
+    if date_to:
+        conditions.append(ExpressOrder.timestamp <= date_to)
+
+    if sku_id:
+        # items is stored as JSON array [{"sku_id": 2, ...}], cast produces JSON double-quote format
+        conditions.append(cast(ExpressOrder.items, String).ilike(f'%\"sku_id\": {sku_id}%'))
+    if sku_name_kw:
+        conditions.append(cast(ExpressOrder.items, String).ilike(f"%{sku_name_kw}%"))
+
+    if shipping_point_id:
+        conditions.append(ExpressOrder.address_info.op('->>')('发货点位Id').cast(Integer) == shipping_point_id)
+    if shipping_point_name_kw:
+        conditions.append(ExpressOrder.address_info.op('->>')('发货点位名称').ilike(f"%{shipping_point_name_kw}%"))
+    if receiving_point_id:
+        conditions.append(ExpressOrder.address_info.op('->>')('收货点位Id').cast(Integer) == receiving_point_id)
+    if receiving_point_name_kw:
+        conditions.append(ExpressOrder.address_info.op('->>')('收货点位名称').ilike(f"%{receiving_point_name_kw}%"))
+
+    if vc_id:
+        conditions.append(Logistics.virtual_contract_id == vc_id)
+    if vc_type:
+        conditions.append(VirtualContract.type == vc_type)
+    if vc_status_type and vc_status_value:
+        if vc_status_type == '主状态':
+            conditions.append(VirtualContract.status == vc_status_value)
+        elif vc_status_type == '合同状态':
+            conditions.append(VirtualContract.subject_status == vc_status_value)
+    if subject_status:
+        conditions.append(VirtualContract.subject_status == subject_status)
+
+    if business_id:
+        conditions.append(VirtualContract.business_id == business_id)
+    if business_customer_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.business_id == Business.id,
+                Business.customer_id == ChannelCustomer.id,
+                ChannelCustomer.name.ilike(f"%{business_customer_name_kw}%")
+            )
+        )
+
+    if supply_chain_id:
+        conditions.append(VirtualContract.supply_chain_id == supply_chain_id)
+    if supply_chain_supplier_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.supply_chain_id == SupplyChain.id,
+                SupplyChain.supplier_id == Supplier.id,
+                Supplier.name.ilike(f"%{supply_chain_supplier_name_kw}%")
+            )
+        )
+
+    for cond in conditions:
+        q = q.filter(cond)
+
+    total = q.count()
+    items = q.order_by(ExpressOrder.id.desc()).offset((page - 1) * size).limit(size).all()
+
+    # Enrich
+    result = []
+    for e in items:
+        log = session.query(Logistics).get(e.logistics_id)
+        vc = session.query(VirtualContract).get(log.virtual_contract_id) if log else None
+
+        sku_ids = set()
+        sp_ids = set()
+        rp_ids = set()
+        if e.items:
+            for item in (e.items if isinstance(e.items, list) else []):
+                if isinstance(item, dict) and item.get('sku_id'):
+                    sku_ids.add(item['sku_id'])
+        if isinstance(e.address_info, dict):
+            sp_id = e.address_info.get('发货点位Id')
+            rp_id = e.address_info.get('收货点位Id')
+            if sp_id:
+                sp_ids.add(sp_id)
+            if rp_id:
+                rp_ids.add(rp_id)
+
+        sku_map = {s.id: s.name for s in session.query(SKU).filter(SKU.id.in_(sku_ids)).all()} if sku_ids else {}
+        sp_map = {p.id: p.name for p in session.query(Point).filter(Point.id.in_(sp_ids)).all()} if sp_ids else {}
+        rp_map = {p.id: p.name for p in session.query(Point).filter(Point.id.in_(rp_ids)).all()} if rp_ids else {}
+
+        enriched_items = []
+        for item in (e.items if isinstance(e.items, list) else []):
+            if isinstance(item, dict):
+                enriched_items.append({
+                    **item,
+                    'sku_name': sku_map.get(item.get('sku_id'), item.get('sku_name', f"SKU-{item.get('sku_id')}")),
+                })
+
+        result.append({
+            'id': e.id,
+            'tracking_number': e.tracking_number,
+            'status': e.status,
+            'created_at': e.timestamp.isoformat() if e.timestamp else None,
+            'logistics_id': e.logistics_id,
+            'items': enriched_items,
+            'address_info': e.address_info,
+            'vc_id': vc.id if vc else None,
+            'vc_type': vc.type if vc else None,
+            'vc_subject_status': vc.subject_status if vc else None,
+        })
+
+    return {"items": result, "total": total, "page": page, "size": size}
+
+
+# =============================================================================
+# Logistics Global Query (Tab 3)
+# =============================================================================
+
+def list_logistics_global(session: Session,
+                          ids: Optional[List[int]] = None,
+                          status: Optional[str] = None,
+                          date_from: Optional[str] = None,
+                          date_to: Optional[str] = None,
+                          tracking_number: Optional[str] = None,
+                          express_order_id: Optional[int] = None,
+                          sku_id: Optional[int] = None,
+                          sku_name_kw: Optional[str] = None,
+                          shipping_point_id: Optional[int] = None,
+                          shipping_point_name_kw: Optional[str] = None,
+                          receiving_point_id: Optional[int] = None,
+                          receiving_point_name_kw: Optional[str] = None,
+                          vc_id: Optional[int] = None,
+                          vc_type: Optional[str] = None,
+                          vc_status_type: Optional[str] = None,
+                          vc_status_value: Optional[str] = None,
+                          subject_status: Optional[str] = None,
+                          business_id: Optional[int] = None,
+                          business_customer_name_kw: Optional[str] = None,
+                          supply_chain_id: Optional[int] = None,
+                          supply_chain_supplier_name_kw: Optional[str] = None,
+                          page: int = 1, size: int = 20) -> Dict[str, Any]:
+    from sqlalchemy import exists, cast, Integer, String
+
+    q = session.query(Logistics).outerjoin(
+        VirtualContract, Logistics.virtual_contract_id == VirtualContract.id
+    )
+
+    conditions = []
+
+    if ids:
+        conditions.append(Logistics.id.in_(ids))
+    if status:
+        conditions.append(Logistics.status == status)
+    if date_from:
+        conditions.append(Logistics.timestamp >= date_from)
+    if date_to:
+        conditions.append(Logistics.timestamp <= date_to)
+
+    if tracking_number:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.tracking_number.ilike(f"%{tracking_number}%")
+            )
+        )
+    if express_order_id:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.id == express_order_id
+            )
+        )
+
+    if sku_id:
+        # items is JSON array, use cast to text for array elements
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                cast(ExpressOrder.items, String).ilike(f'%\"sku_id\": {sku_id}%')
+            )
+        )
+    if sku_name_kw:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                cast(ExpressOrder.items, String).ilike(f"%{sku_name_kw}%")
+            )
+        )
+
+    if shipping_point_id:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.address_info.op('->>')('发货点位Id').cast(Integer) == shipping_point_id
+            )
+        )
+    if shipping_point_name_kw:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.address_info.op('->>')('发货点位名称').ilike(f"%{shipping_point_name_kw}%")
+            )
+        )
+    if receiving_point_id:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.address_info.op('->>')('收货点位Id').cast(Integer) == receiving_point_id
+            )
+        )
+    if receiving_point_name_kw:
+        conditions.append(
+            exists().where(
+                ExpressOrder.logistics_id == Logistics.id,
+                ExpressOrder.address_info.op('->>')('收货点位名称').ilike(f"%{receiving_point_name_kw}%")
+            )
+        )
+
+    if vc_id:
+        conditions.append(Logistics.virtual_contract_id == vc_id)
+    if vc_type:
+        conditions.append(VirtualContract.type == vc_type)
+    if vc_status_type and vc_status_value:
+        if vc_status_type == '主状态':
+            conditions.append(VirtualContract.status == vc_status_value)
+        elif vc_status_type == '合同状态':
+            conditions.append(VirtualContract.subject_status == vc_status_value)
+    if subject_status:
+        conditions.append(VirtualContract.subject_status == subject_status)
+
+    if business_id:
+        conditions.append(VirtualContract.business_id == business_id)
+    if business_customer_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.business_id == Business.id,
+                Business.customer_id == ChannelCustomer.id,
+                ChannelCustomer.name.ilike(f"%{business_customer_name_kw}%")
+            )
+        )
+
+    if supply_chain_id:
+        conditions.append(VirtualContract.supply_chain_id == supply_chain_id)
+    if supply_chain_supplier_name_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.supply_chain_id == SupplyChain.id,
+                SupplyChain.supplier_id == Supplier.id,
+                Supplier.name.ilike(f"%{supply_chain_supplier_name_kw}%")
+            )
+        )
+
+    for cond in conditions:
+        q = q.filter(cond)
+
+    total = q.count()
+    items = q.order_by(Logistics.id.desc()).offset((page - 1) * size).limit(size).all()
+
+    # Enrich with VC type
+    vc_ids = list(set(l.virtual_contract_id for l in items if l.virtual_contract_id))
+    vc_map = {vc.id: vc for vc in session.query(VirtualContract).filter(VirtualContract.id.in_(vc_ids)).all()} if vc_ids else {}
+
+    result = []
+    for l in items:
+        vc = vc_map.get(l.virtual_contract_id)
+        result.append({
+            'id': l.id,
+            'virtual_contract_id': l.virtual_contract_id,
+            'status': l.status,
+            'created_at': l.timestamp.isoformat() if l.timestamp else None,
+            'express_orders_count': len(l.express_orders) if l.express_orders else 0,
+            'vc_type': vc.type if vc else None,
+        })
+
+    return {"items": result, "total": total, "page": page, "size": size}
 
 
 # =============================================================================
@@ -426,28 +951,87 @@ def list_cashflows(session: Session, ids: Optional[List[int]] = None,
                    type: Optional[str] = None, payer_id: Optional[int] = None,
                    payee_id: Optional[int] = None, date_from: Optional[str] = None,
                    date_to: Optional[str] = None, amount_min: Optional[float] = None,
-                   amount_max: Optional[float] = None, page: int = 1, size: int = 50) -> Dict[str, Any]:
-    q = session.query(CashFlow)
+                   amount_max: Optional[float] = None, page: int = 1, size: int = 50,
+                   # Extended search params
+                   business_ids: Optional[List[int]] = None,
+                   sc_ids: Optional[List[int]] = None,
+                   customer_kw: Optional[str] = None,
+                   supplier_kw: Optional[str] = None,
+                   payer_name_kw: Optional[str] = None,
+                   payee_name_kw: Optional[str] = None) -> Dict[str, Any]:
+    from sqlalchemy.orm import joinedload
+    from sqlalchemy import or_, exists
+
+    q = session.query(CashFlow).options(
+        joinedload(CashFlow.payer_account),
+        joinedload(CashFlow.payee_account)
+    )
+
+    # Build filter conditions
+    conditions = []
+
     if ids:
-        q = q.filter(CashFlow.id.in_(ids))
+        conditions.append(CashFlow.id.in_(ids))
     if vc_id is not None:
-        q = q.filter(CashFlow.virtual_contract_id == vc_id)
+        conditions.append(CashFlow.virtual_contract_id == vc_id)
     if vc_ids:
-        q = q.filter(CashFlow.virtual_contract_id.in_(vc_ids))
+        conditions.append(CashFlow.virtual_contract_id.in_(vc_ids))
     if type:
-        q = q.filter(CashFlow.type == type)
+        conditions.append(CashFlow.type == type)
     if payer_id is not None:
-        q = q.filter(CashFlow.payer_account_id == payer_id)
+        conditions.append(CashFlow.payer_account_id == payer_id)
     if payee_id is not None:
-        q = q.filter(CashFlow.payee_account_id == payee_id)
+        conditions.append(CashFlow.payee_account_id == payee_id)
     if date_from:
-        q = q.filter(CashFlow.transaction_date >= date_from)
+        conditions.append(CashFlow.transaction_date >= date_from)
     if date_to:
-        q = q.filter(CashFlow.transaction_date <= date_to)
+        conditions.append(CashFlow.transaction_date <= date_to)
     if amount_min is not None:
-        q = q.filter(CashFlow.amount >= amount_min)
+        conditions.append(CashFlow.amount >= amount_min)
     if amount_max is not None:
-        q = q.filter(CashFlow.amount <= amount_max)
+        conditions.append(CashFlow.amount <= amount_max)
+
+    # Cross-table filters using exists subqueries
+    if business_ids:
+        conditions.append(
+            exists().where(
+                VirtualContract.id == CashFlow.virtual_contract_id,
+                VirtualContract.business_id.in_(business_ids)
+            )
+        )
+    if sc_ids:
+        conditions.append(
+            exists().where(
+                VirtualContract.id == CashFlow.virtual_contract_id,
+                VirtualContract.supply_chain_id.in_(sc_ids)
+            )
+        )
+    if customer_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.id == CashFlow.virtual_contract_id,
+                VirtualContract.business_id == Business.id,
+                Business.customer_id == ChannelCustomer.id,
+                ChannelCustomer.name.ilike(f'%{customer_kw}%')
+            )
+        )
+    if supplier_kw:
+        conditions.append(
+            exists().where(
+                VirtualContract.id == CashFlow.virtual_contract_id,
+                VirtualContract.supply_chain_id == SupplyChain.id,
+                SupplyChain.supplier_id == Supplier.id,
+                Supplier.name.ilike(f'%{supplier_kw}%')
+            )
+        )
+    if payer_name_kw:
+        conditions.append(CashFlow.payer_account_name.ilike(f'%{payer_name_kw}%'))
+    if payee_name_kw:
+        conditions.append(CashFlow.payee_account_name.ilike(f'%{payee_name_kw}%'))
+
+    for cond in conditions:
+        q = q.filter(cond)
+
     total = q.count()
     items = q.order_by(CashFlow.transaction_date.desc()).offset((page - 1) * size).limit(size).all()
     return {"items": [_cashflow_to_dict(c) for c in items], "total": total, "page": page, "size": size}
@@ -461,9 +1045,20 @@ def get_cashflow(session: Session, cf_id: int) -> Optional[Dict[str, Any]]:
 def _cashflow_to_dict(c: CashFlow) -> Dict[str, Any]:
     if c is None:
         return {}
-    return {"id": c.id, "virtual_contract_id": c.virtual_contract_id, "type": c.type,
+    payer_acc = c.payer_account
+    payee_acc = c.payee_account
+    payer_info = payer_acc.account_info if payer_acc and payer_acc.account_info else {}
+    payee_info = payee_acc.account_info if payee_acc and payee_acc.account_info else {}
+    vc = c.virtual_contract
+    return {"id": c.id, "virtual_contract_id": c.virtual_contract_id,
+            "vc_type": vc.type if vc else None,
+            "type": c.type,
             "amount": c.amount, "payer_account_id": c.payer_account_id,
             "payee_account_id": c.payee_account_id,
+            "payer_owner_type": payer_acc.owner_type if payer_acc else None,
+            "payee_owner_type": payee_acc.owner_type if payee_acc else None,
+            "payer_account_name": payer_info.get("开户名称") or payer_info.get("bank_name") or payer_info.get("bank") or None,
+            "payee_account_name": payee_info.get("开户名称") or payee_info.get("bank_name") or payee_info.get("bank") or None,
             "transaction_date": c.transaction_date.isoformat() if c.transaction_date else None,
             "description": c.description}
 
@@ -476,7 +1071,9 @@ def list_supply_chains(session: Session, ids: Optional[List[int]] = None,
                        supplier_id: Optional[int] = None, supplier_ids: Optional[List[int]] = None,
                        status: Optional[str] = None, type: Optional[str] = None,
                        date_from: Optional[str] = None, date_to: Optional[str] = None,
-                       search: Optional[str] = None, page: int = 1, size: int = 50) -> Dict[str, Any]:
+                       supplier_name_kw: Optional[str] = None,
+                       sku_name_kw: Optional[str] = None,
+                       page: int = 1, size: int = 50) -> Dict[str, Any]:
     q = session.query(SupplyChain)
     if ids:
         q = q.filter(SupplyChain.id.in_(ids))
@@ -501,11 +1098,18 @@ def list_supply_chains(session: Session, ids: Optional[List[int]] = None,
             q = q.filter(func.date(created_event.c.created_time) >= date_from)
         if date_to:
             q = q.filter(func.date(created_event.c.created_time) <= date_to)
-    if search:
+    if supplier_name_kw:
         q = q.join(Supplier, SupplyChain.supplier_id == Supplier.id).filter(
-            Supplier.name.ilike(f"%{search}%"))
+            Supplier.name.ilike(f"%{supplier_name_kw}%"))
+    if sku_name_kw:
+        q = q.join(SupplyChainItem, SupplyChain.id == SupplyChainItem.supply_chain_id)
+        q = q.join(SKU, SupplyChainItem.sku_id == SKU.id)
+        q = q.filter(SKU.name.ilike(f"%{sku_name_kw}%"))
     total = q.count()
-    items = q.order_by(SupplyChain.id.desc()).offset((page - 1) * size).limit(size).all()
+    if size and size > 0:
+        items = q.order_by(SupplyChain.id.desc()).offset((page - 1) * size).limit(size).all()
+    else:
+        items = q.order_by(SupplyChain.id.desc()).all()
     return {"items": [_sc_to_dict(s) for s in items], "total": total, "page": page, "size": size}
 
 
@@ -561,9 +1165,9 @@ def list_rules(session: Session, ids: Optional[List[int]] = None, related_id: Op
     if status:
         q = q.filter(TimeRule.status == status)
     if date_from:
-        q = q.filter(TimeRule.created_at >= date_from)
+        q = q.filter(TimeRule.timestamp >= date_from)
     if date_to:
-        q = q.filter(TimeRule.created_at <= date_to)
+        q = q.filter(TimeRule.timestamp <= date_to)
     total = q.count()
     items = q.order_by(TimeRule.id.desc()).offset((page - 1) * size).limit(size).all()
     return {"items": [_rule_to_dict(r) for r in items], "total": total, "page": page, "size": size}
@@ -738,3 +1342,58 @@ def mark_events_pushed(session: Session, event_ids: List[int]) -> None:
         session.query(SystemEvent).filter(SystemEvent.id.in_(event_ids)).update(
             {"pushed_to_ai": True}, synchronize_session=False
         )
+
+
+# =============================================================================
+# Addon Business Global Query
+# =============================================================================
+
+def list_addons_global(session: Session,
+                       business_id: Optional[int] = None,
+                       customer_name_kw: Optional[str] = None,
+                       sku_name_kw: Optional[str] = None,
+                       status: Optional[str] = None,
+                       page: int = 1, size: int = 20) -> Dict[str, Any]:
+    q = session.query(AddonBusiness).join(
+        Business, AddonBusiness.business_id == Business.id
+    ).outerjoin(
+        ChannelCustomer, Business.customer_id == ChannelCustomer.id
+    )
+
+    if business_id is not None:
+        q = q.filter(AddonBusiness.business_id == business_id)
+    if customer_name_kw:
+        q = q.filter(ChannelCustomer.name.ilike(f"%{customer_name_kw}%"))
+    if sku_name_kw:
+        q = q.join(SKUModel, AddonBusiness.sku_id == SKUModel.id).filter(
+            SKUModel.name.ilike(f"%{sku_name_kw}%")
+        )
+    if status:
+        q = q.filter(AddonBusiness.status == status)
+
+    total = q.count()
+    items = q.order_by(AddonBusiness.id.desc()).offset((page - 1) * size).limit(size).all()
+
+    # Batch-enrich sku_name
+    sku_ids = list(set(a.sku_id for a in items if a.sku_id))
+    sku_map = {s.id: s.name for s in session.query(SKUModel).filter(SKUModel.id.in_(sku_ids)).all()} if sku_ids else {}
+
+    result = []
+    for a in items:
+        result.append({
+            "id": a.id,
+            "business_id": a.business_id,
+            "business_name": a.business.name if a.business else None,
+            "customer_name": a.business.customer.name if a.business and a.business.customer else None,
+            "addon_type": a.addon_type,
+            "status": a.status,
+            "sku_id": a.sku_id,
+            "sku_name": sku_map.get(a.sku_id, f"SKU-{a.sku_id}") if a.sku_id else None,
+            "override_price": a.override_price,
+            "override_deposit": a.override_deposit,
+            "start_date": a.start_date.isoformat() if a.start_date else None,
+            "end_date": a.end_date.isoformat() if a.end_date else None,
+            "remark": a.remark,
+        })
+
+    return {"items": result, "total": total, "page": page, "size": size}

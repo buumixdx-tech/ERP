@@ -21,12 +21,21 @@ def save_rule_action(session: Session, payload: TimeRuleSchema) -> ActionResult:
         rule.related_type = payload.related_type
         rule.party = payload.party
         rule.trigger_event = payload.trigger_event
+        rule.tge_param1 = payload.tge_param1
+        rule.tge_param2 = payload.tge_param2
         rule.target_event = payload.target_event
+        rule.tae_param1 = payload.tae_param1
+        rule.tae_param2 = payload.tae_param2
         rule.offset = payload.offset
         rule.unit = payload.unit
         rule.direction = payload.direction
         rule.inherit = payload.inherit
         rule.status = payload.status
+        rule.trigger_time = payload.trigger_time
+        rule.target_time = payload.target_time
+        rule.flag_time = payload.flag_time
+        rule.warning = payload.warning
+        rule.result = payload.result
         rule.timestamp = datetime.now()
         
         session.flush()

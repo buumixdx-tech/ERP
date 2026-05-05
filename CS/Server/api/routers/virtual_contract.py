@@ -4,7 +4,8 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from api.deps import get_db, verify_token, api_success, parse_ids
 from api.middleware.error_handler import raise_not_found_error
-from logic.api_queries import list_vcs, get_vc
+from logic.api_queries import list_vcs, get_vc, list_vcs_for_overview
+from logic.services import calculate_cashflow_progress
 from logic.vc import (
     create_procurement_vc_action, create_material_supply_vc_action,
     create_return_vc_action, create_mat_procurement_vc_action,
@@ -81,7 +82,7 @@ def create_stock_procurement_vc(req: CreateStockProcurementVCRequest, session: S
     return create_stock_procurement_vc_action(session, req.vc, draft_rules=req.draft_rules).model_dump()
 
 
-@router.post("/allocate-inventory", summary="库存拨付")
+@router.post("/create-allocate-inventory", summary="库存拨付")
 def allocate_inventory(payload: AllocateInventorySchema, session: Session = Depends(get_db)):
     return create_inventory_allocation_action(session, payload).model_dump()
 
@@ -122,9 +123,60 @@ def get_vcs(
     return api_success(result)
 
 
+@router.get("/global", summary="虚拟合同全局概览")
+def get_vcs_overview(
+    vc_id: Optional[int] = None,
+    vc_type: Optional[str] = None,
+    vc_status: Optional[str] = None,
+    vc_subject_status: Optional[str] = None,
+    vc_cash_status: Optional[str] = None,
+    business_id: Optional[int] = None,
+    business_customer_name_kw: Optional[str] = None,
+    supply_chain_id: Optional[int] = None,
+    supply_chain_supplier_name_kw: Optional[str] = None,
+    sku_id: Optional[int] = None,
+    sku_name_kw: Optional[str] = None,
+    shipping_point_id: Optional[int] = None,
+    shipping_point_name_kw: Optional[str] = None,
+    receiving_point_id: Optional[int] = None,
+    receiving_point_name_kw: Optional[str] = None,
+    tracking_number: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
+    session: Session = Depends(get_db)
+):
+    result = list_vcs_for_overview(
+        session, vc_id=vc_id, vc_type=vc_type, vc_status=vc_status,
+        vc_subject_status=vc_subject_status, vc_cash_status=vc_cash_status,
+        business_id=business_id, business_customer_name_kw=business_customer_name_kw,
+        supply_chain_id=supply_chain_id, supply_chain_supplier_name_kw=supply_chain_supplier_name_kw,
+        sku_id=sku_id, sku_name_kw=sku_name_kw,
+        shipping_point_id=shipping_point_id, shipping_point_name_kw=shipping_point_name_kw,
+        receiving_point_id=receiving_point_id, receiving_point_name_kw=receiving_point_name_kw,
+        tracking_number=tracking_number, page=page, size=size
+    )
+    return api_success(result)
+
+
 @router.get("/{vc_id}", summary="虚拟合同详情")
 def get_vc_detail(vc_id: int, session: Session = Depends(get_db)):
     data = get_vc(session, vc_id)
     if data is None:
         raise_not_found_error("虚拟合同", str(vc_id))
+
+    # Enrich deposit_info with computed financial fields
+    existing_cfs = data.get("cash_flows") or []
+    fin = calculate_cashflow_progress(session, data, existing_cfs)
+    existing_di = data.get("deposit_info") or {}
+    data["deposit_info"] = {
+        **existing_di,
+        "total_amount": fin["goods"].get("total") or 0,
+        "prepayment_ratio": fin["payment_terms"].get("prepayment_ratio") or 0,
+        "expected_deposit": fin["deposit"].get("should") or 0,
+        "actual_deposit": fin["deposit"].get("received") or 0,
+        "should_receive": fin["deposit"].get("should") or 0,
+        "offset_pool": fin["goods"].get("pool") or 0,
+        "paid_amount": fin["goods"].get("paid") or 0,
+        "balance": fin["goods"].get("balance") or 0,
+    }
     return api_success(data)

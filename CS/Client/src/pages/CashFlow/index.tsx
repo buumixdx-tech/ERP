@@ -1,17 +1,17 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Search, RefreshCw, RefreshCcw, Check, X, Info } from 'lucide-react'
+import { Plus, RefreshCw, Info } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { financeApi, CashFlow, CashFlowType, CreateCashFlowSchema } from '@/api/endpoints/finance'
+import { financeApi, CashFlow, CashFlowType, CreateCashFlowSchema, CashFlowListResponse } from '@/api/endpoints/finance'
 import { vcApi, VCStatus } from '@/api/endpoints/vc'
 import { formatCurrency, formatDate } from '@/lib/utils'
 
@@ -47,6 +47,7 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
   const queryClient = useQueryClient()
   const [isOpen, setIsOpen] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
+  const [attachmentFile, setAttachmentFile] = useState<File | null>(null)
   const [formData, setFormData] = useState({
     vc_id: '',
     type: 'PREPAYMENT' as CashFlowType,
@@ -74,6 +75,26 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
     enabled: !!formData.vc_id && !!formData.type,
   })
 
+  // 选VC后自动填充收付款方（根据 owner_type + owner_id 匹配银行账户）
+  useEffect(() => {
+    if (!suggestedParties || !bankAccounts) return
+    if (!formData.payer_id && !formData.payee_id) {
+      const payerAcc = bankAccounts.find(a =>
+        a.owner_type === suggestedParties.payer_type &&
+        (suggestedParties.payer_type === 'ourselves' ? a.owner_id === null : a.owner_id === suggestedParties.payer_id)
+      )
+      const payeeAcc = bankAccounts.find(a =>
+        a.owner_type === suggestedParties.payee_type &&
+        (suggestedParties.payee_type === 'ourselves' ? a.owner_id === null : a.owner_id === suggestedParties.payee_id)
+      )
+      setFormData(prev => ({
+        ...prev,
+        payer_id: payerAcc ? String(payerAcc.id) : '',
+        payee_id: payeeAcc ? String(payeeAcc.id) : '',
+      }))
+    }
+  }, [suggestedParties, bankAccounts])
+
   const { data: progress } = useQuery({
     queryKey: ['cf-progress', formData.vc_id],
     queryFn: () => vcApi.getCashflowProgress(parseInt(formData.vc_id)),
@@ -81,43 +102,49 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
   })
 
   const createMutation = useMutation({
-    mutationFn: () => financeApi.createCashflow({
-      vc_id: parseInt(formData.vc_id),
-      type: formData.type,
-      amount: parseFloat(formData.amount) || 0,
-      payer_id: formData.payer_id ? parseInt(formData.payer_id) : undefined,
-      payee_id: formData.payee_id ? parseInt(formData.payee_id) : undefined,
-      transaction_date: formData.transaction_date + 'T00:00:00',
-      description: formData.description,
-    }),
-    onSuccess: () => {
+    mutationFn: async () => {
+      const result = await financeApi.createCashflow({
+        vc_id: parseInt(formData.vc_id),
+        type: formData.type,
+        amount: parseFloat(formData.amount) || 0,
+        payer_id: formData.payer_id ? parseInt(formData.payer_id) : undefined,
+        payee_id: formData.payee_id ? parseInt(formData.payee_id) : undefined,
+        transaction_date: formData.transaction_date + 'T00:00:00',
+        description: formData.description,
+      })
+      return result
+    },
+    onSuccess: async (data) => {
+      // Upload attachment if file was selected
+      // Server returns {cf_id: number} in data field
+      const cfId = (data as { cf_id?: number })?.cf_id
+      if (attachmentFile && cfId) {
+        try {
+          await financeApi.uploadAttachment(cfId, attachmentFile)
+        } catch (e) {
+          console.error('Failed to upload attachment:', e)
+        }
+      }
       queryClient.invalidateQueries({ queryKey: ['cashflow-list'] })
       setIsOpen(false)
       setShowConfirm(false)
+      setAttachmentFile(null)
       onSuccess()
     },
   })
 
   const handleVCSelect = (vcId: string) => {
-    setFormData({ ...formData, vc_id: vcId })
     const vc = vcs?.items?.find(v => v.id === parseInt(vcId))
+    let defaultType: CashFlowType = 'PREPAYMENT'
     if (vc) {
       if (vc.type === 'RETURN') {
+        defaultType = 'REFUND'
         setCfTypes(['REFUND', 'RETURN_DEPOSIT'])
       } else {
         setCfTypes(['PREPAYMENT', 'FULFILLMENT', 'DEPOSIT', 'RETURN_DEPOSIT', 'PENALTY'])
       }
     }
-  }
-
-  const applySuggestedParties = () => {
-    if (suggestedParties) {
-      setFormData({
-        ...formData,
-        payer_id: String(suggestedParties.payer_id || ''),
-        payee_id: String(suggestedParties.payee_id || ''),
-      })
-    }
+    setFormData({ ...formData, vc_id: vcId, type: defaultType, payer_id: '', payee_id: '' })
   }
 
   const selectedVC = vcs?.items?.find(v => v.id === parseInt(formData.vc_id))
@@ -166,27 +193,27 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
                   <div className="grid grid-cols-3 gap-4 text-sm">
                     <div>
                       <span className="text-muted-foreground">应付总额: </span>
-                      <span className="font-medium">{formatCurrency(progress.total_amount)}</span>
+                      <span className="font-medium">{formatCurrency(progress.goods?.total ?? 0)}</span>
                     </div>
                     <div>
                       <span className="text-muted-foreground">已付金额: </span>
-                      <span className="font-medium text-green-600">{formatCurrency(progress.paid_amount)}</span>
+                      <span className="font-medium text-green-600">{formatCurrency(progress.goods?.paid ?? 0)}</span>
                     </div>
                     <div>
                       <span className="text-muted-foreground">未付余额: </span>
-                      <span className="font-medium text-orange-600">{formatCurrency(progress.balance)}</span>
+                      <span className="font-medium text-orange-600">{formatCurrency(progress.goods?.balance ?? 0)}</span>
                     </div>
                     <div>
                       <span className="text-muted-foreground">应收押金: </span>
-                      <span className="font-medium">{formatCurrency(progress.expected_deposit)}</span>
+                      <span className="font-medium">{formatCurrency(progress.deposit?.should ?? 0)}</span>
                     </div>
                     <div>
                       <span className="text-muted-foreground">实收押金: </span>
-                      <span className="font-medium text-blue-600">{formatCurrency(progress.actual_deposit)}</span>
+                      <span className="font-medium text-blue-600">{formatCurrency(progress.deposit?.received ?? 0)}</span>
                     </div>
                     <div>
                       <span className="text-muted-foreground">核销池: </span>
-                      <span className="font-medium">{formatCurrency(progress.offset_pool)}</span>
+                      <span className="font-medium">{formatCurrency(progress.goods?.pool ?? 0)}</span>
                     </div>
                   </div>
                 </CardContent>
@@ -214,16 +241,9 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
 
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label>付款方账户</Label>
-                  {suggestedParties && (
-                    <Button type="button" variant="ghost" size="sm" onClick={applySuggestedParties}>
-                      <RefreshCcw className="h-3 w-3 mr-1" />自动填充
-                    </Button>
-                  )}
-                </div>
+                <Label>付款方账户</Label>
                 <Select value={formData.payer_id} onValueChange={(v) => setFormData({ ...formData, payer_id: v })}>
-                  <SelectTrigger>
+                  <SelectTrigger className="h-10">
                     <SelectValue placeholder="选择付款方" />
                   </SelectTrigger>
                   <SelectContent>
@@ -236,7 +256,7 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
               <div className="space-y-2">
                 <Label>收款方账户</Label>
                 <Select value={formData.payee_id} onValueChange={(v) => setFormData({ ...formData, payee_id: v })}>
-                  <SelectTrigger>
+                  <SelectTrigger className="h-10">
                     <SelectValue placeholder="选择收款方" />
                   </SelectTrigger>
                   <SelectContent>
@@ -258,6 +278,16 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
               <Textarea value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} />
             </div>
 
+            <div className="space-y-2">
+              <Label>附件（银行转账单据）</Label>
+              <Input
+                type="file"
+                accept="image/*,.pdf"
+                onChange={(e) => setAttachmentFile(e.target.files?.[0] || null)}
+              />
+              <p className="text-xs text-muted-foreground">支持 JPG、PNG、PDF 格式</p>
+            </div>
+
             <div className="flex justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>取消</Button>
               <Button type="submit" disabled={!formData.vc_id || !formData.amount || createMutation.isPending}>
@@ -274,8 +304,12 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
               </div>
               <div className="grid grid-cols-2 gap-4 text-sm">
                 <div>
-                  <span className="text-muted-foreground">关联合同: </span>
+                  <span className="text-muted-foreground">关联VC: </span>
                   <span className="font-medium">{selectedVC?.description?.slice(0, 30) || `VC-${formData.vc_id}`}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">VC类型: </span>
+                  <span className="font-medium">{selectedVC?.type || '-'}</span>
                 </div>
                 <div>
                   <span className="text-muted-foreground">资金类型: </span>
@@ -304,6 +338,12 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
                   <span>{formData.description}</span>
                 </div>
               )}
+              {attachmentFile && (
+                <div className="text-sm">
+                  <span className="text-muted-foreground">附件: </span>
+                  <span>{attachmentFile.name}</span>
+                </div>
+              )}
             </div>
 
             <div className="flex justify-between">
@@ -322,182 +362,123 @@ function CreateCashFlowDialog({ onSuccess }: { onSuccess: () => void }) {
 }
 
 export function CashFlowPage() {
-  const [activeTab, setActiveTab] = useState('entry')
-  const [typeFilter, setTypeFilter] = useState<CashFlowType | 'ALL'>('ALL')
-  const [search, setSearch] = useState('')
-  const [overviewTypeFilter, setOverviewTypeFilter] = useState<string[]>([])
-  const [overviewSearch, setOverviewSearch] = useState('')
+  const [typeFilter, setTypeFilter] = useState<CashFlowType[]>([])
   const [selectedCF, setSelectedCF] = useState<CashFlow | null>(null)
+  const [displayLimit, setDisplayLimit] = useState(10)
+  const loadMoreRef = useRef<HTMLTableRowElement>(null)
+
+  // 全局概览搜索状态
+  const [searchParams, setSearchParams] = useState({
+    cf_id: '', vc_id: '', business_ids: '', sc_ids: '',
+    customer_kw: '', supplier_kw: '', payer_name_kw: '', payee_name_kw: '',
+    amount_min: '', amount_max: '',
+    type: '' as string,
+    page: 1, size: 20,
+  })
+  const [searchCount, setSearchCount] = useState(0)
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['cashflow-list', typeFilter],
-    queryFn: () => financeApi.getCashflows({
-      type: typeFilter !== 'ALL' ? typeFilter : undefined,
-      size: 100,
-    }),
+    queryFn: () => financeApi.listCashflows({ size: 20 }),
   })
 
-  const { data: recentData } = useQuery({
-    queryKey: ['cashflow-recent'],
-    queryFn: () => financeApi.getCashflows({ size: 20 }),
-    enabled: activeTab === 'entry',
+  // 获取银行账户，判断哪些是我们自己的
+  const { data: bankAccounts } = useQuery({
+    queryKey: ['bank-accounts-for-direction'],
+    queryFn: () => financeApi.getBankAccounts(),
   })
 
-  const { data: overviewData } = useQuery({
-    queryKey: ['cashflow-overview', overviewTypeFilter],
-    queryFn: () => financeApi.getCashflows({ size: 100 }),
-    enabled: activeTab === 'overview',
-  })
+  // 构建我们自己的账户 ID 集合
+  const ourAccountIds = new Set(
+    bankAccounts?.filter(a => a.owner_type === 'ourselves').map(a => a.id) || []
+  )
+
+  // 判断资金流方向
+  const getDirection = (cf: CashFlow): 'INFLOW' | 'OUTFLOW' => {
+    return ourAccountIds.has(cf.payee_account_id) ? 'INFLOW' : 'OUTFLOW'
+  }
 
   const filteredItems = data?.items?.filter(cf => {
-    if (!search) return true
-    return cf.description?.toLowerCase().includes(search.toLowerCase()) ||
-           cf.vc_description?.toLowerCase().includes(search.toLowerCase())
-  }) || []
-
-  const overviewFiltered = overviewData?.items?.filter(cf => {
-    if (overviewTypeFilter.length > 0 && !overviewTypeFilter.includes(cf.type)) return false
-    if (overviewSearch) {
-      const q = overviewSearch.toLowerCase()
-      return cf.description?.toLowerCase().includes(q) ||
-             cf.vc_description?.toLowerCase().includes(q) ||
-             String(cf.id).includes(q)
-    }
+    if (typeFilter.length > 0 && !typeFilter.includes(cf.type as CashFlowType)) return false
     return true
   }) || []
+
+  // 筛选条件变化时重置显示数量
+  useEffect(() => {
+    setDisplayLimit(10)
+  }, [typeFilter])
+
+  // 滚动加载更多
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && displayLimit < filteredItems.length) {
+          setDisplayLimit(prev => Math.min(prev + 10, filteredItems.length))
+        }
+      },
+      { threshold: 0.1 }
+    )
+    if (loadMoreRef.current) {
+      observer.observe(loadMoreRef.current)
+    }
+    return () => observer.disconnect()
+  }, [displayLimit, filteredItems.length])
+
+  const displayedItems = filteredItems.slice(0, displayLimit)
+
+  // 全局概览搜索
+  const { data: globalSearchData, isLoading: isGlobalSearching } = useQuery({
+    queryKey: ['cashflow-global', searchParams, searchCount],
+    enabled: searchCount > 0,
+    queryFn: () => {
+      const p: Record<string, unknown> = { ...searchParams }
+      const numFields = ['vc_id', 'payer_id', 'payee_id']
+      Object.keys(p).forEach(k => {
+        if (numFields.includes(k) && typeof p[k] === 'string' && (p[k] as string) !== '') {
+          p[k] = Number(p[k])
+        } else if (p[k] === '' || p[k] === undefined) {
+          delete p[k]
+        }
+      })
+      return financeApi.getCashflowsGlobal(p as Parameters<typeof financeApi.getCashflowsGlobal>[0]) as unknown as Promise<CashFlowListResponse>
+    },
+  })
+
+  const doGlobalSearch = () => {
+    setSelectedCF(null)
+    setSearchCount(c => c + 1)
+  }
+
+  const clearSearch = () => {
+    setSearchParams({
+      cf_id: '', vc_id: '', business_ids: '', sc_ids: '',
+      customer_kw: '', supplier_kw: '', payer_name_kw: '',
+      payee_name_kw: '', amount_min: '', amount_max: '',
+      type: '', page: 1, size: 20,
+    })
+    setSearchCount(0)
+    setSelectedCF(null)
+  }
+
+  const globalFilteredItems = globalSearchData?.items || []
+  const totalPages = globalSearchData ? Math.ceil(globalSearchData.total / (globalSearchData.size || 20)) : 0
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold">资金流管理</h2>
-        {activeTab === 'entry' && <CreateCashFlowDialog onSuccess={() => refetch()} />}
+        <CreateCashFlowDialog onSuccess={() => refetch()} />
       </div>
 
-      <Tabs value={activeTab} onValueChange={setActiveTab}>
+      <Tabs defaultValue="list" className="w-full">
         <TabsList>
-          <TabsTrigger value="entry">资金流录入</TabsTrigger>
-          <TabsTrigger value="overview">资金全局概览</TabsTrigger>
+          <TabsTrigger value="list">列表</TabsTrigger>
+          <TabsTrigger value="global">全局概览</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="entry" className="space-y-4">
+        <TabsContent value="list" className="space-y-4">
           <div className="flex gap-4 flex-wrap">
-            <Input placeholder="搜索..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-64" />
-            <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as CashFlowType | 'ALL')}>
-              <SelectTrigger className="w-32">
-                <SelectValue placeholder="类型" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="ALL">全部类型</SelectItem>
-                {Object.entries(CASHFLOW_TYPE_LABELS).map(([value, label]) => (
-                  <SelectItem key={value} value={value}>{label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button variant="outline" onClick={() => refetch()}>
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-          </div>
-
-          <Card>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>ID</TableHead>
-                    <TableHead>类型</TableHead>
-                    <TableHead>金额</TableHead>
-                    <TableHead>方向</TableHead>
-                    <TableHead>付款方</TableHead>
-                    <TableHead>收款方</TableHead>
-                    <TableHead>关联合同</TableHead>
-                    <TableHead>交易日期</TableHead>
-                    <TableHead>备注</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {filteredItems.map(cf => (
-                    <TableRow key={cf.id}>
-                      <TableCell className="font-medium">CF-{cf.id}</TableCell>
-                      <TableCell>
-                        <Badge className={CASHFLOW_TYPE_COLORS[cf.type]}>{CASHFLOW_TYPE_LABELS[cf.type]}</Badge>
-                      </TableCell>
-                      <TableCell className={`font-medium ${cf.direction === 'INFLOW' ? 'text-green-600' : 'text-red-600'}`}>
-                        {cf.direction === 'INFLOW' ? '+' : '-'}{formatCurrency(cf.amount)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{cf.direction === 'INFLOW' ? '流入' : '流出'}</Badge>
-                      </TableCell>
-                      <TableCell className="text-sm">{cf.payer_account_name || '-'}</TableCell>
-                      <TableCell className="text-sm">{cf.payee_account_name || '-'}</TableCell>
-                      <TableCell>
-                        <Badge variant="outline">VC-{cf.virtual_contract_id}</Badge>
-                      </TableCell>
-                      <TableCell>{formatDate(cf.transaction_date)}</TableCell>
-                      <TableCell className="max-w-[150px] truncate text-sm">
-                        {cf.description || '-'}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                  {!filteredItems.length && (
-                    <TableRow>
-                      <TableCell colSpan={9} className="text-center text-muted-foreground">
-                        {isLoading ? '加载中...' : '暂无数据'}
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base flex items-center gap-2">
-                <RefreshCw className="h-4 w-4" />最近资金收付记录
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {recentData?.items && recentData.items.length > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>时间</TableHead>
-                      <TableHead>流水ID</TableHead>
-                      <TableHead>关联合同</TableHead>
-                      <TableHead>类型</TableHead>
-                      <TableHead>金额</TableHead>
-                      <TableHead>付款方</TableHead>
-                      <TableHead>收款方</TableHead>
-                      <TableHead>说明</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {recentData.items.slice(0, 10).map(cf => (
-                      <TableRow key={cf.id}>
-                        <TableCell className="text-sm">{formatDate(cf.transaction_date)}</TableCell>
-                        <TableCell className="font-medium">CF-{cf.id}</TableCell>
-                        <TableCell className="text-sm">{cf.vc_description || '-'}</TableCell>
-                        <TableCell><Badge className={CASHFLOW_TYPE_COLORS[cf.type]}>{CASHFLOW_TYPE_LABELS[cf.type]}</Badge></TableCell>
-                        <TableCell className={`font-medium ${cf.direction === 'INFLOW' ? 'text-green-600' : 'text-red-600'}`}>
-                          {cf.direction === 'INFLOW' ? '+' : '-'}{formatCurrency(cf.amount)}
-                        </TableCell>
-                        <TableCell className="text-sm">{cf.payer_account_name || '-'}</TableCell>
-                        <TableCell className="text-sm">{cf.payee_account_name || '-'}</TableCell>
-                        <TableCell className="text-sm max-w-[150px] truncate">{cf.description || '-'}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              ) : (
-                <div className="text-center py-4 text-muted-foreground">暂无记录</div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="overview" className="space-y-4">
-          <div className="flex gap-4 flex-wrap">
-            <Select value={overviewTypeFilter[0] || 'ALL'} onValueChange={(v) => setOverviewTypeFilter(v === 'ALL' ? [] : [v as CashFlowType])}>
+            <Select value={typeFilter[0] || 'ALL'} onValueChange={(v) => setTypeFilter(v === 'ALL' ? [] : [v as CashFlowType])}>
               <SelectTrigger className="w-36">
                 <SelectValue placeholder="资金类型" />
               </SelectTrigger>
@@ -508,12 +489,6 @@ export function CashFlowPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Input
-              placeholder="搜索流水..."
-              value={overviewSearch}
-              onChange={(e) => setOverviewSearch(e.target.value)}
-              className="w-64"
-            />
             <Button variant="outline" onClick={() => refetch()}>
               <RefreshCw className="h-4 w-4" />
             </Button>
@@ -526,14 +501,17 @@ export function CashFlowPage() {
                   <TableRow>
                     <TableHead>流水ID</TableHead>
                     <TableHead>日期</TableHead>
-                    <TableHead>关联合同</TableHead>
                     <TableHead>类型</TableHead>
                     <TableHead>金额</TableHead>
+                    <TableHead>方向</TableHead>
+                    <TableHead>付款方</TableHead>
+                    <TableHead>收款方</TableHead>
+                    <TableHead>关联VC</TableHead>
                     <TableHead>备注</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {overviewFiltered.map(cf => (
+                  {displayedItems.map(cf => (
                     <TableRow
                       key={cf.id}
                       className={selectedCF?.id === cf.id ? 'bg-muted' : ''}
@@ -541,17 +519,28 @@ export function CashFlowPage() {
                     >
                       <TableCell className="font-medium">CF-{cf.id}</TableCell>
                       <TableCell>{formatDate(cf.transaction_date)}</TableCell>
-                      <TableCell className="text-sm">{cf.vc_description || '-'}</TableCell>
                       <TableCell><Badge className={CASHFLOW_TYPE_COLORS[cf.type]}>{CASHFLOW_TYPE_LABELS[cf.type]}</Badge></TableCell>
-                      <TableCell className={`font-medium ${cf.direction === 'INFLOW' ? 'text-green-600' : 'text-red-600'}`}>
-                        {cf.direction === 'INFLOW' ? '+' : '-'}{formatCurrency(cf.amount)}
+                      <TableCell className={`font-medium ${getDirection(cf) === 'INFLOW' ? 'text-green-600' : 'text-red-600'}`}>
+                        {getDirection(cf) === 'INFLOW' ? '+' : '-'}{formatCurrency(cf.amount)}
                       </TableCell>
+                      <TableCell><Badge variant="outline">{getDirection(cf) === 'INFLOW' ? '流入' : '流出'}</Badge></TableCell>
+                      <TableCell className="text-sm">{cf.payer_account_name || '-'}</TableCell>
+                      <TableCell className="text-sm">{cf.payee_account_name || '-'}</TableCell>
+                      <TableCell className="text-sm">VC-{cf.virtual_contract_id}</TableCell>
                       <TableCell className="text-sm max-w-[150px] truncate">{cf.description || '-'}</TableCell>
                     </TableRow>
                   ))}
-                  {!overviewFiltered.length && (
+                  {!filteredItems.length ? (
                     <TableRow>
-                      <TableCell colSpan={6} className="text-center text-muted-foreground">暂无数据</TableCell>
+                      <TableCell colSpan={9} className="text-center text-muted-foreground">
+                        {isLoading ? '加载中...' : '暂无数据'}
+                      </TableCell>
+                    </TableRow>
+                  ) : (
+                    <TableRow ref={loadMoreRef}>
+                      <TableCell colSpan={9} className="text-center py-2 text-sm text-muted-foreground">
+                        {displayLimit >= filteredItems.length ? '已加载全部' : '滚动加载更多...'}
+                      </TableCell>
                     </TableRow>
                   )}
                 </TableBody>
@@ -589,8 +578,9 @@ export function CashFlowPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-4 mt-4 text-sm">
                   <div>
-                    <span className="text-muted-foreground">关联合同: </span>
-                    <span>{selectedCF.vc_description || '-'}</span>
+                    <span className="text-muted-foreground">关联VC: </span>
+                    <span>VC-{selectedCF.virtual_contract_id}</span>
+                    {selectedCF.vc_type && <span className="ml-2 text-muted-foreground">({selectedCF.vc_type})</span>}
                   </div>
                   <div>
                     <span className="text-muted-foreground">备注: </span>
@@ -599,6 +589,194 @@ export function CashFlowPage() {
                 </div>
               </CardContent>
             </Card>
+          )}
+        </TabsContent>
+
+        <TabsContent value="global" className="space-y-4">
+          {/* 搜索表单 */}
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">多条件搜索</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-3 gap-4">
+                <div className="space-y-1">
+                  <Label className="text-xs">CF ID</Label>
+                  <Input value={searchParams.cf_id} onChange={e => setSearchParams(p => ({ ...p, cf_id: e.target.value }))} placeholder="如 1,2,3" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">VC ID</Label>
+                  <Input value={searchParams.vc_id} onChange={e => setSearchParams(p => ({ ...p, vc_id: e.target.value }))} placeholder="如 1,2,3" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Business ID</Label>
+                  <Input value={searchParams.business_ids} onChange={e => setSearchParams(p => ({ ...p, business_ids: e.target.value }))} placeholder="如 1,2,3" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">供应链 ID</Label>
+                  <Input value={searchParams.sc_ids} onChange={e => setSearchParams(p => ({ ...p, sc_ids: e.target.value }))} placeholder="如 1,2,3" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">客户名称</Label>
+                  <Input value={searchParams.customer_kw} onChange={e => setSearchParams(p => ({ ...p, customer_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">供应商名称</Label>
+                  <Input value={searchParams.supplier_kw} onChange={e => setSearchParams(p => ({ ...p, supplier_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">付款账户名称</Label>
+                  <Input value={searchParams.payer_name_kw} onChange={e => setSearchParams(p => ({ ...p, payer_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">收款账户名称</Label>
+                  <Input value={searchParams.payee_name_kw} onChange={e => setSearchParams(p => ({ ...p, payee_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">金额范围</Label>
+                  <div className="flex gap-1 items-center">
+                    <Input type="number" value={searchParams.amount_min} onChange={e => setSearchParams(p => ({ ...p, amount_min: e.target.value }))} placeholder="最小" className="w-full" />
+                    <span className="text-muted-foreground">~</span>
+                    <Input type="number" value={searchParams.amount_max} onChange={e => setSearchParams(p => ({ ...p, amount_max: e.target.value }))} placeholder="最大" className="w-full" />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4">
+                <Select value={searchParams.type || 'ALL'} onValueChange={(v) => setSearchParams(p => ({ ...p, type: v === 'ALL' ? '' : v }))}>
+                  <SelectTrigger className="w-36">
+                    <SelectValue placeholder="资金类型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ALL">全部类型</SelectItem>
+                    {Object.entries(CASHFLOW_TYPE_LABELS).map(([value, label]) => (
+                      <SelectItem key={value} value={value}>{label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <div className="flex gap-2 ml-auto">
+                  <Button variant="outline" onClick={clearSearch}>清空</Button>
+                  <Button onClick={doGlobalSearch} disabled={isGlobalSearching}>
+                    {isGlobalSearching ? '搜索中...' : '搜索'}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* 搜索结果 */}
+          {globalSearchData && (
+            <>
+              <div className="text-sm text-muted-foreground">
+                共 {globalSearchData.total} 条记录
+              </div>
+              <Card>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>流水ID</TableHead>
+                        <TableHead>日期</TableHead>
+                        <TableHead>类型</TableHead>
+                        <TableHead>金额</TableHead>
+                        <TableHead>方向</TableHead>
+                        <TableHead>付款方</TableHead>
+                        <TableHead>收款方</TableHead>
+                        <TableHead>关联VC</TableHead>
+                        <TableHead>备注</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {globalFilteredItems.map(cf => (
+                        <TableRow
+                          key={cf.id}
+                          className={selectedCF?.id === cf.id ? 'bg-muted' : ''}
+                          onClick={() => setSelectedCF(cf)}
+                        >
+                          <TableCell className="font-medium">CF-{cf.id}</TableCell>
+                          <TableCell>{formatDate(cf.transaction_date)}</TableCell>
+                          <TableCell><Badge className={CASHFLOW_TYPE_COLORS[cf.type]}>{CASHFLOW_TYPE_LABELS[cf.type]}</Badge></TableCell>
+                          <TableCell className={`font-medium ${getDirection(cf) === 'INFLOW' ? 'text-green-600' : 'text-red-600'}`}>
+                            {getDirection(cf) === 'INFLOW' ? '+' : '-'}{formatCurrency(cf.amount)}
+                          </TableCell>
+                          <TableCell><Badge variant="outline">{getDirection(cf) === 'INFLOW' ? '流入' : '流出'}</Badge></TableCell>
+                          <TableCell className="text-sm">{cf.payer_account_name || '-'}</TableCell>
+                          <TableCell className="text-sm">{cf.payee_account_name || '-'}</TableCell>
+                          <TableCell className="text-sm">VC-{cf.virtual_contract_id}</TableCell>
+                          <TableCell className="text-sm max-w-[150px] truncate">{cf.description || '-'}</TableCell>
+                        </TableRow>
+                      ))}
+                      {!globalFilteredItems.length && (
+                        <TableRow>
+                          <TableCell colSpan={9} className="text-center text-muted-foreground">
+                            未找到匹配记录
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+
+              {/* 分页 */}
+              {totalPages > 1 && (
+                <div className="flex items-center justify-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setSearchParams(p => ({ ...p, page: p.page - 1 }))} disabled={searchParams.page <= 1}>
+                    上一页
+                  </Button>
+                  <span className="text-sm text-muted-foreground">
+                    第 {searchParams.page} / {totalPages} 页
+                  </span>
+                  <Button variant="outline" size="sm" onClick={() => setSearchParams(p => ({ ...p, page: p.page + 1 }))} disabled={searchParams.page >= totalPages}>
+                    下一页
+                  </Button>
+                </div>
+              )}
+
+              {/* 详情 */}
+              {selectedCF && (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-base">资金流水详情 (ID: {selectedCF.id})</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-3 gap-4 text-sm mb-4">
+                      <div>
+                        <span className="text-muted-foreground">交易金额: </span>
+                        <span className="font-medium">{formatCurrency(selectedCF.amount)}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">资金类型: </span>
+                        <Badge className={CASHFLOW_TYPE_COLORS[selectedCF.type]}>{CASHFLOW_TYPE_LABELS[selectedCF.type]}</Badge>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">交易时间: </span>
+                        <span className="font-medium">{formatDate(selectedCF.transaction_date)}</span>
+                      </div>
+                    </div>
+                    <div className="bg-muted rounded-lg p-3 text-sm">
+                      <div className="text-muted-foreground mb-1">资金收付链路</div>
+                      <div className="flex items-center gap-2">
+                        <span>{selectedCF.payer_account_name || '未指定'}</span>
+                        <span className="text-muted-foreground">→</span>
+                        <span>{selectedCF.payee_account_name || '未指定'}</span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4 mt-4 text-sm">
+                      <div>
+                        <span className="text-muted-foreground">关联VC: </span>
+                        <span>VC-{selectedCF.virtual_contract_id}</span>
+                        {selectedCF.vc_type && <span className="ml-2 text-muted-foreground">({selectedCF.vc_type})</span>}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">备注: </span>
+                        <span>{selectedCF.description || '无'}</span>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </>
           )}
         </TabsContent>
       </Tabs>

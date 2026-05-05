@@ -34,9 +34,8 @@ export interface Logistics {
   id: number
   virtual_contract_id: number
   status: string
-  timestamp: string
-  express_orders: ExpressOrder[]
-  created_at?: string
+  created_at: string
+  express_orders_count: number
 }
 
 export interface LogisticsDetail extends Logistics {
@@ -62,12 +61,20 @@ export interface LogisticsListResponse {
 }
 
 export interface LogisticsDashboardSummary {
-  total_count: number
-  pending_count: number
-  in_transit_count: number
-  signed_count: number
-  completed_count: number
-  today_new_count: number
+  logistics_summary: {
+    total: number
+    pending: number
+    transit: number
+    signed: number
+    finish: number
+    today_new: number
+  }
+  express_summary: {
+    total: number
+    pending: number
+    transit: number
+    signed: number
+  }
 }
 
 export interface CreateLogisticsPlanSchema {
@@ -97,6 +104,95 @@ export interface ExpressOrderStatusSchema {
   order_id: number
   target_status: ExpressStatus
   logistics_id: number
+}
+
+// Express Order Global Overview types
+export interface ExpressOrderGlobalItem {
+  id: number
+  tracking_number: string
+  status: ExpressStatus
+  created_at: string
+  logistics_id: number
+  items: Array<{ sku_id: number; sku_name: string; qty: number }>
+  address_info: AddressInfo
+  vc_id: number | null
+  vc_type: string | null
+  vc_subject_status: string | null
+}
+
+export interface ExpressOrderGlobalResponse {
+  items: ExpressOrderGlobalItem[]
+  total: number
+  page: number
+  size: number
+}
+
+export interface ExpressOrderGlobalParams {
+  ids?: number
+  tracking_number?: string
+  status?: ExpressStatus
+  date_from?: string
+  date_to?: string
+  sku_id?: number
+  sku_name_kw?: string
+  shipping_point_id?: number
+  shipping_point_name_kw?: string
+  receiving_point_id?: number
+  receiving_point_name_kw?: string
+  vc_id?: number
+  vc_type?: string
+  vc_status_type?: '主状态' | '合同状态'
+  vc_status_value?: string
+  subject_status?: string
+  business_id?: number
+  business_customer_name_kw?: string
+  supply_chain_id?: number
+  supply_chain_supplier_name_kw?: string
+  page?: number
+  size?: number
+}
+
+// Logistics Global Overview types
+export interface LogisticsGlobalItem {
+  id: number
+  virtual_contract_id: number
+  status: LogisticsStatus
+  created_at: string
+  express_orders_count: number
+  vc_type: string | null
+}
+
+export interface LogisticsGlobalResponse {
+  items: LogisticsGlobalItem[]
+  total: number
+  page: number
+  size: number
+}
+
+export interface LogisticsGlobalParams {
+  ids?: number
+  status?: LogisticsStatus
+  date_from?: string
+  date_to?: string
+  tracking_number?: string
+  express_order_id?: number
+  sku_id?: number
+  sku_name_kw?: string
+  shipping_point_id?: number
+  shipping_point_name_kw?: string
+  receiving_point_id?: number
+  receiving_point_name_kw?: string
+  vc_id?: number
+  vc_type?: string
+  vc_status_type?: '主状态' | '合同状态'
+  vc_status_value?: string
+  subject_status?: string
+  business_id?: number
+  business_customer_name_kw?: string
+  supply_chain_id?: number
+  supply_chain_supplier_name_kw?: string
+  page?: number
+  size?: number
 }
 
 export const logisticsApi = {
@@ -137,4 +233,10 @@ export const logisticsApi = {
 
   getDashboardSummary: () =>
     apiClient.get<LogisticsDashboardSummary>('/logistics/dashboard/summary') as unknown as Promise<LogisticsDashboardSummary>,
+
+  getExpressOrdersGlobal: (params: ExpressOrderGlobalParams) =>
+    apiClient.get<ExpressOrderGlobalResponse>('/logistics/express-orders/global', { params }) as unknown as Promise<ExpressOrderGlobalResponse>,
+
+  getLogisticsGlobal: (params: LogisticsGlobalParams) =>
+    apiClient.get<LogisticsGlobalResponse>('/logistics/global', { params }) as unknown as Promise<LogisticsGlobalResponse>,
 }

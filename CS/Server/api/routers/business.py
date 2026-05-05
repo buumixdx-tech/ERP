@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from api.deps import get_db, verify_token, api_success, parse_ids, row_to_dict
 from api.middleware.error_handler import raise_not_found_error
-from logic.api_queries import list_businesses, get_business
+from logic.api_queries import list_businesses, get_business, list_addons_global
 from logic.business import (
     create_business_action, update_business_status_action,
     delete_business_action, advance_business_stage_action,
@@ -84,6 +84,28 @@ def get_addon(addon_id: int, session: Session = Depends(get_db)):
     return api_success(row_to_dict(addon))
 
 
+@router.get("/addons/global", summary="附加业务全局列表（跨业务）")
+def list_addons_global_endpoint(
+    business_id: Optional[int] = None,
+    customer_name_kw: Optional[str] = None,
+    sku_name_kw: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    size: int = 20,
+    session: Session = Depends(get_db)
+):
+    result = list_addons_global(
+        session,
+        business_id=business_id,
+        customer_name_kw=customer_name_kw,
+        sku_name_kw=sku_name_kw,
+        status=status,
+        page=page,
+        size=size,
+    )
+    return api_success(result)
+
+
 # ==================== Query Endpoints ====================
 
 @router.get("/list", summary="业务列表")
@@ -94,7 +116,8 @@ def get_businesses(
     status: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    search: Optional[str] = None,
+    customer_name_kw: Optional[str] = None,
+    sku_name_kw: Optional[str] = None,
     page: int = 1,
     size: int = 50,
     session: Session = Depends(get_db)
@@ -103,7 +126,8 @@ def get_businesses(
     cust_ids = parse_ids(customer_ids) if customer_ids else None
     result = list_businesses(session, ids=id_list, customer_id=customer_id,
                               customer_ids=cust_ids, status=status, date_from=date_from,
-                              date_to=date_to, search=search, page=page, size=size)
+                              date_to=date_to, customer_name_kw=customer_name_kw,
+                              sku_name_kw=sku_name_kw, page=page, size=size)
     return api_success(result)
 
 

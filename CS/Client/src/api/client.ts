@@ -104,7 +104,11 @@ apiClient.interceptors.response.use(
       }
     }
 
-    const message = error.response?.data?.detail || error.message || '网络错误'
+    const detail = error.response?.data?.detail
+    const message = Array.isArray(detail)
+      ? detail.map((e: any) => e.msg || JSON.stringify(e)).join('; ')
+      : (typeof detail === 'string' ? detail : error.message)
+      || '网络错误'
     return Promise.reject(new Error(message))
   }
 )

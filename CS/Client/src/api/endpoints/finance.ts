@@ -18,16 +18,17 @@ export type CashFlowDirection = 'INFLOW' | 'OUTFLOW'
 export interface CashFlow {
   id: number
   virtual_contract_id: number
+  vc_type?: string
   type: string
   amount: number
   payer_account_id: number
   payee_account_id: number
+  payer_owner_type?: string
+  payee_owner_type?: string
   transaction_date: string
   description: string
   payer_account_name?: string
   payee_account_name?: string
-  // 可能存在的额外字段
-  vc_description?: string
   direction?: string
 }
 
@@ -148,9 +149,21 @@ export interface FundHistoryItem {
 }
 
 export const financeApi = {
-  getCashflows: (params?: {
-    ids?: number[]
+  listCashflows: (params?: {
+    ids?: number[] | string
     vc_id?: number
+    type?: string
+    date_from?: string
+    date_to?: string
+    page?: number
+    size?: number
+  }) => apiClient.get<CashFlowListResponse>('/finance/cashflows/list', { params }) as unknown as Promise<CashFlowListResponse>,
+
+  getCashflowsGlobal: (params?: {
+    ids?: number[] | string
+    cf_id?: number
+    vc_id?: number
+    vc_ids?: string
     type?: string
     payer_id?: number
     payee_id?: number
@@ -158,9 +171,15 @@ export const financeApi = {
     date_to?: string
     amount_min?: number
     amount_max?: number
+    business_ids?: string
+    sc_ids?: string
+    customer_kw?: string
+    supplier_kw?: string
+    payer_name_kw?: string
+    payee_name_kw?: string
     page?: number
     size?: number
-  }) => apiClient.get<CashFlowListResponse>('/finance/cashflows', { params }) as unknown as Promise<CashFlowListResponse>,
+  }) => apiClient.get<CashFlowListResponse>('/finance/cashflows/global', { params }) as unknown as Promise<CashFlowListResponse>,
 
   createCashflow: (data: CreateCashFlowSchema) =>
     apiClient.post<{ success: boolean }>('/finance/create-cashflow', data) as unknown as Promise<{ success: boolean }>,
@@ -198,4 +217,12 @@ export const financeApi = {
 
   getDashboard: () =>
     apiClient.get<FinanceDashboardStats>('/finance/dashboard') as unknown as Promise<FinanceDashboardStats>,
+
+  uploadAttachment: (cfId: number, file: File) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiClient.post(`/finance/cashflows/${cfId}/attachment`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }) as unknown as Promise<{ success: boolean; data?: { path: string } }>
+  },
 }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, Search, RefreshCw, ChevronRight, X, Pencil, Trash2, AlertTriangle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -17,32 +17,25 @@ import { vcApi } from '@/api/endpoints/vc'
 import { formatDate, formatCurrency, cn } from '@/lib/utils'
 
 const STATUS_LABELS: Record<string, string> = {
-  DRAFT: '草稿',
-  INITIAL_CONTACT: '前期接洽',
-  EVALUATION: '业务评估',
-  FEEDBACK: '客户反馈',
-  LANDING: '落地阶段',
-  ACTIVE: '业务开展',
-  PAUSED: '业务暂缓',
-  TERMINATED: '业务终止',
-  COMPLETED: '业务完成',
   前期接洽: '前期接洽',
   业务评估: '业务评估',
-  方案设计: '方案设计',
+  客户反馈: '客户反馈',
   合作落地: '合作落地',
   业务开展: '业务开展',
+  业务暂缓: '业务暂缓',
+  业务终止: '业务终止',
+  业务完成: '业务完成',
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  DRAFT: 'bg-gray-100 text-gray-800',
-  INITIAL_CONTACT: 'bg-blue-100 text-blue-800',
-  EVALUATION: 'bg-indigo-100 text-indigo-800',
-  FEEDBACK: 'bg-purple-100 text-purple-800',
-  LANDING: 'bg-orange-100 text-orange-800',
-  ACTIVE: 'bg-green-100 text-green-800',
-  PAUSED: 'bg-yellow-100 text-yellow-800',
-  TERMINATED: 'bg-red-100 text-red-800',
-  COMPLETED: 'bg-gray-100 text-gray-800',
+  前期接洽: 'bg-blue-100 text-blue-800',
+  业务评估: 'bg-indigo-100 text-indigo-800',
+  客户反馈: 'bg-purple-100 text-purple-800',
+  合作落地: 'bg-orange-100 text-orange-800',
+  业务开展: 'bg-green-100 text-green-800',
+  业务暂缓: 'bg-yellow-100 text-yellow-800',
+  业务终止: 'bg-red-100 text-red-800',
+  业务完成: 'bg-gray-100 text-gray-800',
 }
 
 const ADDON_TYPE_LABELS: Record<string, string> = {
@@ -192,7 +185,7 @@ function AdvanceBusinessDialog({ business, onSuccess }: { business: Business; on
 
   const { data: allSkus } = useQuery({
     queryKey: ['skus-all'],
-    queryFn: () => masterApi.skus.list({ size: 500 }),
+    queryFn: () => masterApi.skus.list({ size: 100 }),
     enabled: isLanding && isOpen,
   })
 
@@ -497,7 +490,7 @@ function CreateAddonDialog({ business, onSuccess }: { business: Business; onSucc
   const { data: allSkus } = useQuery({
     queryKey: ['skus-for-addon', business.id],
     queryFn: async () => {
-      const skus = await masterApi.skus.list({ size: 500 })
+      const skus = await masterApi.skus.list({ size: 100 })
       const detail = await businessApi.getDetail(business.id)
       const pricingSkuIds = new Set(Object.keys(detail.details?.pricing || {}).filter(k => !isNaN(parseInt(k))))
       return {
@@ -830,6 +823,415 @@ function DeactivateAddonButton({ business, addon, onSuccess }: { business: Busin
   )
 }
 
+// ─── AddonFormDialog ───────────────────────────────────────────────────────────
+function AddonFormDialog({
+  mode, addon, businessId, onSuccess, onCancel,
+}: {
+  mode: 'create' | 'edit'
+  addon?: AddonBusiness
+  businessId: number
+  onSuccess: () => void
+  onCancel: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [addonType, setAddonType] = useState<string>(addon?.addon_type || 'PRICE_ADJUST')
+  const [skuId, setSkuId] = useState(String(addon?.sku_id || ''))
+  const [startDate, setStartDate] = useState(addon?.start_date ? new Date(addon.start_date) : new Date())
+  const [endDate, setEndDate] = useState(addon?.end_date ? new Date(addon.end_date) : undefined)
+  const [overrideVal, setOverrideVal] = useState(addon?.override_price?.toString() || addon?.override_deposit?.toString() || '')
+  const [remark, setRemark] = useState(addon?.remark || '')
+  const [step, setStep] = useState<'type' | 'detail'>('type')
+
+  // Fetch business details (for create) to know which SKUs are already priced
+  const { data: bizDetail } = useQuery({
+    queryKey: ['biz-detail-for-addon', businessId],
+    queryFn: () => businessApi.getDetail(businessId),
+    enabled: mode === 'create',
+  })
+
+  const pricingSkuIds = new Set(
+    (bizDetail?.details?.pricing
+      ? Object.keys(bizDetail.details.pricing).filter(k => !isNaN(parseInt(k)))
+      : []
+    ).map(String)
+  )
+
+  // Fetch all SKUs for the selector
+  const { data: allSkusData } = useQuery({
+    queryKey: ['master-skus'],
+    queryFn: () => masterApi.skus.list({ size: 500 }),
+  })
+
+  const allSkuItems = allSkusData?.items || []
+
+  const selectedSku = allSkuItems.find((s: SKU) => String(s.id) === skuId)
+  const isEquipment = selectedSku?.type_level1 === '设备'
+  const isMaterial = selectedSku?.type_level1 === '物料'
+
+  // Filter available SKUs based on addon type
+  const availableSkus = (() => {
+    if (mode === 'edit') return []
+    if (addonType === 'PRICE_ADJUST') {
+      return allSkuItems.filter((s: SKU) => pricingSkuIds.has(String(s.id)))
+    } else {
+      return allSkuItems.filter((s: SKU) => !pricingSkuIds.has(String(s.id)))
+    }
+  })()
+
+  const createMutation = useMutation({
+    mutationFn: () => {
+      const payload: CreateAddonSchema = {
+        business_id: businessId,
+        addon_type: addonType as AddonType,
+        sku_id: parseInt(skuId),
+        start_date: startDate.toISOString(),
+        end_date: endDate ? endDate.toISOString() : undefined,
+        remark: remark || undefined,
+      }
+      if (isEquipment && overrideVal) payload.override_deposit = parseFloat(overrideVal)
+      else if (isMaterial && overrideVal) payload.override_price = parseFloat(overrideVal)
+      return businessApi.createAddon(payload)
+    },
+    onSuccess,
+  })
+
+  const updateMutation = useMutation({
+    mutationFn: () => {
+      if (!addon) return Promise.reject()
+      const payload: UpdateAddonSchema = {
+        addon_id: addon.id,
+        start_date: startDate.toISOString(),
+        end_date: endDate ? endDate.toISOString() : undefined,
+        remark: remark || undefined,
+      }
+      if (overrideVal) {
+        if (addon.addon_type === 'PRICE_ADJUST') {
+          payload.override_price = parseFloat(overrideVal)
+        } else {
+          payload.override_deposit = parseFloat(overrideVal)
+        }
+      }
+      return businessApi.updateAddon(payload)
+    },
+    onSuccess,
+  })
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) onCancel() }}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{mode === 'create' ? '新建附加项' : '编辑附加项'}</DialogTitle>
+        </DialogHeader>
+        {step === 'type' ? (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label>附加项类型</Label>
+              <Select value={addonType} onValueChange={(v) => { setAddonType(v as AddonType); setSkuId('') }}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="PRICE_ADJUST">价格调整</SelectItem>
+                  <SelectItem value="NEW_SKU">新增 SKU</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>选择 SKU</Label>
+              {availableSkus.length > 0 ? (
+                <Select value={skuId} onValueChange={setSkuId}>
+                  <SelectTrigger><SelectValue placeholder="选择 SKU" /></SelectTrigger>
+                  <SelectContent>
+                    {availableSkus.map((s: SKU) => <SelectItem key={s.id} value={String(s.id)}>{s.name} ({s.type_level1})</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {addonType === 'PRICE_ADJUST' ? '该业务下暂无已定价 SKU' : '所有 SKU 均已在业务中'}
+                </p>
+              )}
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={() => setStep('detail')} disabled={!skuId}>下一步</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label>开始日期</Label>
+                <Input type="date" value={startDate.toISOString().slice(0, 10)}
+                  onChange={(e) => setStartDate(e.target.value ? new Date(e.target.value) : new Date())} />
+              </div>
+              <div className="space-y-2">
+                <Label>结束日期（留空=永久）</Label>
+                <Input type="date" value={endDate ? endDate.toISOString().slice(0, 10) : ''}
+                  onChange={(e) => setEndDate(e.target.value ? new Date(e.target.value) : undefined)} />
+              </div>
+            </div>
+            {isEquipment && (
+              <div className="space-y-2">
+                <Label>覆盖押金（元）</Label>
+                <Input type="number" min="0" step="0.01" value={overrideVal} onChange={(e) => setOverrideVal(e.target.value)} />
+              </div>
+            )}
+            {isMaterial && (
+              <div className="space-y-2">
+                <Label>覆盖单价（元）</Label>
+                <Input type="number" min="0" step="0.01" value={overrideVal} onChange={(e) => setOverrideVal(e.target.value)} />
+              </div>
+            )}
+            <div className="space-y-2">
+              <Label>备注</Label>
+              <Textarea value={remark} onChange={(e) => setRemark(e.target.value)} placeholder="选填" />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={mode === 'create' ? () => setStep('type') : onCancel}>返回</Button>
+              <Button
+                onClick={() => mode === 'create' ? createMutation.mutate() : updateMutation.mutate()}
+                disabled={createMutation.isPending || updateMutation.isPending}
+              >
+                {createMutation.isPending || updateMutation.isPending ? '处理中...' : mode === 'create' ? '创建' : '保存'}
+              </Button>
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ─── AddonManagementTab (global cross-business view) ─────────────────────────
+function AddonManagementTab() {
+  const queryClient = useQueryClient()
+  const [page, setPage] = useState(1)
+  const [businessId, setBusinessId] = useState<string>('')
+  const [customerNameKw, setCustomerNameKw] = useState('')
+  const [skuNameKw, setSkuNameKw] = useState('')
+  const [status, setStatus] = useState<string>('ALL')
+  const [editingAddon, setEditingAddon] = useState<AddonBusiness | null>(null)
+  const [createStep, setCreateStep] = useState<'select-biz' | 'form' | null>(null)
+  const [createBizId, setCreateBizId] = useState<string>('__NONE__')
+  const pageSize = 20
+
+  const { data: addonsData, isLoading, refetch } = useQuery({
+    queryKey: ['addon-global-list', page, businessId, customerNameKw, skuNameKw, status],
+    queryFn: () => businessApi.listAddonsGlobal({
+      page,
+      size: pageSize,
+      business_id: businessId ? parseInt(businessId) : undefined,
+      customer_name_kw: customerNameKw || undefined,
+      sku_name_kw: skuNameKw || undefined,
+      status: status === 'ALL' ? undefined : status,
+    }),
+  })
+
+  const { data: activeBizs } = useQuery({
+    queryKey: ['business-active'],
+    queryFn: () => businessApi.list({ status: '业务开展' as BusinessStatus, size: 500 }),
+  })
+
+  const deactivateMutation = useMutation({
+    mutationFn: (addonId: number) => businessApi.deactivateAddon(addonId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['addon-global-list'] }),
+  })
+
+  const totalPages = addonsData ? Math.ceil(addonsData.total / pageSize) : 0
+
+  useEffect(() => { setPage(1) }, [businessId, customerNameKw, skuNameKw, status])
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-end">
+        <Button size="sm" onClick={() => setCreateStep('select-biz')}>
+          <Plus className="mr-2 h-4 w-4" />新建附加业务
+        </Button>
+      </div>
+
+      {/* Filters */}
+      <div className="flex gap-4 flex-wrap items-end">
+        <div className="space-y-2">
+          <Label className="text-xs">业务ID</Label>
+          <Input
+            type="number"
+            placeholder="业务ID"
+            value={businessId}
+            onChange={(e) => setBusinessId(e.target.value)}
+            className="w-28"
+            min={1}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-xs">客户名称</Label>
+          <Input
+            placeholder="客户名称"
+            value={customerNameKw}
+            onChange={(e) => setCustomerNameKw(e.target.value)}
+            className="w-36"
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-xs">SKU名称</Label>
+          <Input
+            placeholder="SKU名称"
+            value={skuNameKw}
+            onChange={(e) => setSkuNameKw(e.target.value)}
+            className="w-36"
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-xs">状态</Label>
+          <Select value={status} onValueChange={setStatus}>
+            <SelectTrigger className="w-28">
+              <SelectValue placeholder="全部" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ALL">全部</SelectItem>
+              <SelectItem value="生效">生效</SelectItem>
+              <SelectItem value="失效">失效</SelectItem>
+              <SelectItem value="过期">过期</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <Button variant="outline" size="icon" onClick={() => refetch()}>
+          <RefreshCw className="h-4 w-4" />
+        </Button>
+      </div>
+
+      {/* Table */}
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>ID</TableHead>
+                <TableHead>业务ID</TableHead>
+                <TableHead>客户名称</TableHead>
+                <TableHead>SKU名称</TableHead>
+                <TableHead>类型</TableHead>
+                <TableHead className="text-right">覆盖值</TableHead>
+                <TableHead>有效期</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isLoading ? (
+                <TableRow>
+                  <TableCell colSpan={9} className="text-center text-muted-foreground">加载中...</TableCell>
+                </TableRow>
+              ) : !addonsData?.items?.length ? (
+                <TableRow>
+                  <TableCell colSpan={9} className="text-center text-muted-foreground">暂无数据</TableCell>
+                </TableRow>
+              ) : (
+                addonsData.items.map((addon: AddonBusiness) => (
+                  <TableRow key={addon.id}>
+                    <TableCell className="font-medium">{addon.id}</TableCell>
+                    <TableCell>BIZ-{addon.business_id}</TableCell>
+                    <TableCell>{addon.customer_name || '-'}</TableCell>
+                    <TableCell>{addon.sku_name || `SKU-${addon.sku_id}`}</TableCell>
+                    <TableCell><Badge variant="outline">{ADDON_TYPE_LABELS[addon.addon_type]}</Badge></TableCell>
+                    <TableCell className="text-right">
+                      {addon.override_price !== undefined ? `¥${addon.override_price}` :
+                       addon.override_deposit !== undefined ? `¥${addon.override_deposit}` : '-'}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">
+                      {addon.start_date?.slice(0, 10)} ~ {addon.end_date?.slice(0, 10) || '永久'}
+                    </TableCell>
+                    <TableCell>
+                      <Badge className={addon.status === '生效' ? 'bg-green-100 text-green-800' : 'bg-gray-100'}>
+                        {addon.status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex gap-1">
+                        <Button variant="ghost" size="sm" onClick={() => setEditingAddon(addon)}>
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                        {addon.status === '生效' && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-orange-600"
+                            onClick={() => deactivateMutation.mutate(addon.id)}
+                          >
+                            失效
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between px-4 py-3 border-t">
+              <div className="text-sm text-muted-foreground">
+                共 {addonsData?.total || 0} 条，第 {page} / {totalPages} 页
+              </div>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1}>
+                  上一页
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>
+                  下一页
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Step 1: select business */}
+      {createStep === 'select-biz' && (
+        <Dialog open onOpenChange={(open) => { if (!open) { setCreateStep(null); setCreateBizId('__NONE__') } }}>
+          <DialogContent className="max-w-sm">
+            <DialogHeader>
+              <DialogTitle>选择业务</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4">
+              <Select value={createBizId} onValueChange={(v) => setCreateBizId(v)}>
+                <SelectTrigger><SelectValue placeholder="选择业务" /></SelectTrigger>
+                <SelectContent>
+                  {(activeBizs?.items || []).map((b: Business) => (
+                    <SelectItem key={b.id} value={String(b.id)}>{b.id} - {b.customer_name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => { setCreateStep(null); setCreateBizId('__NONE__') }}>取消</Button>
+                <Button disabled={createBizId === '__NONE__'} onClick={() => setCreateStep('form')}>下一步</Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Step 2: addon form */}
+      {createStep === 'form' && createBizId !== '__NONE__' && (
+        <AddonFormDialog
+          mode="create"
+          businessId={parseInt(createBizId)}
+          onSuccess={() => { setCreateStep(null); setCreateBizId('__NONE__'); queryClient.invalidateQueries({ queryKey: ['addon-global-list'] }) }}
+          onCancel={() => { setCreateStep(null); setCreateBizId('__NONE__') }}
+        />
+      )}
+
+      {/* Edit dialog */}
+      {editingAddon && (
+        <AddonFormDialog
+          mode="edit"
+          addon={editingAddon}
+          businessId={editingAddon.business_id}
+          onSuccess={() => { setEditingAddon(null); queryClient.invalidateQueries({ queryKey: ['addon-global-list'] }) }}
+          onCancel={() => setEditingAddon(null)}
+        />
+      )}
+    </div>
+  )
+}
+
 function BusinessDetailDialog({ business, onClose }: { business: Business; onClose: () => void }) {
   const [activeTab, setActiveTab] = useState('detail')
 
@@ -1040,86 +1442,154 @@ function BusinessDetailDialog({ business, onClose }: { business: Business; onClo
 }
 
 export function BusinessPage() {
+  const [activeTab, setActiveTab] = useState('list')
   const [statusFilter, setStatusFilter] = useState<BusinessStatus | 'ALL'>('ALL')
   const [selectedBusiness, setSelectedBusiness] = useState<Business | null>(null)
+  const [customerNameKw, setCustomerNameKw] = useState('')
+  const [skuNameKw, setSkuNameKw] = useState('')
+  const [page, setPage] = useState(1)
+  const pageSize = 20
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ['business-list', statusFilter],
+    queryKey: ['business-list', statusFilter, customerNameKw, skuNameKw, page],
     queryFn: () => businessApi.list({
       status: statusFilter !== 'ALL' ? statusFilter : undefined,
-      size: 100,
+      customer_name_kw: customerNameKw || undefined,
+      sku_name_kw: skuNameKw || undefined,
+      page,
+      size: pageSize,
     }),
   })
+
+  const totalPages = data ? Math.ceil(data.total / pageSize) : 0
+
+  // Reset to page 1 when filters change
+  useEffect(() => { setPage(1) }, [statusFilter, customerNameKw, skuNameKw])
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold">业务管理</h2>
-        <CreateBusinessDialog onSuccess={() => refetch()} />
       </div>
 
-      {/* Filters */}
-      <div className="flex gap-4 flex-wrap">
-        <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as BusinessStatus | 'ALL')}>
-          <SelectTrigger className="w-40">
-            <SelectValue placeholder="状态" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="ALL">全部状态</SelectItem>
-            {Object.entries(STATUS_LABELS).map(([value, label]) => (
-              <SelectItem key={value} value={value}>{label}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button variant="outline" onClick={() => refetch()}>
-          <RefreshCw className="h-4 w-4" />
-        </Button>
-      </div>
+      <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <TabsList>
+          <TabsTrigger value="list">业务列表</TabsTrigger>
+          <TabsTrigger value="addons">附加业务</TabsTrigger>
+        </TabsList>
 
-      {/* Business List */}
-      <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>ID</TableHead>
-                <TableHead>客户</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>创建时间</TableHead>
-                <TableHead>操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data?.items?.map(b => (
-                <TableRow key={b.id}>
-                  <TableCell className="font-medium">BIZ-{b.id}</TableCell>
-                  <TableCell>{b.customer_name}</TableCell>
-                  <TableCell>
-                    <Badge className={STATUS_COLORS[b.status]}>{STATUS_LABELS[b.status]}</Badge>
-                  </TableCell>
-                  <TableCell>{formatDate(b.created_at || '')}</TableCell>
-                  <TableCell>
-                    <div className="flex gap-2">
-                      <Button variant="ghost" size="sm" onClick={() => setSelectedBusiness(b)}>
-                        详情
-                      </Button>
-                      <AdvanceBusinessDialog business={b} onSuccess={() => refetch()} />
-                      <DeleteBusinessDialog business={b} onSuccess={() => refetch()} />
+        <TabsContent value="list">
+          <div className="space-y-4">
+            <div className="flex items-center justify-end">
+              <CreateBusinessDialog onSuccess={() => refetch()} />
+            </div>
+
+            {/* Filters */}
+            <div className="flex gap-4 flex-wrap">
+              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as BusinessStatus | 'ALL')}>
+                <SelectTrigger className="w-40">
+                  <SelectValue placeholder="状态" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ALL">全部状态</SelectItem>
+                  {Object.entries(STATUS_LABELS).map(([value, label]) => (
+                    <SelectItem key={value} value={value}>{label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Input
+                placeholder="客户名称"
+                value={customerNameKw}
+                onChange={(e) => setCustomerNameKw(e.target.value)}
+                className="w-40"
+              />
+              <Input
+                placeholder="SKU名称"
+                value={skuNameKw}
+                onChange={(e) => setSkuNameKw(e.target.value)}
+                className="w-40"
+              />
+              <Button variant="outline" onClick={() => refetch()}>
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            </div>
+
+            {/* Business List */}
+            <Card>
+              <CardContent className="p-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>ID</TableHead>
+                      <TableHead>客户</TableHead>
+                      <TableHead>状态</TableHead>
+                      <TableHead>创建时间</TableHead>
+                      <TableHead>操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data?.items?.map(b => (
+                      <TableRow key={b.id}>
+                        <TableCell className="font-medium">BIZ-{b.id}</TableCell>
+                        <TableCell>{b.customer_name}</TableCell>
+                        <TableCell>
+                          <Badge className={STATUS_COLORS[b.status]}>{STATUS_LABELS[b.status]}</Badge>
+                        </TableCell>
+                        <TableCell>{formatDate(b.created_at || '')}</TableCell>
+                        <TableCell>
+                          <div className="flex gap-2">
+                            <Button variant="ghost" size="sm" onClick={() => setSelectedBusiness(b)}>
+                              详情
+                            </Button>
+                            <AdvanceBusinessDialog business={b} onSuccess={() => refetch()} />
+                            <DeleteBusinessDialog business={b} onSuccess={() => refetch()} />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {!data?.items?.length && (
+                      <TableRow>
+                        <TableCell colSpan={5} className="text-center text-muted-foreground">
+                          {isLoading ? '加载中...' : '暂无数据'}
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+                {totalPages > 1 && (
+                  <div className="flex items-center justify-between px-4 py-3 border-t">
+                    <div className="text-sm text-muted-foreground">
+                      共 {data?.total || 0} 条，第 {page} / {totalPages} 页
                     </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!data?.items?.length && (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
-                    {isLoading ? '加载中...' : '暂无数据'}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setPage(p => Math.max(1, p - 1))}
+                        disabled={page <= 1}
+                      >
+                        上一页
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                        disabled={page >= totalPages}
+                      >
+                        下一页
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="addons">
+          <AddonManagementTab />
+        </TabsContent>
+      </Tabs>
 
       {selectedBusiness && (
         <BusinessDetailDialog business={selectedBusiness} onClose={() => setSelectedBusiness(null)} />

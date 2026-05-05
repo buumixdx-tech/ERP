@@ -10,7 +10,6 @@ import { VCPager } from '@/pages/VC'
 import { LogisticsPage } from '@/pages/Logistics'
 import { CashFlowPage } from '@/pages/CashFlow'
 import { BusinessPage } from '@/pages/Business'
-import { OperationsPage } from '@/pages/Operations'
 import { SupplyChainPage } from '@/pages/SupplyChain'
 import { TimeRulesPage } from '@/pages/TimeRules'
 import { InventoryPage } from '@/pages/Inventory'
@@ -56,7 +55,6 @@ function App() {
             <Route path="logistics" element={<LogisticsPage />} />
             <Route path="cash-flow" element={<CashFlowPage />} />
             <Route path="business/management" element={<BusinessPage />} />
-            <Route path="business/operations" element={<OperationsPage />} />
             <Route path="business/supply-chain" element={<SupplyChainPage />} />
             <Route path="inventory" element={<InventoryPage />} />
             <Route path="rules" element={<TimeRulesPage />} />

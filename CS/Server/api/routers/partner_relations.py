@@ -30,7 +30,7 @@ def get_partner_relations_list(
     """
     合作方关系列表查询
     - partner_id: 合作方ID
-    - owner_type: 所有者类型 (customer/supplier/ourselves)
+    - owner_type: 所有者类型 (business/supply_chain/ourselves)
     - owner_id: 所有者ID
     - relation_type: 合作模式
     """

@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text, JSON, Boolean, Index, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base, object_session
@@ -463,7 +464,7 @@ class ExpressOrder(Base):
 class CashFlow(Base):
     """行动-3. 资金流"""
     __tablename__ = 'cash_flows'
-    
+
     # 索引优化：加速资金查询和统计
     __table_args__ = (
         Index('ix_cf_vc_id', 'virtual_contract_id'),
@@ -471,19 +472,19 @@ class CashFlow(Base):
         Index('ix_cf_transaction_date', 'transaction_date'),
         Index('ix_cf_vc_type', 'virtual_contract_id', 'type'),
     )
-    
+
     id = Column(Integer, primary_key=True)
     virtual_contract_id = Column(Integer, ForeignKey('virtual_contracts.id'))
     type = Column(String(50)) # 预付、履约、罚金、押金、退还押金、退款、冲抵入金、冲抵支付
     amount = Column(Float)
-    
+
     # New: Explicit bank account links
     payer_account_id = Column(Integer, ForeignKey('bank_accounts.id'), nullable=True)
     payee_account_id = Column(Integer, ForeignKey('bank_accounts.id'), nullable=True)
-    
+
     # 财务集成
     finance_triggered = Column(Boolean, default=False)
-    
+
     payment_info = Column(JSON) # 外部参考 / 交易代码
     voucher_path = Column(String(512)) # 凭证文件路径 (data/finance/finance-voucher/)
     description = Column(Text)
@@ -548,39 +549,13 @@ class SystemEvent(Base):
     pushed_to_ai = Column(Boolean, default=False) # AI 是否已消费
 
 
-class OperationTransaction(Base):
-    """23. 操作事务表：记录所有写操作快照，支持回滚和撤销回滚"""
-    __tablename__ = 'operation_transactions'
-
-    id = Column(Integer, primary_key=True)
-
-    # 操作标识
-    action_name = Column(String(50))      # 'create_procurement_vc' | 'create_cash_flow' | ...
-    ref_type = Column(String(50))         # 'VirtualContract' | 'CashFlow' | 'Logistics' | ...
-    ref_id = Column(Integer)              # 关联记录 ID（主记录）
-    ref_vc_id = Column(Integer, ForeignKey('virtual_contracts.id'), nullable=True)
-
-    # 快照（JSON）
-    snapshot_before = Column(JSON)        # 回滚时的恢复依据（修改前）
-    snapshot_after = Column(JSON)         # redo 时的恢复依据（修改后）
-
-    # 快速查询辅助（不存 JSON，只存 ID 列表）
-    involved_ids = Column(JSON, nullable=True)  # [vc_id, logistics_id, ...]
-
-    # 事务状态
-    status = Column(String(20))           # 'committed' | 'rolled_back' | 'failed'
-
-    # 审计
-    reason = Column(Text, nullable=True)   # 回滚原因（仅回滚时填写）
-    created_by = Column(String(100))
-    created_at = Column(DateTime, default=datetime.now)
-    rolled_back_at = Column(DateTime, nullable=True)
-    rolled_back_by = Column(String(100), nullable=True)
-
 
 # Database Setup
 engine = None
 SessionLocal = None
+
+# Thread-local storage for current session (used by audit_context)
+_thread_local_session = threading.local()
 
 def init_db(db_uri='sqlite:///data/business_system.db'):
     global engine, SessionLocal
@@ -607,7 +582,16 @@ def init_db(db_uri='sqlite:///data/business_system.db'):
     except Exception as e:
         print(f"[Warning] Event responders registration failed: {e}")
 
+    # 初始化审计系统
+    try:
+        from logic.audit_engine import init_audit_system
+        init_audit_system(engine)
+    except Exception as e:
+        print(f"[Warning] Audit system initialization failed: {e}")
+
 def get_session():
     if SessionLocal is None:
         init_db()
-    return SessionLocal()
+    session = SessionLocal()
+    _thread_local_session.current = session
+    return session

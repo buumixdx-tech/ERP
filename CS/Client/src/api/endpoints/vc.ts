@@ -63,12 +63,15 @@ export interface VirtualContract {
   description: string
   elements: VCElementsWrapper
   deposit_info?: {
-    total_amount?: number
     prepayment_ratio?: number
     expected_deposit?: number
     actual_deposit?: number
     should_receive?: number
+    offset_pool?: number
+    paid_amount?: number
+    balance?: number
   }
+  total_amount?: number
   status_timestamp?: string
   status_logs?: VCStatusLog[]
   logistics?: LogisticsSummary[]
@@ -108,7 +111,7 @@ export interface VCDetailResponse extends VirtualContract {
 
 export interface LogisticsSummary {
   id: number
-  virtual_contract_id: number
+  virtual_contract_id?: number
   status: string
   timestamp: string
   express_orders: ExpressOrder[]
@@ -219,14 +222,44 @@ export interface ReturnableItem {
 }
 
 export interface CashflowProgress {
-  vc_id: number
-  total_amount: number
-  paid_amount: number
-  balance: number
-  prepayment_ratio: number
-  expected_deposit: number
-  actual_deposit: number
-  offset_pool: number
+  is_return: boolean
+  goods: {
+    total: number
+    paid: number
+    balance: number
+    pool: number
+    due: number
+    label: string
+    paid_label: string
+    balance_label: string
+  }
+  deposit: {
+    should: number
+    received: number
+    remaining: number
+  }
+  payment_terms: Record<string, unknown>
+}
+
+export interface VCGlobalSearchParams {
+  vc_id?: number
+  vc_type?: string
+  vc_status?: string
+  vc_subject_status?: string
+  vc_cash_status?: string
+  business_id?: number
+  business_customer_name_kw?: string
+  supply_chain_id?: number
+  supply_chain_supplier_name_kw?: string
+  sku_id?: number
+  sku_name_kw?: string
+  shipping_point_id?: number
+  shipping_point_name_kw?: string
+  receiving_point_id?: number
+  receiving_point_name_kw?: string
+  tracking_number?: string
+  page?: number
+  size?: number
 }
 
 export const vcApi = {
@@ -247,6 +280,9 @@ export const vcApi = {
   getDetail: (vcId: number) =>
     apiClient.get<VCDetailResponse>(`/vc/${vcId}`) as unknown as Promise<VCDetailResponse>,
 
+  getGlobalOverview: (params?: VCGlobalSearchParams) =>
+    apiClient.get<VCListResponse>('/vc/global', { params }) as unknown as Promise<VCListResponse>,
+
   createProcurement: (data: CreateProcurementVC, draftRules?: unknown[]) =>
     apiClient.post<VirtualContract>('/vc/create-procurement', { vc: data, draft_rules: draftRules }) as unknown as Promise<VirtualContract>,
 
@@ -263,7 +299,7 @@ export const vcApi = {
     apiClient.post<VirtualContract>('/vc/create-return', { vc: data, draft_rules: draftRules }) as unknown as Promise<VirtualContract>,
 
   allocateInventory: (data: AllocateInventoryVC) =>
-    apiClient.post<{ success: boolean }>('/vc/allocate-inventory', data) as unknown as Promise<{ success: boolean }>,
+    apiClient.post<{ success: boolean }>('/vc/create-allocate-inventory', data) as unknown as Promise<{ success: boolean }>,
 
   update: (data: { vc_id: number; description?: string; elements?: VCElement[]; deposit_info?: DepositInfo }) =>
     apiClient.put<{ success: boolean }>('/vc/update', data) as unknown as Promise<{ success: boolean }>,

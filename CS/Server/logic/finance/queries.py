@@ -416,6 +416,9 @@ def _get_account_owner_name(session, account) -> str:
         return f"[供应商] {obj.name}" if obj else "[供应商] 未知"
     elif owner_type == AccountOwnerType.OURSELVES:
         return "[我方] 闪饮业务中心"
+    elif owner_type == AccountOwnerType.PARTNER:
+        obj = session.query(ExternalPartner).get(owner_id)
+        return f"[合作伙伴] {obj.name}" if obj else "[合作伙伴] 未知"
     else:
         return "[未知]"
 

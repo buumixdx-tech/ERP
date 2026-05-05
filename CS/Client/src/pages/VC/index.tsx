@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, Search, X, ChevronRight, Package, Truck, RotateCcw, RefreshCw, Pencil, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,7 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { PointSelect, PointOption } from '@/components/ui/point-select'
-import { vcApi, VCType, VCStatus, VirtualContract, VCDetailResponse, CashflowProgress } from '@/api/endpoints/vc'
+import { vcApi, VCType, VCStatus, VirtualContract, VCDetailResponse, CashflowProgress, VCListResponse, VCGlobalSearchParams } from '@/api/endpoints/vc'
 import { masterApi, Point, SKU } from '@/api/endpoints/master'
 import { supplyChainApi } from '@/api/endpoints/supplyChain'
 import { formatCurrency, formatDate } from '@/lib/utils'
@@ -873,7 +873,7 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
                   </div>
                   <div>
                     <Label className="text-muted-foreground">总金额</Label>
-                    <p>{formatCurrency(detail.deposit_info?.total_amount || 0)}</p>
+                    <p>{formatCurrency(detail.total_amount || 0)}</p>
                   </div>
                   <div>
                     <Label className="text-muted-foreground">预付款比例</Label>
@@ -889,11 +889,11 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
                   </div>
                   <div>
                     <Label className="text-muted-foreground">应付总额</Label>
-                    <p>{formatCurrency(detail.deposit_info?.total_amount || 0)}</p>
+                    <p>{formatCurrency(detail.total_amount || 0)}</p>
                   </div>
                   <div>
-                    <Label className="text-muted-foreground">应收取押金</Label>
-                    <p>{formatCurrency(detail.deposit_info?.should_receive || 0)}</p>
+                    <Label className="text-muted-foreground">实付金额</Label>
+                    <p>{formatCurrency(detail.deposit_info?.paid_amount || 0)}</p>
                   </div>
                 </div>
 
@@ -917,7 +917,7 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {detail.elements.elements?.map((el, idx) => (
+                      {(((detail.elements as any)?.items) || ((detail.elements as any)?.elements) || [])?.map((el: any, idx: number) => (
                         <TableRow key={idx}>
                           <TableCell>{el.sku_name || el.sku_id}</TableCell>
                           <TableCell>{el.shipping_point_name || el.shipping_point_id}</TableCell>
@@ -941,9 +941,8 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
                         <div key={log.id} className="flex items-center gap-2 text-sm">
                           <ChevronRight className="h-4 w-4 text-muted-foreground" />
                           <span className="text-muted-foreground">{formatDate(log.timestamp)}</span>
-                          <span>{log.from_status} → {log.to_status}</span>
-                          <span className="text-muted-foreground">({log.changed_field})</span>
-                          {log.comment && <span className="text-muted-foreground">- {log.comment}</span>}
+                          <Badge className={STATUS_COLORS[log.status_name] || 'bg-gray-100'}>{log.status_name}</Badge>
+                          <span className="text-muted-foreground text-xs">[{(log.category || '').toUpperCase()}]</span>
                         </div>
                       ))}
                     </div>
@@ -960,37 +959,37 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
               <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold">{formatCurrency(progress.total_amount)}</div>
+                    <div className="text-2xl font-bold">{formatCurrency(progress.goods?.total || 0)}</div>
                     <p className="text-sm text-muted-foreground">应付总额</p>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold text-green-600">{formatCurrency(progress.paid_amount)}</div>
+                    <div className="text-2xl font-bold text-green-600">{formatCurrency(progress.goods?.paid || 0)}</div>
                     <p className="text-sm text-muted-foreground">已付金额</p>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold text-orange-600">{formatCurrency(progress.balance)}</div>
+                    <div className="text-2xl font-bold text-orange-600">{formatCurrency(progress.goods?.balance || 0)}</div>
                     <p className="text-sm text-muted-foreground">未付余额</p>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold">{formatCurrency(progress.expected_deposit)}</div>
+                    <div className="text-2xl font-bold">{formatCurrency(progress.deposit?.should || 0)}</div>
                     <p className="text-sm text-muted-foreground">应收押金</p>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold text-blue-600">{formatCurrency(progress.actual_deposit)}</div>
+                    <div className="text-2xl font-bold text-blue-600">{formatCurrency(progress.deposit?.received || 0)}</div>
                     <p className="text-sm text-muted-foreground">实收押金</p>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardContent className="pt-4">
-                    <div className="text-2xl font-bold">{formatCurrency(progress.offset_pool)}</div>
+                    <div className="text-2xl font-bold">{formatCurrency(progress.goods?.pool || 0)}</div>
                     <p className="text-sm text-muted-foreground">核销池余额</p>
                   </CardContent>
                 </Card>
@@ -1021,7 +1020,7 @@ function VCDetailDialog({ vc, onClose }: { vc: VirtualContract; onClose: () => v
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {log.express_orders.map(order => (
+                          {(log.express_orders || []).map(order => (
                             <TableRow key={order.id}>
                               <TableCell className="font-mono">{order.tracking_number}</TableCell>
                               <TableCell><Badge>{order.status}</Badge></TableCell>
@@ -1260,20 +1259,62 @@ function VCDeleteButton({ vcId }: { vcId: number }) {
 }
 
 export function VCPager() {
+  const [activeTab, setActiveTab] = useState('list')
   const [typeFilter, setTypeFilter] = useState<VCType | 'ALL'>('ALL')
   const [statusFilter, setStatusFilter] = useState<VCStatus | 'ALL'>('ALL')
   const [search, setSearch] = useState('')
   const [selectedVC, setSelectedVC] = useState<VirtualContract | null>(null)
+  const [page, setPage] = useState(1)
+  const pageSize = 20
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ['vc-list', typeFilter, statusFilter, search],
+    queryKey: ['vc-list', typeFilter, statusFilter, search, page],
     queryFn: () => vcApi.list({
       type: typeFilter !== 'ALL' ? typeFilter : undefined,
       status: statusFilter !== 'ALL' ? statusFilter : undefined,
       search: search || undefined,
-      size: 100,
+      page,
+      size: pageSize,
     }),
   })
+
+  const totalPages = data ? Math.ceil(data.total / pageSize) : 0
+
+  useEffect(() => { setPage(1) }, [typeFilter, statusFilter, search])
+
+  // ========== 全局概览搜索状态 ==========
+  // Store form values as strings (from <Input>), convert to numbers in queryFn
+  const [overviewParams, setOverviewParams] = useState<Record<string, string | number | undefined>>({ size: 20, page: 1 })
+  const [searchCount, setSearchCount] = useState(0)
+
+  const { data: overviewData, isLoading: isOverviewSearching } = useQuery({
+    queryKey: ['vc-global', overviewParams, searchCount],
+    enabled: searchCount > 0,
+    queryFn: () => {
+      const p = { ...overviewParams }
+      const numFields = ['vc_id', 'business_id', 'supply_chain_id', 'sku_id', 'shipping_point_id', 'receiving_point_id']
+      Object.keys(p).forEach(k => {
+        if (numFields.includes(k) && typeof p[k] === 'string' && p[k] !== '') {
+          p[k] = Number(p[k])
+        } else if (p[k] === '' || p[k] === undefined) {
+          delete p[k]
+        }
+      })
+      return vcApi.getGlobalOverview(p as VCGlobalSearchParams) as unknown as Promise<VCListResponse>
+    },
+  })
+
+  const doOverviewSearch = () => {
+    setSelectedVC(null)
+    setSearchCount(c => c + 1)
+  }
+
+  const clearOverview = () => {
+    setOverviewParams({ size: 20, page: 1 })
+    setSelectedVC(null)
+  }
+
+  const overviewTotalPages = overviewData ? Math.ceil(overviewData.total / (overviewData.size || 20)) : 0
 
   return (
     <div className="space-y-4">
@@ -1284,87 +1325,301 @@ export function VCPager() {
         </div>
       </div>
 
-      {/* Filters */}
-      <div className="flex gap-4 flex-wrap">
-        <Input placeholder="搜索合同..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-64" />
-        <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as VCType | 'ALL')}>
-          <SelectTrigger className="w-40">
-            <SelectValue placeholder="合同类型" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="ALL">全部类型</SelectItem>
-            {Object.entries(VC_TYPE_LABELS).map(([value, label]) => (
-              <SelectItem key={value} value={value}>{label}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as VCStatus | 'ALL')}>
-          <SelectTrigger className="w-32">
-            <SelectValue placeholder="状态" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="ALL">全部状态</SelectItem>
-            <SelectItem value="执行">执行中</SelectItem>
-            <SelectItem value="完成">已完成</SelectItem>
-            <SelectItem value="终止">已终止</SelectItem>
-            <SelectItem value="取消">已取消</SelectItem>
-          </SelectContent>
-        </Select>
-        <Button variant="outline" onClick={() => refetch()}>
-          <RefreshCw className="h-4 w-4" />
-        </Button>
-      </div>
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
+        <TabsList>
+          <TabsTrigger value="list">列表</TabsTrigger>
+          <TabsTrigger value="global">全局概览</TabsTrigger>
+        </TabsList>
 
-      {/* VC List */}
-      <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>ID</TableHead>
-                <TableHead>类型</TableHead>
-                <TableHead>描述</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>标的</TableHead>
-                <TableHead>资金</TableHead>
-                <TableHead>总金额</TableHead>
-                <TableHead>创建时间</TableHead>
-                <TableHead>操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {data?.items?.map(vc => (
-                <TableRow key={vc.id}>
-                  <TableCell className="font-medium">VC-{vc.id}</TableCell>
-                  <TableCell>
-                    <Badge className={VC_TYPE_COLORS[vc.type]}>{VC_TYPE_LABELS[vc.type]}</Badge>
-                  </TableCell>
-                  <TableCell className="max-w-[200px] truncate">{vc.description || '-'}</TableCell>
-                  <TableCell><Badge className={STATUS_COLORS[vc.status]}>{vc.status}</Badge></TableCell>
-                  <TableCell><Badge className={STATUS_COLORS[vc.subject_status] || 'bg-gray-100'}>{vc.subject_status}</Badge></TableCell>
-                  <TableCell><Badge className={STATUS_COLORS[vc.cash_status] || 'bg-gray-100'}>{vc.cash_status}</Badge></TableCell>
-                  <TableCell className="text-right">{formatCurrency(vc.deposit_info?.total_amount || 0)}</TableCell>
-                  <TableCell>{formatDate(vc.created_at || '')}</TableCell>
-                  <TableCell>
-                    <div className="flex gap-1">
-                      <Button variant="ghost" size="sm" onClick={() => setSelectedVC(vc)}>详情</Button>
-                      <VCUpdateDialog vc={vc} onSuccess={() => refetch()} />
-                      <VCDeleteButton vcId={vc.id} />
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!data?.items?.length && (
-                <TableRow>
-                  <TableCell colSpan={9} className="text-center text-muted-foreground">
-                    {isLoading ? '加载中...' : '暂无数据'}
-                  </TableCell>
-                </TableRow>
+        <TabsContent value="list" className="space-y-4">
+          {/* Filters */}
+          <div className="flex gap-4 flex-wrap">
+            <Input placeholder="搜索合同..." value={search} onChange={(e) => setSearch(e.target.value)} className="w-64" />
+            <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as VCType | 'ALL')}>
+              <SelectTrigger className="w-40">
+                <SelectValue placeholder="合同类型" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ALL">全部类型</SelectItem>
+                {Object.entries(VC_TYPE_LABELS).map(([value, label]) => (
+                  <SelectItem key={value} value={value}>{label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as VCStatus | 'ALL')}>
+              <SelectTrigger className="w-32">
+                <SelectValue placeholder="状态" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ALL">全部状态</SelectItem>
+                <SelectItem value="执行">执行中</SelectItem>
+                <SelectItem value="完成">已完成</SelectItem>
+                <SelectItem value="终止">已终止</SelectItem>
+                <SelectItem value="取消">已取消</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button variant="outline" onClick={() => refetch()}>
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+          </div>
+
+          {/* VC List */}
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>ID</TableHead>
+                    <TableHead>类型</TableHead>
+                    <TableHead>描述</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead>标的</TableHead>
+                    <TableHead>资金</TableHead>
+                    <TableHead>总金额</TableHead>
+                    <TableHead>创建时间</TableHead>
+                    <TableHead>操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {data?.items?.map(vc => (
+                    <TableRow key={vc.id}>
+                      <TableCell className="font-medium">VC-{vc.id}</TableCell>
+                      <TableCell>
+                        <Badge className={VC_TYPE_COLORS[vc.type]}>{VC_TYPE_LABELS[vc.type]}</Badge>
+                      </TableCell>
+                      <TableCell className="max-w-[200px] truncate">{vc.description || '-'}</TableCell>
+                      <TableCell><Badge className={STATUS_COLORS[vc.status]}>{vc.status}</Badge></TableCell>
+                      <TableCell><Badge className={STATUS_COLORS[vc.subject_status] || 'bg-gray-100'}>{vc.subject_status}</Badge></TableCell>
+                      <TableCell><Badge className={STATUS_COLORS[vc.cash_status] || 'bg-gray-100'}>{vc.cash_status}</Badge></TableCell>
+                      <TableCell className="text-right">{formatCurrency(vc.total_amount || 0)}</TableCell>
+                      <TableCell>{formatDate(vc.created_at || '')}</TableCell>
+                      <TableCell>
+                        <div className="flex gap-1">
+                          <Button variant="ghost" size="sm" onClick={() => setSelectedVC(vc)}>详情</Button>
+                          <VCUpdateDialog vc={vc} onSuccess={() => refetch()} />
+                          <VCDeleteButton vcId={vc.id} />
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!data?.items?.length && (
+                    <TableRow>
+                      <TableCell colSpan={9} className="text-center text-muted-foreground">
+                        {isLoading ? '加载中...' : '暂无数据'}
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+              {totalPages > 1 && (
+                <div className="flex items-center justify-between px-4 py-3 border-t">
+                  <div className="text-sm text-muted-foreground">
+                    共 {data?.total || 0} 条，第 {page} / {totalPages} 页
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage(p => Math.max(1, p - 1))}
+                      disabled={page <= 1}
+                    >
+                      上一页
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                      disabled={page >= totalPages}
+                    >
+                      下一页
+                    </Button>
+                  </div>
+                </div>
               )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="global" className="space-y-4">
+          {/* 搜索表单 */}
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">多条件搜索</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-4 gap-4">
+                <div className="space-y-1">
+                  <Label className="text-xs">VC ID</Label>
+                  <Input value={overviewParams.vc_id} onChange={e => setOverviewParams((prev) => ({ ...prev, vc_id: e.target.value }))} placeholder="VC ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">VC类型</Label>
+                  <Select value={String(overviewParams.vc_type || '')} onValueChange={v => setOverviewParams((prev) => ({ ...prev, vc_type: v === 'ALL' ? '' : v }))}>
+                    <SelectTrigger><SelectValue placeholder="选择类型" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">全部</SelectItem>
+                      {Object.entries(VC_TYPE_LABELS).map(([value, label]) => (
+                        <SelectItem key={value} value={value}>{label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">VC状态</Label>
+                  <Select value={String(overviewParams.vc_status || '')} onValueChange={v => setOverviewParams((prev) => ({ ...prev, vc_status: v === 'ALL' ? '' : v }))}>
+                    <SelectTrigger><SelectValue placeholder="选择状态" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">全部</SelectItem>
+                      <SelectItem value="执行">执行中</SelectItem>
+                      <SelectItem value="完成">已完成</SelectItem>
+                      <SelectItem value="终止">已终止</SelectItem>
+                      <SelectItem value="取消">已取消</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">标的状态</Label>
+                  <Select value={String(overviewParams.vc_subject_status || '')} onValueChange={v => setOverviewParams((prev) => ({ ...prev, vc_subject_status: v === 'ALL' ? '' : v }))}>
+                    <SelectTrigger><SelectValue placeholder="选择标的状态" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">全部</SelectItem>
+                      <SelectItem value="执行">执行</SelectItem>
+                      <SelectItem value="发货">发货</SelectItem>
+                      <SelectItem value="签收">签收</SelectItem>
+                      <SelectItem value="完成">完成</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">资金状态</Label>
+                  <Select value={String(overviewParams.vc_cash_status || '')} onValueChange={v => setOverviewParams((prev) => ({ ...prev, vc_cash_status: v === 'ALL' ? '' : v }))}>
+                    <SelectTrigger><SelectValue placeholder="选择资金状态" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ALL">全部</SelectItem>
+                      <SelectItem value="执行">执行</SelectItem>
+                      <SelectItem value="预付">预付</SelectItem>
+                      <SelectItem value="完成">完成</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">Business ID</Label>
+                  <Input value={overviewParams.business_id} onChange={e => setOverviewParams((prev) => ({ ...prev, business_id: e.target.value }))} placeholder="Business ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">客户名称</Label>
+                  <Input value={overviewParams.business_customer_name_kw} onChange={e => setOverviewParams((prev) => ({ ...prev, business_customer_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">供应链ID</Label>
+                  <Input value={overviewParams.supply_chain_id} onChange={e => setOverviewParams((prev) => ({ ...prev, supply_chain_id: e.target.value }))} placeholder="供应链ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">供应商名称</Label>
+                  <Input value={overviewParams.supply_chain_supplier_name_kw} onChange={e => setOverviewParams((prev) => ({ ...prev, supply_chain_supplier_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">SKU ID</Label>
+                  <Input value={overviewParams.sku_id} onChange={e => setOverviewParams((prev) => ({ ...prev, sku_id: e.target.value }))} placeholder="SKU ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">SKU名称</Label>
+                  <Input value={overviewParams.sku_name_kw} onChange={e => setOverviewParams((prev) => ({ ...prev, sku_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">发货点位ID</Label>
+                  <Input value={overviewParams.shipping_point_id} onChange={e => setOverviewParams((prev) => ({ ...prev, shipping_point_id: e.target.value }))} placeholder="发货点位ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">发货点位名称</Label>
+                  <Input value={overviewParams.shipping_point_name_kw} onChange={e => setOverviewParams((prev) => ({ ...prev, shipping_point_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">收货点位ID</Label>
+                  <Input value={overviewParams.receiving_point_id} onChange={e => setOverviewParams((prev) => ({ ...prev, receiving_point_id: e.target.value }))} placeholder="收货点位ID" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">收货点位名称</Label>
+                  <Input value={overviewParams.receiving_point_name_kw} onChange={e => setOverviewParams((prev) => ({ ...prev, receiving_point_name_kw: e.target.value }))} placeholder="精确包含" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-xs">物流单号</Label>
+                  <Input value={overviewParams.tracking_number} onChange={e => setOverviewParams((prev) => ({ ...prev, tracking_number: e.target.value }))} placeholder="精确包含" />
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={clearOverview}>清空</Button>
+                <Button onClick={doOverviewSearch} disabled={isOverviewSearching}>
+                  {isOverviewSearching ? '搜索中...' : '搜索'}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* 搜索结果 */}
+          {overviewData && (
+            <>
+              <div className="text-sm text-muted-foreground">共 {overviewData.total} 条记录</div>
+              <Card>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>ID</TableHead>
+                        <TableHead>类型</TableHead>
+                        <TableHead>描述</TableHead>
+                        <TableHead>状态</TableHead>
+                        <TableHead>标的</TableHead>
+                        <TableHead>资金</TableHead>
+                        <TableHead>总金额</TableHead>
+                        <TableHead>创建时间</TableHead>
+                        <TableHead>操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {overviewData.items?.map((vc) => (
+                        <TableRow key={vc.id}>
+                          <TableCell className="font-medium">VC-{vc.id}</TableCell>
+                          <TableCell>
+                            <Badge className={VC_TYPE_COLORS[vc.type]}>{VC_TYPE_LABELS[vc.type]}</Badge>
+                          </TableCell>
+                          <TableCell className="max-w-[200px] truncate">{vc.description || '-'}</TableCell>
+                          <TableCell><Badge className={STATUS_COLORS[vc.status]}>{vc.status}</Badge></TableCell>
+                          <TableCell><Badge className={STATUS_COLORS[vc.subject_status] || 'bg-gray-100'}>{vc.subject_status}</Badge></TableCell>
+                          <TableCell><Badge className={STATUS_COLORS[vc.cash_status] || 'bg-gray-100'}>{vc.cash_status}</Badge></TableCell>
+                          <TableCell className="text-right">{formatCurrency(vc.total_amount || 0)}</TableCell>
+                          <TableCell>{formatDate(vc.created_at || '')}</TableCell>
+                          <TableCell>
+                            <div className="flex gap-1">
+                              <Button variant="ghost" size="sm" onClick={() => setSelectedVC(vc)}>详情</Button>
+                              <VCUpdateDialog vc={vc} onSuccess={() => refetch()} />
+                              <VCDeleteButton vcId={vc.id} />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                      {!overviewData.items?.length && (
+                        <TableRow>
+                          <TableCell colSpan={9} className="text-center text-muted-foreground">暂无数据</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
+
+              {/* 分页 */}
+              {overviewTotalPages > 1 && (
+                <div className="flex items-center justify-center gap-2">
+                  <Button variant="outline" size="sm" onClick={() => setOverviewParams((prev) => ({ ...prev, page: Number(prev.page || 1) - 1 }))} disabled={(Number(overviewParams.page) || 1) <= 1}>上一页</Button>
+                  <span className="text-sm text-muted-foreground">第 {Number(overviewParams.page) || 1} / {overviewTotalPages} 页</span>
+                  <Button variant="outline" size="sm" onClick={() => setOverviewParams((prev) => ({ ...prev, page: Number(prev.page || 1) + 1 }))} disabled={(Number(overviewParams.page) || 1) >= overviewTotalPages}>下一页</Button>
+                </div>
+              )}
+            </>
+          )}
+        </TabsContent>
+      </Tabs>
 
       {selectedVC && (
         <VCDetailDialog vc={selectedVC} onClose={() => setSelectedVC(null)} />

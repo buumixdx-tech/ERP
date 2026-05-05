@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, RefreshCw, X, Pencil, Trash2, Eye, AlertTriangle } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
@@ -536,14 +536,26 @@ function SupplyChainDetailDialog({ supplyChain, onClose }: { supplyChain: Supply
 export function SupplyChainPage() {
   const [typeFilter, setTypeFilter] = useState<SupplyChainType | 'ALL'>('ALL')
   const [selectedSupplyChain, setSelectedSupplyChain] = useState<SupplyChain | null>(null)
+  const [supplierNameKw, setSupplierNameKw] = useState('')
+  const [skuNameKw, setSkuNameKw] = useState('')
+  const [page, setPage] = useState(1)
+  const pageSize = 20
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ['supplychain-list', typeFilter],
+    queryKey: ['supplychain-list', typeFilter, supplierNameKw, skuNameKw, page],
     queryFn: () => supplyChainApi.list({
       type: typeFilter !== 'ALL' ? typeFilter : undefined,
-      size: 100,
+      supplier_name_kw: supplierNameKw || undefined,
+      sku_name_kw: skuNameKw || undefined,
+      page,
+      size: pageSize,
     }),
   })
+
+  const totalPages = data ? Math.ceil(data.total / pageSize) : 0
+
+  // Reset to page 1 when filters change
+  useEffect(() => { setPage(1) }, [typeFilter, supplierNameKw, skuNameKw])
 
   return (
     <div className="space-y-4">
@@ -552,7 +564,7 @@ export function SupplyChainPage() {
         <CreateSupplyChainDialog onSuccess={() => refetch()} />
       </div>
 
-      <div className="flex gap-4">
+      <div className="flex gap-4 flex-wrap">
         <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as SupplyChainType | 'ALL')}>
           <SelectTrigger className="w-32">
             <SelectValue placeholder="类型" />
@@ -563,6 +575,18 @@ export function SupplyChainPage() {
             <SelectItem value="MATERIAL">物料</SelectItem>
           </SelectContent>
         </Select>
+        <Input
+          placeholder="供应商名称"
+          value={supplierNameKw}
+          onChange={(e) => setSupplierNameKw(e.target.value)}
+          className="w-40"
+        />
+        <Input
+          placeholder="SKU名称"
+          value={skuNameKw}
+          onChange={(e) => setSkuNameKw(e.target.value)}
+          className="w-40"
+        />
         <Button variant="outline" onClick={() => refetch()}>
           <RefreshCw className="h-4 w-4" />
         </Button>
@@ -617,6 +641,31 @@ export function SupplyChainPage() {
               )}
             </TableBody>
           </Table>
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between px-4 py-3 border-t">
+              <div className="text-sm text-muted-foreground">
+                共 {data?.total || 0} 条，第 {page} / {totalPages} 页
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                >
+                  上一页
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  下一页
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 
